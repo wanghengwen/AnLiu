@@ -1,0 +1,11 @@
+# build outputs
+*.o
+bench/anl_bench
+anl_test
+
+# local Claude Code settings
+.claude/settings.local.json
+
+# CMake build and local install directories
+/build*/
+/install/
