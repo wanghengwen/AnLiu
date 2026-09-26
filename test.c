@@ -41,6 +41,7 @@ typedef struct pkt {
 typedef struct net {
     int loss_pct, dup_pct, min_delay, max_delay;
     int reflect;                    /* send packets back to the sender */
+    uint32_t drop_at[4];            /* != 0: drop the datagrams with these n->sent numbers */
     int reorder;                    /* 1 = jitter may reorder datagrams; 0 = FIFO path */
     uint32_t last_at[2];            /* last scheduled delivery per direction (FIFO) */
     int bandwidth_bps;              /* 0 = unlimited; otherwise a bottleneck queue */
@@ -73,6 +74,11 @@ static int net_output(const char *buf, int len, anl_t *w, void *user)
     uint32_t delay;
     (void)w;
     n->sent++;
+    {
+        int d;
+        for (d = 0; d < 4; d++)
+            if (n->drop_at[d] != 0 && (uint32_t)n->sent == n->drop_at[d]) { n->lost++; return 0; }
+    }
     /* burst measurement over a 5 ms window */
     if ((int32_t)(n->now - n->burst_window_start[from]) >= 5) { n->burst_window_start[from] = n->now; n->burst_window_bytes[from] = 0; }
     n->burst_window_bytes[from] += (uint32_t)len;
@@ -298,7 +304,9 @@ static anl_stream_t *open_pair(net *n, int from, const anl_stream_opt *mine, con
     sid = anl_stream_id(s);
     g_peer[1 - from][sid] = NULL;               /* forget an earlier incarnation of this sid */
     g_peer_opt[1 - from] = peer ? peer : mine;
-    for (i = 0; i < 3000 && g_peer[1 - from][sid] == NULL; i++) net_tick(n);
+    /* before the first RTT sample STREAM_OPEN is resent after 0.2, 0.6, 1.4,
+       3.0 s (RTO_DEF, doubling) */
+    for (i = 0; i < 6000 && g_peer[1 - from][sid] == NULL; i++) net_tick(n);
     g_peer_opt[1 - from] = NULL;
     *other = g_peer[1 - from][sid];
     CHECK(*other != NULL, "peer accepted sid %d", sid);
@@ -394,7 +402,6 @@ static void test_reliable(int loss, int stream_mode)
     printf("[reliable loss=%d%% stream=%d]\n", loss, stream_mode);
     net_init(&n, &ca, &cb);
     n.loss_pct = loss; n.dup_pct = 2;
-    ca.resend = cb.resend = 2;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_RELIABLE);
     o.stream = stream_mode;
@@ -465,11 +472,10 @@ static void test_semi(int loss, int fec, int bandwidth_kbps)
     printf("[semi loss=%d%% fec=%d bw=%dkbps]\n", loss, fec, bandwidth_kbps);
     net_init(&n, &ca, &cb);
     n.loss_pct = loss; n.min_delay = 15; n.max_delay = 25;
-    ca.nodelay = cb.nodelay = 1; ca.resend = cb.resend = 2;
     n.bandwidth_bps = bandwidth_kbps * 1000; n.queue_limit = 30;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_SEMI);
-    o.fec = fec; o.fec_depth = 2;
+    o.fec = fec; o.fec_ratio = 25;
     o.max_age_ms = 300;
     o.rcv_deadline_ms = 400;
     o.drop_until_key = 1;
@@ -674,7 +680,10 @@ static void test_open_close(int loss)
     CHECK(b && anl_stream_tag(b) == 4242, "peer sees the tag");
     CHECK(got == 10 && eof, "peer read 10 messages then end of stream (%d, eof %d)", got, eof);
     CHECK(b && anl_stream_send(b, "x", 1) == ANL_ECLOSED, "send on a stream the peer closed");
-    for (i = 0; i < 10000 && stream_count(n.ep[0], NULL); i++) net_tick(&n);    /* CLOSE exchange under loss */
+    /* CLOSE exchange under loss: each round (CLOSE there, answer back) fails
+       with ~28% at 15% loss both ways, and the CLOSE interval grows x1.5 per
+       retry: a few failed rounds in a row take several seconds */
+    for (i = 0; i < 30000 && stream_count(n.ep[0], NULL); i++) net_tick(&n);
     CHECK(stream_count(n.ep[0], NULL) == 0, "opener side freed (%d ms)", i);
     CHECK(stream_count(n.ep[1], NULL) == 1, "peer handle kept until the application closes it");
     CHECK(b && stream_state(b) == ANL_STREAM_CLOSED && anl_stream_recv(b, buf, sizeof(buf)) == ANL_ECLOSED, "held handle still answers");
@@ -682,6 +691,55 @@ static void test_open_close(int loss)
     for (i = 0; i < 100 && stream_count(n.ep[1], NULL); i++) net_tick(&n);
     CHECK(stream_count(n.ep[1], NULL) == 0, "freed after close");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    net_stop(&n);
+}
+
+/* a semi-reliable stream is aborted by close (DESIGN 6.1): frames in flight
+ * are dropped, the peer sees the end of the stream about one RTT later, and
+ * both sides free the stream - closed by the sender or by the receiver */
+static void test_semi_abort(int loss, int by_receiver)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[20000];
+    int i, r, frames = 0, got = 0, eof = 0, t_close = 0, t_eof = -1;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    printf("[semi-reliable abort by the %s, loss=%d%%]\n", by_receiver ? "receiver" : "sender", loss);
+    net_init(&n, &ca, &cb);
+    n.loss_pct = loss;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 20000 && t_eof < 0; i++) {
+        net_tick(&n);
+        if (a && i % 33 == 0) {                             /* 30 fps, 12 KB frames */
+            fill_pattern(buf, 12000, (uint32_t)frames);
+            r = anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, 12000, NULL);
+            if (r == ANL_ECLOSED) { t_eof = i; break; }     /* receiver aborted: the sender learns */
+            frames++;
+        }
+        if (b) while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) {
+            CHECK(r == 12000 && check_pattern(buf, r, fi.frame_no), "frame %u intact", fi.frame_no);
+            got++;
+        }
+        if (b && r == ANL_ECLOSED) { eof = 1; t_eof = i; }
+        if (i == 2000) {                                    /* frames are in flight */
+            t_close = i;
+            if (by_receiver) { anl_stream_close(b); b = NULL; }
+            else { anl_stream_close(a); a = NULL; }
+        }
+    }
+    CHECK(got > 0, "frames delivered before the abort (%d of %d)", got, frames);
+    CHECK(t_eof >= 0, "the %s learnt of the abort", by_receiver ? "sender" : "receiver");
+    /* the CLOSE may be lost a few times (backoff x1.5 from RTO) */
+    CHECK(t_eof >= 0 && t_eof - t_close < 5000, "abort seen %d ms after close", t_eof - t_close);
+    if (a) anl_stream_close(a);
+    if (b) anl_stream_close(b);
+    for (i = 0; i < 20000 && (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)); i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both sides freed (%d ms)", i);
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    printf("  %d of %d frames delivered, abort seen after %d ms%s\n", got, frames, t_eof - t_close, eof ? " (end of stream)" : "");
     net_stop(&n);
 }
 
@@ -693,8 +751,7 @@ static void test_pacing(void)
     anl_stream_t *a, *b;
     printf("[pacing]\n");
     net_init(&n, &ca, &cb);
-    ca.pace_rate = 2000000;          /* 2 MB/s */
-    ca.nc = 1;
+    ca.pace_rate = 2000000;          /* 2 MB/s: upper bound on the BBR rate */
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_SEMI);
     a = open_pair(&n, 0, &o, NULL, &b);
@@ -703,11 +760,13 @@ static void test_pacing(void)
     n.max_burst[0] = 0;
     fill_pattern(buf, 200000, 1);
     anl_stream_send_frame(a, ANL_FRAME_KEY, buf, 200000, NULL);
-    for (i = 0; i < 400; i++) net_tick(&n);
+    /* the warm-up sent no data: the frame starts BBR from STARTUP, 4~5 round
+       trips from 16 segments up to 2 MB/s, then 100 ms at 2 MB/s */
+    for (i = 0; i < 600; i++) net_tick(&n);
     /* 2 MB/s over a 5 ms window = 10 KB, plus bucket 4*mtu and one datagram of slack */
     CHECK(n.max_burst[0] <= 10000 + 4 * 1400 + 1400, "max 5ms burst %u bytes", n.max_burst[0]);
     CHECK(anl_stream_peeksize(b) == 200000, "frame arrived (%d)", anl_stream_peeksize(b));
-    printf("  max 5 ms burst: %u bytes, frame arrived after <= 400 ms\n", n.max_burst[0]);
+    printf("  max 5 ms burst: %u bytes, frame arrived after <= 600 ms\n", n.max_burst[0]);
     net_stop(&n);
 }
 
@@ -766,7 +825,7 @@ static void test_fuzz(void)
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o1, ANL_RELIABLE);
     anl_stream_opt_default(&o2, ANL_SEMI);
-    o2.fec = 1; o2.fec_depth = 3;
+    o2.fec = 1; o2.fec_ratio = 50;               /* several parities per block: RS decode on fuzzed input */
     a1 = open_pair(&n, 0, &o1, NULL, &b1);
     a2 = open_pair(&n, 0, &o2, NULL, &b2);
     for (i = 0; i < 300; i++) {
@@ -1101,10 +1160,9 @@ typedef struct prio_result { double p50, p99, max; uint32_t sent, got, vframes, 
 /* control: reliable 200 B every 50 ms, on the default stream (ctrl_prio < 0)
  * or on its own stream; video: semi 30 fps, I 40 KB / P 15 KB (~3.6 Mbps)
  * over a 3 Mbps bottleneck; video = 0 runs the control stream alone.
- * nc = 1 disables cwnd; the sender is then paced at 2.8 Mbps, below the link:
- * without congestion control and without a rate below the bottleneck the
- * link collapses (queue drops + RTO backoff) and no priority can help. */
-static void run_priority(int ctrl_prio, int video_prio, int video, int nc, prio_result *res)
+ * capped: BBR with cfg.pace_rate = 2.8 Mbps, below the link (a known uplink
+ * quota): no queue builds at the bottleneck - the latency floor for control. */
+static void run_priority(int ctrl_prio, int video_prio, int video, int nc, prio_result *res)   /* nc: rate capped */
 {
     net n; anl_config ca, cb; anl_stream_opt oc, ov;
     static char buf[70000];
@@ -1120,7 +1178,6 @@ static void run_priority(int ctrl_prio, int video_prio, int video, int nc, prio_
     n.min_delay = n.max_delay = 20;
     n.loss_pct = 1;
     n.bandwidth_bps = 3000000; n.queue_limit = 40;
-    ca.nc = cb.nc = nc;
     if (nc) ca.pace_rate = 350000;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&oc, ANL_RELIABLE);
@@ -1180,7 +1237,7 @@ static void run_priority(int ctrl_prio, int video_prio, int video, int nc, prio_
 
 static void test_priority(void)
 {
-    static const char *cc[2] = { "cwnd on (nc=0)", "cwnd off (nc=1), paced at 2.8 Mbps" };
+    static const char *cc[2] = { "BBR (default)", "BBR capped at 2.8 Mbps (cfg.pace_rate)" };
     int nc;
     printf("[priority: control (reliable 200 B / 50 ms) vs video (~3.6 Mbps) on a 3 Mbps link, rtt 40 ms, 1%% loss]\n");
     printf("  default stream: strict priority; other streams: %d levels, weighted round robin %u:%u:%u:%u\n", ANL_MAX_PRIO,
@@ -1200,7 +1257,7 @@ static void test_priority(void)
             printf("    %-26s ctrl p50 %4.0f p99 %4.0f max %4.0f ms (%u/%u)  max ctrl unsent %d seg  video %u/%u\n",
                    name[k], r[k].p50, r[k].p99, r[k].max, r[k].got, r[k].sent, r[k].max_wait, r[k].vgot, r[k].vframes);
         /* inside AnLiu the control stream is never queued behind video
-           (nc=0: at most until video frees the shared cwnd) */
+           (BBR: at most until video frees the shared cwnd) */
         for (k = 1; k <= 2; k++) {
             CHECK(r[k].max_wait <= (nc ? 2 : 4), "%s: at most %d unsent control segments (%d)", name[k], nc ? 2 : 4, r[k].max_wait);
             CHECK(r[k].got == r[k].sent, "%s: control delivered with video running (%u/%u)", name[k], r[k].got, r[k].sent);
@@ -1269,6 +1326,7 @@ static void run_key_receiver(int rcv_drop, uint32_t *delivered, uint32_t *discar
     ca.pad_max = cb.pad_max = 0;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_SEMI);
+    o.max_age_ms = 50;                          /* frame 10 stays lost: abandoned rather than retransmitted (RACK) */
     op = o;                                     /* receiver-side options live on the accepting side */
     op.rcv_deadline_ms = 30;
     op.rcv_drop_until_key = rcv_drop;
@@ -1316,6 +1374,299 @@ static void test_key_receiver_discard(void)
     CHECK(d1 == 40 && x1 == 19, "on: frames 11..29 discarded, 0..9 and 30..59 delivered (%u, %u)", d1, x1);
 }
 
+/* FEC (DESIGN 8): Reed-Solomon over blocks of up to 100 ms. With rtt 400 ms a
+   retransmission takes at least 600 ms; the parities arrive about 300 ms after
+   the data - so a frame complete within 400 ms was rebuilt by FEC. m parities
+   repair any m lost packets of a block, not only one per group as with XOR. */
+static void run_fec_repair(int frags, int ratio, const int *drop, int ndrop, uint32_t *recovered, int *ms)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stream_stats ss; anl_frame_info fi;
+    static char buf[20000];
+    anl_stream_t *a, *b;
+    uint32_t base, t0;
+    int i, r, len = frags * 1300;
+    *ms = -1;
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 200;
+    ca.pad_max = cb.pad_max = 0;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 1; o.fec_ratio = ratio;
+    o.max_age_ms = 2000;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 1500; i++) net_tick(&n);        /* srtt settles */
+    base = (uint32_t)n.sent;
+    t0 = n.now;
+    for (i = 0; i < ndrop; i++) n.drop_at[i] = base + (uint32_t)drop[i];
+    fill_pattern(buf, len, 7);
+    CHECK(anl_stream_send_frame(a, ANL_FRAME_KEY, buf, len, NULL) == 0, "send frame");
+    for (i = 0; i < 1000 && *ms < 0; i++) {
+        net_tick(&n);
+        if ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) {
+            CHECK(r == len && check_pattern(buf, r, 7), "frame content");
+            *ms = (int)(n.now - t0);
+        }
+    }
+    anl_stream_get_stats(b, &ss);
+    *recovered = ss.fec_recovered;
+    net_stop(&n);
+}
+
+static void test_fec_repair(void)
+{
+    static const int last[1] = { 3 }, three[3] = { 1, 4, 8 }, burst[4] = { 3, 4, 5, 6 };
+    uint32_t rec;
+    int ms;
+    printf("[fec: Reed-Solomon repair, rtt 400 ms (a retransmission takes >= 600 ms)]\n");
+    run_fec_repair(3, 20, last, 1, &rec, &ms);
+    printf("  3 fragments, 1 parity, the last fragment lost:       complete after %d ms, rebuilt %u\n", ms, rec);
+    CHECK(rec == 1 && ms >= 0 && ms < 400, "last fragment rebuilt by FEC (%u, %d ms)", rec, ms);
+    run_fec_repair(8, 50, three, 3, &rec, &ms);
+    printf("  8 fragments, 4 parities, 3 scattered fragments lost: complete after %d ms, rebuilt %u\n", ms, rec);
+    CHECK(rec == 3 && ms >= 0 && ms < 400, "three lost fragments of one block rebuilt (%u, %d ms)", rec, ms);
+    run_fec_repair(8, 50, burst, 4, &rec, &ms);
+    printf("  8 fragments, 4 parities, a burst of 4 lost:          complete after %d ms, rebuilt %u\n", ms, rec);
+    CHECK(rec == 4 && ms >= 0 && ms < 400, "a burst of four rebuilt (%u, %d ms)", rec, ms);
+}
+
+/* adaptive redundancy (fec_ratio 0, DESIGN 8.5): down to the floor on a
+ * clean link, up where FEC alone would miss, down again when the loss ends */
+static void run_fec_auto(int deadline, int *ratio, int *got, int *frames)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stream_stats ss;
+    static char buf[20000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    int i, phase;
+    *got = *frames = 0;
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 50;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 1; o.fec_ratio = 0; o.fec_deadline_ms = deadline;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (phase = 0; phase < 3; phase++) {
+        n.loss_pct = phase == 1 ? 20 : 0;
+        for (i = 0; i < 20000; i++) {
+            net_tick(&n);
+            if (i % 33 == 0) {
+                fill_pattern(buf, 6000, (uint32_t)*frames);
+                anl_stream_send_frame(a, *frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, 6000, NULL);
+                (*frames)++;
+            }
+            while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) (*got)++;
+        }
+        anl_stream_get_stats(a, &ss);
+        ratio[phase] = (int)ss.fec_ratio;
+    }
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    net_stop(&n);
+}
+
+/* adaptive redundancy (fec_ratio 0, DESIGN 8.5): down to the floor on a
+ * clean link, up where FEC alone would miss the deadline, down again when the
+ * loss ends; not up where a retransmission makes the deadline anyway */
+static void test_fec_auto(void)
+{
+    int r[3], got, frames;
+    printf("[fec: adaptive redundancy, video 30 fps, rtt 100 ms: 0%% / 20%% / 0%% loss, 20 s each]\n");
+    run_fec_auto(100, r, &got, &frames);
+    printf("  deadline 100 ms (a retransmission is late): ratio %d%% / %d%% / %d%%, %d of %d frames delivered\n",
+           r[0], r[1], r[2], got, frames);
+    CHECK(r[0] == FEC_AUTO_MIN, "clean link: down to the floor (%d)", r[0]);
+    CHECK(r[1] >= 50, "20%% loss: raised (%d)", r[1]);
+    CHECK(r[2] < r[1], "loss over: lowered again (%d)", r[2]);
+    run_fec_auto(0, r, &got, &frames);
+    printf("  deadline 250 ms (max_age / 2, a retransmission makes it): ratio %d%% / %d%% / %d%%, %d of %d delivered\n",
+           r[0], r[1], r[2], got, frames);
+    CHECK(r[1] < 50, "20%% loss, retransmissions in time: not raised much (%d)", r[1]);
+    CHECK(got >= frames * 99 / 100, "frames delivered (%d of %d)", got, frames);
+}
+
+/* a path of about 1 ms (loopback, LAN): min_rtt / 2 is 0, a rate sample's
+ * send interval may be 0 too (divided by it once, found on a real network) */
+static void test_tiny_rtt(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[40000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    int i, frames = 0, got = 0;
+    printf("[tiny rtt: one-way delay 0..1 ms, video 30 fps, 5%% loss]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = 0; n.max_delay = 1;
+    n.loss_pct = 5;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 1; o.fec_ratio = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 5000; i++) {
+        net_tick(&n);
+        if (i % 33 == 0) {
+            int len = frames % 30 == 0 ? 30000 : 3000;
+            fill_pattern(buf, len, (uint32_t)frames);
+            anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            frames++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) got++;
+    }
+    printf("  %d of %d frames delivered\n", got, frames);
+    CHECK(got >= frames * 95 / 100, "frames delivered (%d of %d)", got, frames);
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    net_stop(&n);
+}
+
+/* adaptive FEC on two streams (DESIGN 8.5): audio learns the loss from the
+ * connection estimate (video's packets and the peer's repair counts), not
+ * only from its own 50 packets/s */
+static void test_fec_auto_shared(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt oa, ov; anl_stream_stats sa, sv;
+    static char buf[20000];
+    anl_stream_t *a, *b, *va, *vb;
+    anl_frame_info fi;
+    int i, frames = 0, sent = 0, got = 0;
+    printf("[fec: adaptive on audio (prio 1) and video (prio 2), 10%% loss, rtt 100 ms, 5 s]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 50;
+    n.loss_pct = 10;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&oa, ANL_SEMI);
+    oa.prio = 1; oa.fec = 1; oa.fec_ratio = 0; oa.max_age_ms = 200;
+    anl_stream_opt_default(&ov, ANL_SEMI);
+    ov.prio = 2; ov.fec = 1; ov.fec_ratio = 0;
+    a = open_pair(&n, 0, &oa, NULL, &b);
+    va = open_pair(&n, 0, &ov, NULL, &vb);
+    if (!b || !vb) { net_stop(&n); return; }
+    for (i = 0; i < 5000; i++) {
+        net_tick(&n);
+        if (i % 20 == 0) {
+            fill_pattern(buf, 160, (uint32_t)sent);
+            if (anl_stream_send_frame(a, 0, buf, 160, NULL) == 0) sent++;
+        }
+        if (i % 33 == 0) {
+            fill_pattern(buf, 6000, (uint32_t)frames);
+            anl_stream_send_frame(va, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, 6000, NULL);
+            frames++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) got++;
+        while (anl_stream_recv_frame(vb, buf, sizeof(buf), &fi) > 0) ;
+    }
+    anl_stream_get_stats(b, &sa);
+    anl_stream_get_stats(vb, &sv);
+    printf("  audio: %d of %d delivered, %u repaired by FEC; video: %u repaired by FEC\n", got, sent, sa.fec_recovered, sv.fec_recovered);
+    CHECK(sa.fec_recovered >= 5, "audio repaired by FEC within 5 s (%u)", sa.fec_recovered);
+    CHECK(got >= sent * 95 / 100, "audio delivered (%d of %d)", got, sent);
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    net_stop(&n);
+}
+
+/* target_rate (DESIGN 6.10): an encoder that follows it ramps up to the
+ * link and follows a bandwidth drop */
+static uint32_t g_rate;
+static int g_rate_calls;
+static void rate_cb(anl_t *w, uint32_t target, void *user) { (void)w; (void)user; g_rate = target; g_rate_calls++; }
+
+static void test_target_rate(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stats st;
+    static char buf[200000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    uint32_t hi = 0, lo = 0, frames = 0;
+    uint64_t tail_sum = 0, drop_sum = 0;
+    int i, tail_n = 0, drop_n = 0;
+    printf("[target_rate: an encoder follows it, 3 Mbps link, rtt 40 ms; 1 Mbps after 30 s]\n");
+    net_init(&n, &ca, &cb);
+    n.bandwidth_bps = 3000000;
+    n.queue_limit = 60;
+    net_start(&n, &ca, &cb);
+    anl_set_rate_callback(n.ep[0], rate_cb);
+    g_rate = 0; g_rate_calls = 0;
+    anl_stream_opt_default(&o, ANL_SEMI);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 40000; i++) {
+        uint32_t rate = g_rate ? g_rate : 60000;            /* bytes/s; 480 kbps before the first value */
+        net_tick(&n);
+        if (i % 33 == 0) {
+            int len = (int)umin32(rate / 30, sizeof(buf));
+            fill_pattern(buf, len, frames);
+            anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            frames++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) ;
+        if (i == 30000) { hi = g_rate; n.bandwidth_bps = 1000000; }
+        if (i >= 32000 && i < 34000 && i % 100 == 0) { drop_sum += g_rate; drop_n++; }
+        if (i >= 35000 && i % 100 == 0) { tail_sum += g_rate; tail_n++; }
+    }
+    lo = (uint32_t)(drop_sum / (uint64_t)drop_n);
+    anl_get_stats(n.ep[0], &st);
+    printf("  target after 30 s: %u B/s (link 375000), 2..4 s after the drop: %u B/s (link 125000), last 5 s %u on average; %d callbacks\n",
+           hi, lo, (uint32_t)(tail_sum / (uint64_t)tail_n), g_rate_calls);
+    CHECK(hi >= 375000 * 4 / 10 && hi <= 375000, "ramped up towards the link (%u)", hi);
+    CHECK(lo <= 125000, "followed the drop within 2..4 s (%u)", lo);
+    CHECK(tail_sum / (uint64_t)tail_n >= 125000 / 2 && tail_sum / (uint64_t)tail_n <= 125000, "settled below the new link (%u)",
+          (uint32_t)(tail_sum / (uint64_t)tail_n));
+    CHECK(st.target_rate > 0, "target_rate in the stats (%u)", st.target_rate);
+    CHECK(g_rate_calls > 2, "callbacks (%d)", g_rate_calls);
+    net_stop(&n);
+}
+
+/* delay reports (DESIGN 6.9): the receiver measures, the sender learns */
+static int g_reports;
+static uint32_t g_report_frames;
+static void report_cb(anl_t *w, anl_stream_t *s, const anl_delay_report *r, void *user)
+{
+    (void)w; (void)s; (void)user;
+    if (r->valid) { g_reports++; g_report_frames += r->frames; }
+}
+
+static void test_delay_report(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stream_stats sa, sb;
+    static char buf[20000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    int i, frames = 0;
+    printf("[delay report: video 30 fps, one-way delay 40..60 ms, 5%% loss]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = 40; n.max_delay = 60;
+    n.loss_pct = 5;
+    net_start(&n, &ca, &cb);
+    anl_set_report_callback(n.ep[0], report_cb);
+    g_reports = 0; g_report_frames = 0;
+    anl_stream_opt_default(&o, ANL_SEMI);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 10000; i++) {
+        net_tick(&n);
+        if (i % 33 == 0) {
+            fill_pattern(buf, 6000, (uint32_t)frames);
+            anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, 6000, NULL);
+            frames++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) ;
+    }
+    anl_stream_get_stats(a, &sa);
+    anl_stream_get_stats(b, &sb);
+    printf("  receiver: jitter %u ms, queue %u/%u ms, frame delay %u/%u ms (avg/max), %u frames in the last interval\n",
+           sb.rx.jitter_ms, sb.rx.qdelay_avg_ms, sb.rx.qdelay_max_ms, sb.rx.frame_delay_avg_ms, sb.rx.frame_delay_max_ms, sb.rx.frames);
+    printf("  sender:   %d reports (%u frames in all), the last %u ms old: jitter %u ms, frame delay max %u ms\n",
+           g_reports, g_report_frames, sa.peer.age_ms, sa.peer.jitter_ms, sa.peer.frame_delay_max_ms);
+    CHECK(sb.rx.valid, "receiver measured");
+    CHECK(g_report_frames >= (uint32_t)frames * 8 / 10, "reports cover the frames (%u of %d)", g_report_frames, frames);
+    CHECK(sb.rx.jitter_ms >= 1 && sb.rx.jitter_ms <= 20, "jitter within the path's 20 ms spread (%u)", sb.rx.jitter_ms);
+    CHECK(sb.rx.qdelay_max_ms <= 40, "queue delay: the jitter spread only (%u)", sb.rx.qdelay_max_ms);
+    CHECK(sa.peer.valid && g_reports >= 30, "sender got reports (%d)", g_reports);
+    CHECK(sa.peer.age_ms <= 600, "the last report is recent (%u ms): reports are not resent", sa.peer.age_ms);
+    CHECK(sa.peer.jitter_ms == sb.rx.jitter_ms || sa.peer.age_ms > 0, "report carries the receiver's numbers");
+    net_stop(&n);
+}
+
 /*---------------------------------------------------------------------
  * 9. network outage: FWD / CLOSE / data retransmissions must back off
  *-------------------------------------------------------------------*/
@@ -1328,7 +1679,6 @@ static void test_outage(void)
     int i, frames_after = 0, rel_got = 0, r, t_resume = -1;
     printf("[network outage: 5 s blackout with semi + reliable streams, one closed during the outage]\n");
     net_init(&n, &ca, &cb);
-    ca.nodelay = cb.nodelay = 1; ca.resend = cb.resend = 2; ca.nc = cb.nc = 1;
     n.min_delay = n.max_delay = 30;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&os, ANL_SEMI);
@@ -1364,37 +1714,48 @@ static void test_outage(void)
 int main(void)
 {
     const char *seed = getenv("ANL_TEST_SEED");    /* runs are deterministic for a given seed */
+    const char *only = getenv("ANL_TEST_ONLY");     /* substring of a test name: run only those */
+#define RUN(call) do { if (!only || strstr(#call, only)) call; } while (0)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (seed) g_seed = 0x9E3779B97F4A7C15ULL * (strtoull(seed, NULL, 10) + 1);
     printf("seed %s\n", seed ? seed : "default");
-    test_kat();
-    test_demux();
-    test_default_stream();
-    test_reliable(0, 0);
-    test_reliable(10, 0);
-    test_reliable(10, 1);
-    test_semi(0, 0, 0);
-    test_semi(5, 0, 0);
-    test_semi(5, 1, 0);
-    test_semi(2, 0, 1000);
-    test_reflect();
-    test_stale();
-    test_violation();
-    test_seg_size();
-    test_open_close(0);
-    test_open_close(15);
-    test_pacing();
-    test_stream_lifecycle(0);
-    test_stream_lifecycle(10);
-    test_sid_once();
-    test_handle_lifetime();
-    test_accept_limits();
-    test_max_streams();
-    test_priority();
-    test_key_sender_purge();
-    test_key_receiver_discard();
-    test_outage();
-    test_fuzz();
+    RUN(test_kat());
+    RUN(test_demux());
+    RUN(test_default_stream());
+    RUN(test_reliable(0, 0));
+    RUN(test_reliable(10, 0));
+    RUN(test_reliable(10, 1));
+    RUN(test_semi(0, 0, 0));
+    RUN(test_semi(5, 0, 0));
+    RUN(test_semi(5, 1, 0));
+    RUN(test_semi(2, 0, 1000));
+    RUN(test_reflect());
+    RUN(test_stale());
+    RUN(test_violation());
+    RUN(test_seg_size());
+    RUN(test_open_close(0));
+    RUN(test_open_close(15));
+    RUN(test_semi_abort(0, 0));
+    RUN(test_semi_abort(10, 0));
+    RUN(test_semi_abort(10, 1));
+    RUN(test_pacing());
+    RUN(test_stream_lifecycle(0));
+    RUN(test_stream_lifecycle(10));
+    RUN(test_sid_once());
+    RUN(test_handle_lifetime());
+    RUN(test_accept_limits());
+    RUN(test_max_streams());
+    RUN(test_priority());
+    RUN(test_key_sender_purge());
+    RUN(test_key_receiver_discard());
+    RUN(test_fec_repair());
+    RUN(test_fec_auto());
+    RUN(test_fec_auto_shared());
+    RUN(test_tiny_rtt());
+    RUN(test_target_rate());
+    RUN(test_delay_report());
+    RUN(test_outage());
+    RUN(test_fuzz());
     if (g_fail) { printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("\nall tests passed\n");
     return 0;

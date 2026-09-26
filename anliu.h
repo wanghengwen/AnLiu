@@ -8,7 +8,7 @@
  * caller. Different anl_t instances share no state (except anl_allocator).
  *
  * Re-entrancy: anl_flush, anl_send_frame (flush_on_send) and anl_input
- * (ack_nodelay) may invoke the output callback synchronously. The output
+ * (immediate ACKs) may invoke the output callback synchronously. The output
  * callback must not call any anl_* function.
  */
 #ifndef ANLIU_H
@@ -30,7 +30,6 @@ extern "C" {
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
 #define ANL_MAX_WND         8192    /* 16-bit sn requires wnd << 32768 */
 #define ANL_MAX_PRIO        4       /* prio 0 (highest) .. 3 */
-#define ANL_MAX_FEC_DEPTH   16
 #define ANL_FEC_GROUP       8       /* 8 data + 1 parity */
 #define ANL_PSK_SIZE        32
 #define ANL_MAX_PAD         255     /* pad length is stored in one byte */
@@ -62,6 +61,11 @@ extern "C" {
 /*---------------------------------------------------------------------
  * roles / modes / flags
  *---------------------------------------------------------------------*/
+/* BBR states (anl_stats.cc_state); congestion control is always BBR (DESIGN 6.8) */
+#define ANL_BBR_STARTUP     0
+#define ANL_BBR_DRAIN       1
+#define ANL_BBR_PROBE_BW    2
+#define ANL_BBR_PROBE_RTT   3
 #define ANL_ROLE_CLIENT     0       /* the two ends MUST use different roles */
 #define ANL_ROLE_SERVER     1
 
@@ -87,17 +91,14 @@ typedef struct anl_config {
     int mtu;                    /* 1400 */
     int pad_max;                /* 32; 0 = no padding; <= ANL_MAX_PAD */
     anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG */
-    int nodelay;                /* 0, same as ikcp_nodelay */
     int interval;               /* 20 ms (ikcp default is 100) */
-    int resend;                 /* 0 = no fast resend */
-    int nc;                     /* 0 = congestion control on (pacing still applies) */
-    int ack_nodelay;            /* 1 = ACK after every 2 data datagrams; 0 = ikcp behaviour */
-    int init_cwnd;              /* 16 segments (ikcp: 1) */
+    int init_cwnd;              /* 16 segments: cwnd until the first bandwidth sample */
     int dead_link;              /* 20 retransmissions (data / FWD / CLOSE, not OPEN) */
     int ts_window_ms;           /* 1000, fixed; not tied to RTO */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
     int idle_timeout_ms;        /* SERVER default 30000, CLIENT default 0 */
-    int pace_rate;              /* bytes/s; 0 = auto (1.25*W*mss/srtt), -1 = no pacing */
+    int pace_rate;              /* bytes/s; 0 = BBR alone (gain * bandwidth estimate), > 0 = upper
+                                   bound on the BBR rate (e.g. an uplink quota) */
     int pace_burst;             /* token bucket size in bytes; 0 = 4 * mtu */
     int rcv_limit_bytes;        /* connection-wide receive buffer cap; 16 MB, 0 = unlimited */
     int max_peer_streams;       /* streams the peer may have open at once; 1024, <= ANL_MAX_STREAMS */
@@ -116,14 +117,19 @@ typedef struct anl_stream_opt {
     int stream;                 /* reliable only: byte-stream mode */
     int flush_on_send;          /* semi default 1, reliable default 0 */
     int fec;                    /* 0 = off */
-    int fec_depth;              /* interleave depth 1..16, default 1 */
-    int fec_flush_ms;           /* 0 = min(interval, 20) */
+    int fec_ratio;              /* FEC redundancy, parities per 100 data packets 1..100, default 25:
+                                   Reed-Solomon over blocks of up to 100 ms (DESIGN 8);
+                                   0 = adaptive 10..100, from the losses FEC did not repair (8.5) */
+    int fec_deadline_ms;        /* adaptive FEC: a loss whose retransmission arrives within this
+                                   (from enqueue) needs no FEC; 0 = semi max_age_ms / 2, reliable none */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
     int drop_until_key;         /* semi only: 0 */
     int rcv_deadline_ms;        /* semi only: 0 = off */
     int rcv_drop_until_key;     /* semi only: after a lost frame discard non-key frames until the
                                    next key frame (they cannot be decoded); 0 = off */
+    int report;                 /* receiver: send delay reports to the peer (DESIGN 6.9);
+                                   semi 1, reliable 0 */
 } anl_stream_opt;
 
 typedef struct anl_frame_info {
@@ -137,13 +143,40 @@ typedef struct anl_frame_info {
  *---------------------------------------------------------------------*/
 typedef struct anl_stats {
     uint32_t srtt, rttval, rto;         /* ms */
-    uint32_t cwnd, ssthresh, inflight;  /* segments */
+    uint32_t cwnd, inflight;            /* segments */
+    uint32_t bw_estimate;               /* bytes/s, BBR bottleneck bandwidth (0 until the first sample) */
+    int bw_app_limited;                 /* 1: the sender used less than bw_estimate, the real
+                                           bandwidth may be higher (the estimate is a lower bound) */
+    uint32_t bw_estimate_age_ms;        /* since the last sample that measured the path (not
+                                           app-limited); 0xffffffff = none yet. While the application
+                                           sends less, bw_estimate keeps that old peak - for an
+                                           encoder use target_rate (DESIGN 6.8, 6.10) */
+    uint32_t min_rtt;                   /* ms */
+    int cc_state;                       /* ANL_BBR_STARTUP .. ANL_BBR_PROBE_RTT */
     uint32_t retrans;                   /* total retransmitted segments */
     uint32_t pace_rate;                 /* effective pacing rate, bytes/s */
+    uint32_t target_rate;               /* payload bytes/s the application may send over all streams:
+                                           bw_estimate less headers, FEC parities, retransmissions and
+                                           a 10% margin; grows 10%/s while app-limited (DESIGN 6.10) */
     uint32_t rcv_bytes;                 /* bytes held in all receive buffers */
     uint64_t tx_datagrams, rx_datagrams;
     uint64_t rx_auth_fail, rx_stale;    /* ANL_EAUTH / ANL_ESTALE drops */
 } anl_stats;
+
+/* delay seen by a stream's receiver (DESIGN 6.9). Delays are relative to the
+ * smallest one-way transit of the last 10 s: queueing, retransmission and
+ * reassembly on top of the path's propagation time. */
+typedef struct anl_delay_report {
+    int      valid;             /* 0 until the first measurement / report */
+    uint32_t age_ms;            /* since it was measured / arrived */
+    uint32_t jitter_ms;         /* interarrival jitter (RFC 3550) */
+    uint32_t qdelay_avg_ms, qdelay_max_ms;          /* per packet, over the last interval */
+    uint32_t frame_delay_avg_ms, frame_delay_max_ms;/* from the earliest fragment's send time to
+                                                       the frame being complete */
+    uint32_t frames;            /* frames (messages) completed in the last interval */
+    uint32_t frames_skipped;    /* receiver's total (mod 65536 in reports) */
+    uint32_t fec_recovered;     /* receiver's total (mod 65536 in reports) */
+} anl_delay_report;
 
 typedef struct anl_stream_stats {
     int      state;             /* ANL_STREAM_OPENING .. ANL_STREAM_CLOSED */
@@ -154,7 +187,10 @@ typedef struct anl_stream_stats {
     uint32_t frames_dropped;    /* dropped by sender (age / bytes) */
     uint32_t frames_skipped;    /* skipped by receiver (FWD / deadline) */
     uint32_t fec_recovered;
+    uint32_t fec_ratio;         /* sender: current FEC redundancy (follows the loss with fec_ratio 0) */
     uint32_t frames_discarded;  /* receiver: undecodable frames discarded (rcv_drop_until_key) */
+    anl_delay_report rx;        /* receiver: measured here, on what the peer sends */
+    anl_delay_report peer;      /* sender: the peer's latest report on what we send */
 } anl_stream_stats;
 
 typedef struct anl_s anl_t;
@@ -170,6 +206,16 @@ typedef int (*anl_output_fn)(const char *buf, int len, anl_t *w, void *user);
  * it), < 0 to refuse (s is freed, the peer gets an RST). Like the output
  * callback it must not call any anl_* function, except anl_stream_set_user. */
 typedef int (*anl_accept_fn)(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user);
+
+/* Called from anl_update / anl_input / anl_flush when stats.target_rate
+ * changed by 5% or more (DESIGN 6.10), e.g. to set the encoder bitrate.
+ * Like the accept callback it must not call anl_* functions, except the
+ * read-only anl_get_stats / anl_stream_get_stats. */
+typedef void (*anl_rate_fn)(anl_t *w, uint32_t target_rate, void *user);
+
+/* Called from anl_input when the peer's delay report for stream s arrives
+ * (DESIGN 6.9). Same restrictions as the rate callback. */
+typedef void (*anl_report_fn)(anl_t *w, anl_stream_t *s, const anl_delay_report *r, void *user);
 
 void anl_config_default(anl_config *cfg, int role);
 void anl_stream_opt_default(anl_stream_opt *opt, int mode);
@@ -202,9 +248,11 @@ void     anl_release(anl_t *w);
 void     anl_setoutput(anl_t *w, anl_output_fn output);
 /* NULL (default) accepts every peer-opened stream with default options */
 void     anl_set_accept(anl_t *w, anl_accept_fn accept);
+void     anl_set_rate_callback(anl_t *w, anl_rate_fn fn);
+void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
 
 /* Feed a raw UDP datagram; on ANL_EAUTH the caller must not respond.
- * With ack_nodelay the output callback may be invoked synchronously. */
+ * It may send an ACK at once: the output callback may be invoked synchronously. */
 int      anl_input(anl_t *w, const char *data, long size);
 /* feed plaintext already verified by anl_peek_conv (skips crypto) */
 int      anl_input_plain(anl_t *w, const char *plain, long size);
@@ -248,9 +296,10 @@ anl_stream_t *anl_default_stream(anl_t *w);
  * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (no free sid) / ANL_ENOMEM. */
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
-/* Orderly close and release of the handle. Unsent data is still delivered
- * (reliable), unread received data is discarded. Afterwards the handle must
- * not be used. The default stream cannot be closed (ANL_EINVAL). */
+/* Close and release the handle. Reliable: orderly, unsent data is still
+ * delivered. Semi-reliable: abort, frames in flight are dropped on both
+ * sides. Unread received data is discarded. Afterwards the handle must not
+ * be used. The default stream cannot be closed (ANL_EINVAL). */
 int      anl_stream_close(anl_stream_t *s);
 
 /* reliable stream: ikcp semantics. recv returns ANL_ECLOSED once the peer has

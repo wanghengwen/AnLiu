@@ -155,6 +155,7 @@ typedef struct ep {
     anl_t *anl;
     anl_stream_t *h[MAXF];      /* AnLiu stream handle per flow (tag = flow sid) */
     ikcpcb *kcp[MAXF];
+    uint64_t prng;              /* AnLiu padding / PRNG: seeded, so a run is reproducible */
 } ep;
 
 /*=====================================================================
@@ -166,7 +167,7 @@ typedef struct flow {
     const char *name;
     int kind, sid, semi, prio;
     int snd_wnd, rcv_wnd;
-    int fec, fec_depth, max_age, until_key;
+    int fec, max_age, until_key;
     /* generator */
     int period_ms, size_min, size_max, key_min, key_max, gop, msg_size;
     uint64_t bulk_total;        /* 0 = unlimited */
@@ -297,7 +298,6 @@ static void dir_free(dir *d)
 /*---------------------------------------------------------------------
  * endpoint abstraction
  *-------------------------------------------------------------------*/
-typedef struct profile { int nodelay, interval, resend, nc; } profile;
 static int g_fast = 1;
 
 static int anl_out(const char *buf, int len, anl_t *w, void *user)
@@ -318,6 +318,18 @@ static int kcp_out(const char *buf, int len, ikcpcb *k, void *user)
 
 static int anl_accept_flow(anl_t *w, anl_stream_t *st, anl_stream_opt *opt, void *user);
 
+static uint64_t g_seed;         /* --seed (defined below) */
+
+/* deterministic PRNG for AnLiu (padding lengths change the timing of a run) */
+static void ep_rng(void *user, uint8_t *buf, size_t n)
+{
+    ep *e = (ep *)user;
+    while (n--) {
+        e->prng ^= e->prng << 13; e->prng ^= e->prng >> 7; e->prng ^= e->prng << 17;
+        *buf++ = (uint8_t)(e->prng >> 24);
+    }
+}
+
 static void ep_create(sim *s, int side, int proto)
 {
     ep *e = &s->e[side];
@@ -328,13 +340,19 @@ static void ep_create(sim *s, int side, int proto)
         anl_config_default(&cfg, side == 0 ? ANL_ROLE_CLIENT : ANL_ROLE_SERVER);
         memset(cfg.psk, 0x5a, sizeof(cfg.psk));
         cfg.mtu = MTU;
-        if (g_fast) { cfg.nodelay = 1; cfg.interval = 10; cfg.resend = 2; cfg.nc = 1; }
+        cfg.rng = ep_rng;
+        e->prng = g_seed * 0x2545F4914F6CDD1DULL + (uint64_t)side * 0x9E3779B97F4A7C15ULL + 1;
+        if (g_fast) cfg.interval = 10;
         e->anl = anl_create(0x5a5a0001, &cfg, e);
         anl_setoutput(e->anl, anl_out);
         anl_set_accept(e->anl, anl_accept_flow);
         anl_update(e->anl, now32(s));
     }
 }
+
+static int g_abr = 0;              /* bwstep without the bulk flow: 1 = --abr (video follows
+                                      stats.target_rate), 2 = --nobulk (fixed video bitrate) */
+static int g_fec_ratio = -1;       /* --fec-ratio: FEC redundancy in %, 0 = adaptive (-1 = library default) */
 
 static void flow_opt(const flow *f, anl_stream_opt *o)
 {
@@ -345,7 +363,7 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
     o->rcv_wnd = f->rcv_wnd;
     if (f->semi) {
         o->fec = f->fec;
-        o->fec_depth = f->fec_depth > 0 ? f->fec_depth : 1;
+        if (g_fec_ratio >= 0) o->fec_ratio = g_fec_ratio;
         o->max_age_ms = f->max_age;
         o->drop_until_key = f->until_key;
     }
@@ -547,7 +565,7 @@ static void flow_audio(flow *f, int sid, const variant *v)
     f->snd_wnd = f->rcv_wnd = 512;
     f->period_ms = 20; f->size_min = f->size_max = 160;
     f->max_age = 200; f->budget_ms = 150;
-    f->fec = v->fec; f->fec_depth = 1;
+    f->fec = v->fec;
     f->kcp_drop = v->drop; f->kcp_thr = f->max_age / f->period_ms;     /* 10 frames = max_age */
 }
 
@@ -559,7 +577,7 @@ static void flow_video(flow *f, int sid, const variant *v)
     f->period_ms = 33; f->gop = 30;
     f->key_min = 25000; f->key_max = 35000; f->size_min = 2500; f->size_max = 3500;
     f->max_age = 500; f->until_key = 1; f->budget_ms = 300;
-    f->fec = v->fec; f->fec_depth = 4;
+    f->fec = v->fec;
     /* unsent backlog of max_age: ~140 KB/s * 0.5 s / mss */
     f->kcp_drop = v->drop; f->kcp_thr = 140000 / 2 / 1376 + 1;
 }
@@ -625,6 +643,18 @@ static void flow_gen(sim *s, flow *f)
         while (s->t >= f->next_t) {
             int key = (f->seq % (uint32_t)f->gop) == 0;
             int len = key ? rnd_range(&g_trng, f->key_min, f->key_max) : rnd_range(&g_trng, f->size_min, f->size_max);
+            if (g_abr == 1 && s->v->proto == P_ANL) {
+                /* an encoder at target_rate less the audio (DESIGN 6.10): frame sizes
+                   scaled from the nominal ~117 KB/s, key / P ratio kept */
+                anl_stats st;
+                double nominal = ((f->key_min + f->key_max) / 2.0 + (f->gop - 1) * (f->size_min + f->size_max) / 2.0) / f->gop * 30;
+                anl_get_stats(s->e[0].anl, &st);
+                if (st.target_rate > 0) {
+                    double rate = st.target_rate > 16000 ? st.target_rate - 8000.0 : 8000.0;
+                    len = (int)(len * rate / nominal);
+                    if (len < 200) len = 200;
+                }
+            }
             gen_one(s, f, len, key);
             f->next_t = f->start_t + (uint64_t)(f->seq + 1) * 1000 / 30;
         }
@@ -910,6 +940,17 @@ static int build_flows(int sc, const variant *v, flow *fl)
     return 0;
 }
 
+static int g_cctrace = -1;
+static int g_cctrace_ms = 1000;             /* soak trace period, BENCH_CC=<ms> */
+static void cc_trace(sim *s)
+{
+                anl_stats st;
+                anl_get_stats(s->e[0].anl, &st);
+                fprintf(stderr, "t=%5.1f st=%u cwnd=%u infl=%u bw=%u app=%u minrtt=%u srtt=%u pace=%u retx=%llu\n", s->t / 1000.0,
+                        (unsigned)st.cc_state, (unsigned)st.cwnd, (unsigned)st.inflight, (unsigned)st.bw_estimate,
+                        (unsigned)st.bw_app_limited, (unsigned)st.min_rtt, (unsigned)st.srtt, (unsigned)st.pace_rate,
+                        (unsigned long long)st.retrans);
+            }
 static void run_point(int sc, const variant *v, const point *p, rres *r)
 {
     sim s;
@@ -918,19 +959,26 @@ static void run_point(int sc, const variant *v, const point *p, rres *r)
     uint64_t gen_ms, cap_ms;
     double gen_s;
 
+    if (g_cctrace < 0) g_cctrace = getenv("BENCH_CC") != NULL;
     snprintf(g_label, sizeof(g_label), "[%s %s loss=%.0f%%%s rtt=%d%s]", scen_name[sc], v->name, p->loss * 100,
              p->burst > 1 ? " burst" : "", p->rtt, p->jitter ? " jitter" : "");
     sim_init(&s, v, &lc, 1000, g_seed);
     sim_add_flows(&s, fl, build_flows(sc, v, fl));
     if (sc == S1) {
         cap_ms = (uint64_t)g_bulk_cap * 1000;
-        while (!flows_done(&s) && s.t < cap_ms && ep_alive(&s.e[0]) && ep_alive(&s.e[1])) sim_tick(&s, 1);
+        while (!flows_done(&s) && s.t < cap_ms && ep_alive(&s.e[0]) && ep_alive(&s.e[1])) {
+            sim_tick(&s, 1);
+            if (g_cctrace && v->proto == P_ANL && s.t % 500 == 0) cc_trace(&s);
+        }
         gen_s = (fl[0].done_t ? fl[0].done_t : s.t) / 1000.0;
         if (!fl[0].done_t) finding(1, "bulk transfer incomplete after %.0f s (%.1f%%)", s.t / 1000.0,
                                    100.0 * (double)fl[0].rcv_bytes / (double)fl[0].bulk_total);
     } else {
         gen_ms = (uint64_t)g_dur * 1000;
-        while (s.t < gen_ms) sim_tick(&s, 1);
+        while (s.t < gen_ms) {
+            sim_tick(&s, 1);
+            if (g_cctrace && v->proto == P_ANL && s.t % 500 == 0) cc_trace(&s);
+        }
         gen_s = s.t / 1000.0;
         while (s.t < gen_ms + 3000) sim_tick(&s, 0);       /* drain */
     }
@@ -1105,6 +1153,8 @@ static void soak_run(const variant *v)
     linkcfg lc = g_phases[0].c;
     rres r;
 
+    if (g_cctrace < 0) g_cctrace = getenv("BENCH_CC") != NULL;
+    if (g_cctrace && atoi(getenv("BENCH_CC")) > 0) g_cctrace_ms = atoi(getenv("BENCH_CC"));
     snprintf(g_label, sizeof(g_label), "[soak %s]", v->name);
     /* start the protocol clock 30 s before uint32 wrap */
     sim_init(&s, v, &lc, 0xFFFFFFFFu - 30000u, g_seed);
@@ -1137,6 +1187,7 @@ static void soak_run(const variant *v)
             }
         }
         sim_tick(&s, 1);
+        if (g_cctrace && v->proto == P_ANL && s.t % (uint64_t)g_cctrace_ms == 0) cc_trace(&s);
         if (!ep_alive(&s.e[0]) || !ep_alive(&s.e[1])) {
             finding(1, "connection dead at t=%.1f s in phase %s", s.t / 1000.0, g_phases[ph].name);
             break;
@@ -1186,6 +1237,96 @@ static void soak_run(const variant *v)
     }
     printf("\n   up %.0f kbps, dn %.0f kbps, cost %.3f, peak mem %.0f KB, alive %d\n",
            r.up_kbps, r.dn_kbps, r.cost, r.mem_peak / 1024.0, r.alive);
+}
+
+/*=====================================================================
+ * bwstep: the bottleneck changes every phase; bandwidth estimation and
+ * congestion control (DESIGN 6.8)
+ *===================================================================*/
+static const int g_steps_kbps[] = { 8000, 2000, 5000, 1000, 8000 };
+#define NSTEP ((int)(sizeof(g_steps_kbps) / sizeof(g_steps_kbps[0])))
+static int g_step_s = 10;
+static double g_step_loss = 0;
+
+static void bwstep_run(const variant *v)
+{
+    if (g_cctrace < 0) g_cctrace = getenv("BENCH_CC") != NULL;
+    if (g_cctrace && atoi(getenv("BENCH_CC")) > 0) g_cctrace_ms = atoi(getenv("BENCH_CC"));
+    sim s;
+    flow fl[MAXF];
+    int nf = 0, i, cur = -1, nest = 0;
+    uint64_t end = (uint64_t)NSTEP * g_step_s * 1000;
+    uint64_t snap_up = 0, snap_pkts = 0, next_est = 0;
+    double est_sum = 0, util_sum = 0, ratio_sum = 0;
+    int nratio = 0;
+    linkcfg lc = { g_step_loss, 0, 25, 0, g_steps_kbps[0], 100, 0.0 };
+    rres r;
+
+    snprintf(g_label, sizeof(g_label), "[bwstep %s]", v->name);
+    sim_init(&s, v, &lc, 1000, g_seed);
+    flow_audio(&fl[nf++], 0, v);
+    flow_video(&fl[nf++], 1, v);
+    if (!g_abr) {
+        flow_bulk(&fl[nf++], 3, 0, 0);
+        fl[2].prio = 3;
+    }
+    sim_add_flows(&s, fl, nf);
+    printf("\n==== bwstep%s %s: bottleneck %d", g_abr == 1 ? " (abr: video follows target_rate)" : g_abr ? " (no bulk)" : "", v->name, g_steps_kbps[0]);
+    for (i = 1; i < NSTEP; i++) printf(" -> %d", g_steps_kbps[i]);
+    printf(" kbps, %d s each, rtt 50 ms, loss %.0f%%, queue 100 ms ====\n", g_step_s, g_step_loss * 100);
+    printf("%-6s | %8s %8s %6s | %6s | %-15s | %-15s | %9s\n", "kbps", "est kbps", "est/bw", "util", "srtt",
+           "audio dlv/p95", "video ontm/p95", g_abr ? "video kbps" : "bulk KB/s");
+
+    while (s.t < end) {
+        int ph = (int)(s.t / 1000 / (uint64_t)g_step_s);
+        if (ph != cur) {
+            cur = ph;
+            s.d[0].c.bw_kbps = s.d[1].c.bw_kbps = g_steps_kbps[ph];
+        }
+        sim_tick(&s, 1);
+        if (g_cctrace > 0 && v->proto == P_ANL && s.t % (uint64_t)g_cctrace_ms == 0) cc_trace(&s);
+        if (!ep_alive(&s.e[0]) || !ep_alive(&s.e[1])) { finding(1, "connection dead at t=%.1f s", s.t / 1000.0); break; }
+        /* the estimate, sampled every 100 ms after the first 3 s of a phase */
+        if (s.t >= next_est) {
+            next_est = s.t + 100;
+            if (v->proto == P_ANL && s.t % ((uint64_t)g_step_s * 1000) >= 3000) {
+                anl_stats st;
+                anl_get_stats(s.e[0].anl, &st);
+                est_sum += st.bw_estimate * 8.0 / 1000;
+                nest++;
+            }
+        }
+        if (s.t % ((uint64_t)g_step_s * 1000) == 0) {           /* phase report */
+            double w = g_step_s, a50, a95, a99, amax, v95, x, est = nest ? est_sum / nest : 0;
+            double up = ((double)(s.d[0].bytes - snap_up) + (double)(s.d[0].pkts - snap_pkts) * IPUDP_HDR) * 8 / 1000 / w;
+            int kbps = g_steps_kbps[ph - 1 < 0 ? 0 : (s.t / 1000 / (uint64_t)g_step_s) - 1];
+            flow *A = &fl[0], *V = &fl[1], *B = &fl[g_abr ? 1 : 2];
+            cstats cs;
+            ep_stats(&s.e[0], &cs);
+            percentiles(A->lat + A->w_lat, A->nlat - A->w_lat, &a50, &a95, &a99, &amax);
+            percentiles(V->lat + V->w_lat, V->nlat - V->w_lat, &x, &v95, &a99, &amax);
+            printf("%6d | %8.0f %8.2f %5.0f%% | %6u | %5.1f%% %6.0fms | %5.1f%% %6.0fms | %9.1f\n",
+                   kbps, est, est / kbps, 100.0 * up / kbps, cs.srtt,
+                   A->seq > A->w_seq ? 100.0 * (A->delivered - A->w_dlv) / (A->seq - A->w_seq) : 0, a95,
+                   V->seq > V->w_seq ? 100.0 * (V->ontime - V->w_ontime) / (V->seq - V->w_seq) : 0, v95,
+                   g_abr ? (double)(B->rcv_bytes - B->w_bytes) * 8 / 1000 / w : (double)(B->rcv_bytes - B->w_bytes) / 1024.0 / w);
+            if (nest) { ratio_sum += est / kbps; nratio++; }
+            util_sum += up / kbps;
+            for (i = 0; i < nf; i++) {
+                fl[i].w_seq = fl[i].seq; fl[i].w_dlv = fl[i].delivered; fl[i].w_ontime = fl[i].ontime;
+                fl[i].w_lat = fl[i].nlat; fl[i].w_bytes = fl[i].rcv_bytes;
+            }
+            snap_up = s.d[0].bytes; snap_pkts = s.d[0].pkts;
+            est_sum = 0; nest = 0;
+        }
+    }
+    sim_finish(&s, &r, s.t / 1000.0);
+    printf("-- totals: ");
+    for (i = 0; i < r.nf; i++) {
+        fres *xx = &r.f[i];
+        printf("%s dlv %.1f%% ontime %.1f%% p95 %.0f ms; ", xx->name, xx->dlv, xx->ontm, xx->p95);
+    }
+    printf("\n   mean est/bw %.2f, mean util %.0f%%, alive %d\n", nratio ? ratio_sum / nratio : 0, 100.0 * util_sum / NSTEP, r.alive);
 }
 
 /*=====================================================================
@@ -1273,6 +1414,11 @@ static void usage(void)
            "  --dur S         s2..s5 duration (default 60)\n"
            "  --bulk MB       s1 size (default 4)\n"
            "  --wnd N         s1 bulk snd/rcv window in segments (default 128)\n"
+           "  --fec-ratio N   FEC flows: redundancy in %%, 1..100, 0 = adaptive (default 25)\n"
+           "  bwstep          bottleneck steps 8/2/5/1/8 Mbps: bandwidth estimate, utilisation, latency\n"
+           "  --step S        bwstep: seconds per step (default 10); --step-loss P: loss %%\n"
+           "  --abr           bwstep: no bulk flow, the video bitrate follows stats.target_rate\n"
+           "  --nobulk        bwstep: no bulk flow, fixed video bitrate (the baseline for --abr)\n"
            "  --soak S        soak duration (default 3600), --phase S (60), --sample S (60)\n"
            "  --profile fast|default   protocol parameters (default fast)\n"
            "  --seed N  --csv FILE  --quick\n");
@@ -1282,7 +1428,7 @@ int main(int argc, char **argv)
 {
     double loss[32] = { 0, 1, 3, 5, 10, 20, 30 }, rtt[32] = { 20, 100, 300 };
     int nloss = 7, nrtt = 3, burst = 4, jitter = 30, i, j;
-    int want[8] = { 0 }, any = 0, soak = 0, crypto = 0;
+    int want[8] = { 0 }, any = 0, soak = 0, crypto = 0, bwstep = 0;
     point pts[512];
     int npts = 0;
 
@@ -1295,6 +1441,11 @@ int main(int argc, char **argv)
         const char *nx = i + 1 < argc ? argv[i + 1] : "";
         if (a[0] == 's' && a[1] >= '1' && a[1] <= '5' && a[2] == 0) { want[a[1] - '0'] = 1; any = 1; }
         else if (!strcmp(a, "soak")) { soak = 1; any = 1; }
+        else if (!strcmp(a, "bwstep")) { bwstep = 1; any = 1; }
+        else if (!strcmp(a, "--abr")) g_abr = 1;
+        else if (!strcmp(a, "--nobulk")) g_abr = 2;
+        else if (!strcmp(a, "--step")) { g_step_s = atoi(nx); i++; }
+        else if (!strcmp(a, "--step-loss")) { g_step_loss = atof(nx) / 100.0; i++; }
         else if (!strcmp(a, "crypto")) { crypto = 1; any = 1; }
         else if (!strcmp(a, "all")) { for (j = 1; j <= 5; j++) want[j] = 1; soak = crypto = 1; any = 1; }
         else if (!strcmp(a, "--loss")) { nloss = parse_list(nx, loss, 32); i++; }
@@ -1306,6 +1457,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dur")) { g_dur = atoi(nx); i++; }
         else if (!strcmp(a, "--bulk")) { g_bulk_mb = atoi(nx); i++; }
         else if (!strcmp(a, "--wnd")) { g_bulk_wnd = atoi(nx); i++; }
+        else if (!strcmp(a, "--fec-ratio")) { g_fec_ratio = atoi(nx); i++; }
         else if (!strcmp(a, "--soak")) { g_soak = atoi(nx); i++; }
         else if (!strcmp(a, "--phase")) { g_phase = atoi(nx); i++; }
         else if (!strcmp(a, "--sample")) { g_sample = atoi(nx); i++; }
@@ -1339,13 +1491,14 @@ int main(int argc, char **argv)
                        "up_kbps,dn_kbps,cost,up_pkts,dn_pkts,queue_drop,srtt,rto,cwnd,rtx,alive,mem_peak_KB\n");
 
     printf("AnLiu vs ikcp  profile=%s  seed=%llu  bw=%d kbps (queue %d ms)  bandwidth includes %d B IP/UDP per packet\n",
-           g_fast ? "fast (nodelay=1 interval=10 resend=2 nc=1)" : "default", (unsigned long long)g_seed, g_bw, g_qdelay, IPUDP_HDR);
+           g_fast ? "fast (anl: interval=10; kcp: nodelay 1,10,2,1)" : "default", (unsigned long long)g_seed, g_bw, g_qdelay, IPUDP_HDR);
     printf("columns: dlv%% delivered/sent  ontm%% delivered within budget  p50..max latency ms  up = A->B wire  "
            "dn = B->A wire  cost = wire bytes (both dirs) per delivered payload byte\n");
     printf("link: loss%%[b=burst]/rtt[j=jitter]\n");
 
     for (j = 1; j <= 5; j++) if (want[j]) run_scenario(j, pts, npts);
     if (soak) { soak_run(&V_ANLF); soak_run(&V_KCPD); }
+    if (bwstep) { bwstep_run(&V_ANL); bwstep_run(&V_ANLF); if (!g_abr) bwstep_run(&V_KCP); }
     if (crypto) {
         printf("\n==== input cost per datagram (real clock, this machine) ====\n");
         bench_input_cost(&V_ANL);

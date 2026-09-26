@@ -13,6 +13,9 @@ make
 ./anl_bench --profile default        # 使用两者的默认参数（开启拥塞控制）
 ./anl_bench --csv out.csv            # 全部指标写入 CSV
 ./anl_bench s1 --bw 0 --wnd 4096     # 不限带宽，批量流窗口 4096
+./anl_bench --quick --fec-ratio 15   # FEC 冗余率（默认 25）
+./anl_bench bwstep                   # 瓶颈 8/2/5/1/8 Mbps 阶梯：带宽估计、利用率、时延（--step 秒，--step-loss %）
+BENCH_CC=100 ./anl_bench soak        # 每 100 ms 把 AnLiu 的拥塞控制状态打印到 stderr（s1~s5、soak、bwstep）
 BENCH_DEBUG=1 ./anl_bench ...        # 打印损坏消息的细节
 ```
 
@@ -20,7 +23,7 @@ BENCH_DEBUG=1 ./anl_bench ...        # 打印损坏消息的细节
 
 ## 模拟网络
 
-虚拟时钟 1 ms 步进，结果可由 `--seed` 复现。每个方向独立：
+虚拟时钟 1 ms 步进，结果可由 `--seed` 完全复现（AnLiu 的随机填充也用由种子派生的 PRNG；此前的版本用系统熵，同一种子两次运行略有差异）。每个方向独立：
 
 | 参数 | 说明 |
 |---|---|
@@ -40,6 +43,7 @@ BENCH_DEBUG=1 ./anl_bench ...        # 打印损坏消息的细节
 | s4 | 音频 160 B / 20 ms，max_age 200 | 同上 |
 | s5 | 音频 + 视频 + 饱和批量流，5 Mbps 瓶颈 | 同上（kcp 每条流一个 conv） |
 | soak | 音频 + 视频 + 交互 + 250 KB/s 批量；每 60 s 切换网络阶段（良好 / 5% / 突发 / 20% / 2 Mbps / 5 s 断网 / 高 RTT）；时钟从回绕前 30 s 开始 | anl+fec / kcp+drop |
+| bwstep | 音频 + 视频 + 批量，瓶颈每 10 s 切换 8 → 2 → 5 → 1 → 8 Mbps；每阶段报告带宽估计 / 实际、利用率、音视频时延 | anl / anl+fec / kcp |
 | crypto | 真实时钟下每个数据报的 input 开销（合法包 / 伪造包） | anl / kcp |
 
 `kcp+drop` 是在 ikcp 之上加的应用层丢帧策略：尚未发出的积压（`kcp->nsnd_que`）超过 max_age 对应的数据量时不再提交新帧（音频 10 帧，视频约 0.5 s，视频按关键帧恢复）；已交给 ikcp 的数据仍全部可靠送达。v5 之前的结果用的是 `ikcp_waitsnd`（含已发未确认），在高 RTT 下会在无拥塞时误丢帧。它只代表一种常见做法，不是 ikcp 本身的能力。

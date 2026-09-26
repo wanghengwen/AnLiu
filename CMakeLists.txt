@@ -75,6 +75,12 @@ if(ANLIU_BUILD_BENCHMARKS)
         set_target_properties(anl_bench PROPERTIES
             C_EXTENSIONS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bench)
         target_link_libraries(anl_bench PRIVATE anliu anliu_bench_kcp m)
+
+        add_executable(realnet bench/realnet.c)
+        anliu_configure_target(realnet)
+        set_target_properties(realnet PROPERTIES
+            C_EXTENSIONS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bench)
+        target_link_libraries(realnet PRIVATE anliu anliu_bench_kcp m)
     else()
         message(STATUS "POSIX clocks are required by simulation tools; skipping benchmark targets")
     endif()
