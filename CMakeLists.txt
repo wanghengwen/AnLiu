@@ -54,36 +54,53 @@ if(BUILD_TESTING)
         target_link_libraries(anl_test PRIVATE m)
     endif()
     add_test(NAME anliu.unit COMMAND anl_test)
-    set_tests_properties(anliu.unit PROPERTIES TIMEOUT 180)
 endif()
+
+if(UNIX AND ANLIU_BUILD_BENCHMARKS)
+    # KCP is only a comparison-tool dependency; the AnLiu library is standalone.
+    add_library(anliu_bench_kcp STATIC bench/ikcp.c)
+    target_include_directories(anliu_bench_kcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    target_compile_features(anliu_bench_kcp PRIVATE c_std_99)
+    set_target_properties(anliu_bench_kcp PROPERTIES C_EXTENSIONS ON)
+    if(ANLIU_ENABLE_SANITIZERS)
+        target_compile_options(anliu_bench_kcp PRIVATE
+            -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(anliu_bench_kcp PUBLIC -fsanitize=address,undefined)
+    endif()
+endif()
+
+function(anliu_configure_tool target)
+    anliu_configure_target(${target})
+    set_target_properties(${target} PROPERTIES
+        C_EXTENSIONS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bench)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${target} PRIVATE anliu_bench_kcp m)
+endfunction()
 
 if(ANLIU_BUILD_BENCHMARKS)
     if(UNIX)
-        # KCP is only a comparison-tool dependency; the AnLiu library is standalone.
-        add_library(anliu_bench_kcp STATIC bench/ikcp.c)
-        target_include_directories(anliu_bench_kcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench)
-        target_compile_features(anliu_bench_kcp PRIVATE c_std_99)
-        set_target_properties(anliu_bench_kcp PROPERTIES C_EXTENSIONS ON)
-        if(ANLIU_ENABLE_SANITIZERS)
-            target_compile_options(anliu_bench_kcp PRIVATE
-                -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer)
-            target_link_options(anliu_bench_kcp PUBLIC -fsanitize=address,undefined)
-        endif()
-
         add_executable(anl_bench bench/bench.c)
-        anliu_configure_target(anl_bench)
-        set_target_properties(anl_bench PROPERTIES
-            C_EXTENSIONS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bench)
-        target_link_libraries(anl_bench PRIVATE anliu anliu_bench_kcp m)
+        anliu_configure_tool(anl_bench)
+        target_link_libraries(anl_bench PRIVATE anliu)
 
-        add_executable(realnet bench/realnet.c)
-        anliu_configure_target(realnet)
-        set_target_properties(realnet PROPERTIES
-            C_EXTENSIONS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bench)
-        target_link_libraries(realnet PRIVATE anliu anliu_bench_kcp m)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(realnet bench/realnet.c)
+            anliu_configure_tool(realnet)
+            target_link_libraries(realnet PRIVATE anliu)
+
+            add_executable(realnet_trace bench/realnet.c)
+            anliu_configure_tool(realnet_trace)
+            target_compile_definitions(realnet_trace PRIVATE REALNET_INTERNAL)
+        else()
+            message(STATUS "Linux TCP diagnostics are required by realnet; skipping realnet targets")
+        endif()
     else()
         message(STATUS "POSIX clocks are required by simulation tools; skipping benchmark targets")
     endif()
+endif()
+
+if(BUILD_TESTING)
+    set_tests_properties(anliu.unit PROPERTIES TIMEOUT 180)
 endif()
 
 install(TARGETS anliu EXPORT AnLiuTargets

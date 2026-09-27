@@ -6,11 +6,15 @@
  *   (default port: AnLiu 9836, ikcp 9837)
  *
  * Both ends get the same test options:
- *   --proto anl | anlfec | anlauto | kcp | kcpdrop
- *   --test  media (audio 160 B / 20 ms + video 30 fps ~940 kbps) | bulk
+ *   --proto anl | anlfec | anlauto | kcp | kcpdrop | tcp (stream test only: the
+ *           kernel's TCP on the same port number, for comparison)
+ *   --test  media (audio 160 B / 20 ms + video 30 fps ~940 kbps) | bulk (--bulk MB, timed)
+ *           | stream (a reliable stream kept full for --dur seconds: goodput per second)
  *   --dir   up (client sends) | down (server sends)
  *   --dur S       media: seconds of traffic (default 60)
  *   --bulk MB     bulk: megabytes (default 16)
+ *   --wnd N       bulk / stream: send and receive window in segments (default 1024;
+ *                 about 1 MB, 30 Mbps at 280 ms RTT)
  *   --loss P      extra random loss in % on every datagram sent (both ends)
  *   --seed N
  *
@@ -26,6 +30,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,7 +40,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef REALNET_INTERNAL
+#include "../anliu.c"       /* build without ../anliu.c: REALNET_TRACE shows BBR internals */
+#else
 #include "anliu.h"
+#endif
 #include "ikcp.h"
 
 #define MTU         1400
@@ -43,8 +52,8 @@
 #define NFLOW       4           /* flow ids 1 audio, 2 video, 3 bulk */
 #define HDR         16          /* id key pad pad | seq u32 | send_us u64 */
 
-enum { P_ANL, P_ANLFEC, P_ANLAUTO, P_KCP, P_KCPDROP };
-static const char *proto_name[] = { "anl", "anlfec", "anlauto", "kcp", "kcpdrop" };
+enum { P_ANL, P_ANLFEC, P_ANLAUTO, P_KCP, P_KCPDROP, P_TCP };
+static const char *proto_name[] = { "anl", "anlfec", "anlauto", "kcp", "kcpdrop", "tcp" };
 
 typedef struct flow {
     const char *name;
@@ -57,12 +66,13 @@ typedef struct flow {
     /* receiver */
     uint32_t dlv, max_seq, have;
     int64_t *owd; size_t nowd, capowd;
+    int64_t *owdk; size_t nowdk, capowdk;  /* key frames only */
     uint64_t bytes;
 } flow;
 
 static flow g_fl[NFLOW];
-static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk */, g_up = 1, g_server = 0;
-static int g_dur = 60, g_bulk_mb = 16, g_port = 0;      /* 0: anl 9836, kcp 9837 */
+static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk, 2 stream */, g_up = 1, g_server = 0;
+static int g_dur = 60, g_bulk_mb = 16, g_port = 0, g_wnd = 1024;      /* 0: anl 9836, kcp 9837 */
 static double g_loss = 0;
 static uint64_t g_rng = 88172645463325252ull;
 static const char *g_host = NULL;
@@ -78,6 +88,8 @@ static ikcpcb *g_kcp[NFLOW];
 
 /* bulk */
 static uint64_t g_bulk_sent, g_bulk_rcvd, g_bulk_first_us, g_bulk_done_us;
+#define MAXSEC 3600
+static uint64_t g_sec_bytes[MAXSEC];      /* stream: bytes received in each second after the first byte */
 
 static uint64_t now_us(void)
 {
@@ -140,7 +152,7 @@ static void flows_init(void)
     v->name = "video"; v->id = 2; v->semi = 1; v->prio = 1; v->wnd = 512;
     v->period_ms = 33; v->gop = 30; v->key_min = 25000; v->key_max = 35000; v->size_min = 2500; v->size_max = 3500;
     v->max_age = 500; v->budget_ms = 300; v->until_key = 1; v->kcp_thr = 140000 / 2 / 1376 + 1;
-    b->name = "bulk"; b->id = 3; b->semi = 0; b->prio = 3; b->wnd = 1024; b->budget_ms = 1000000;
+    b->name = "bulk"; b->id = 3; b->semi = 0; b->prio = 3; b->wnd = g_wnd; b->budget_ms = 1000000;
 }
 
 static int flow_active(int id) { return g_test == 0 ? (id == 1 || id == 2) : id == 3; }
@@ -295,10 +307,10 @@ static void gen_media(uint64_t t, uint64_t end_us)
     }
 }
 
-static void gen_bulk(void)
+static void gen_bulk(uint64_t t, uint64_t end_us)
 {
     flow *f = &g_fl[3];
-    uint64_t total = (uint64_t)g_bulk_mb << 20;
+    uint64_t total = g_test == 2 ? (t < end_us ? ~0ull : g_bulk_sent) : (uint64_t)g_bulk_mb << 20;
     while (g_bulk_sent < total && ep_waitsnd(3) < 2 * f->wnd) {
         int len = 1024;
         if (g_bulk_sent + (uint64_t)len > total) len = (int)(total - g_bulk_sent);
@@ -320,8 +332,12 @@ static void rx_frames(void)
         while ((r = ep_recv(i, g_buf, (int)sizeof(g_buf))) > 0) {
             uint64_t t = now_us();
             if (i == 3) {
+                uint64_t sec;
                 if (g_bulk_first_us == 0) g_bulk_first_us = t;
                 g_bulk_rcvd += (uint64_t)r;
+                sec = (t - g_bulk_first_us) / 1000000u;
+                if (sec < MAXSEC) g_sec_bytes[sec] += (uint64_t)r;
+                if (g_test == 2) continue;
                 if (g_bulk_rcvd >= ((uint64_t)g_bulk_mb << 20) && g_bulk_done_us == 0) g_bulk_done_us = t;
                 continue;
             }
@@ -334,6 +350,13 @@ static void rx_frames(void)
                     f->owd = (int64_t *)realloc(f->owd, f->capowd * sizeof(int64_t));
                 }
                 f->owd[f->nowd++] = (int64_t)(t - st);
+                if (g_buf[1]) {
+                    if (f->nowdk == f->capowdk) {
+                        f->capowdk = f->capowdk ? f->capowdk * 2 : 256;
+                        f->owdk = (int64_t *)realloc(f->owdk, f->capowdk * sizeof(int64_t));
+                    }
+                    f->owdk[f->nowdk++] = (int64_t)(t - st);
+                }
                 f->dlv++;
                 if (!f->have || seq > f->max_seq) f->max_seq = seq;
                 f->have = 1;
@@ -366,6 +389,12 @@ static void report_receiver(void)
             if (f->owd[k] <= (int64_t)f->budget_ms * 1000) ontime++;
         }
         qsort(f->owd, f->nowd, sizeof(int64_t), cmp64);
+        if (f->nowdk > 0) {
+            for (k = 0; k < f->nowdk; k++) f->owdk[k] -= mn;
+            qsort(f->owdk, f->nowdk, sizeof(int64_t), cmp64);
+            printf("KEYFRAMES %s %s n=%zu p50=%.1f p95=%.1f max=%.1f\n", proto_name[g_proto], f->name, f->nowdk,
+                   f->owdk[f->nowdk / 2] / 1000.0, f->owdk[f->nowdk * 95 / 100] / 1000.0, f->owdk[f->nowdk - 1] / 1000.0);
+        }
         p50 = f->owd[f->nowd / 2] / 1000.0;
         p95 = f->owd[f->nowd * 95 / 100] / 1000.0;
         p99 = f->owd[f->nowd * 99 / 100] / 1000.0;
@@ -373,6 +402,24 @@ static void report_receiver(void)
         printf("RESULT %s %s dlv=%u sent~=%u ontime=%zu p50=%.1f p95=%.1f p99=%.1f max=%.1f kbps=%.0f\n",
                proto_name[g_proto], f->name, f->dlv, f->max_seq + 1, ontime, p50, p95, p99, pmax,
                f->bytes * 8.0 / 1000.0 / g_dur);
+    }
+    if (g_test == 2) {
+        int n = g_dur < MAXSEC ? g_dur : MAXSEC, k;
+        static double v[MAXSEC];
+        double sum = 0;
+        for (k = 0; k < n; k++) { v[k] = g_sec_bytes[k] * 8.0 / 1e6; sum += v[k]; }
+        for (k = 1; k < n; k++) {                       /* insertion sort, n <= 3600 */
+            double x = v[k]; int j = k - 1;
+            while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+            v[j + 1] = x;
+        }
+        if (getenv("REALNET_SECS")) {
+            printf("SECS");
+            for (k = 0; k < n; k++) printf(" %.0f", g_sec_bytes[k] * 8.0 / 1e6);
+            printf("\n");
+        }
+        printf("RESULT %s stream secs=%d bytes=%llu avg_Mbps=%.2f min_Mbps=%.2f p10_Mbps=%.2f p50_Mbps=%.2f max_Mbps=%.2f\n",
+               proto_name[g_proto], n, (unsigned long long)g_bulk_rcvd, sum / n, v[0], v[n / 10], v[n / 2], v[n - 1]);
     }
     if (g_test == 1) {
         double s = g_bulk_done_us ? (g_bulk_done_us - g_bulk_first_us) / 1e6 : -1;
@@ -410,9 +457,95 @@ static void report_sender(double secs)
 /*--------------------------------------------------------------------
  * main loop
  *-------------------------------------------------------------------*/
+/* --proto tcp: the stream test over one kernel TCP connection. The sender
+   writes for --dur seconds from the connect; the receiver counts bytes per
+   second from the first byte, reported like the UDP stream test. */
+static int tcp_run(void)
+{
+    int fd, one = 1;                            /* default buffers: kernel autotuning */
+    uint64_t t0 = now_us(), stop_us, end_us;
+    static char buf[64 << 10];
+    if (g_test != 2) { fprintf(stderr, "--proto tcp: stream test only\n"); return 2; }
+    stop_us = t0 + (uint64_t)(g_dur + 120) * 1000000u;
+    if (g_server) {
+        struct sockaddr_in sa;
+        int ls = socket(AF_INET, SOCK_STREAM, 0);
+        struct pollfd pfd;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)g_port);
+        sa.sin_addr.s_addr = INADDR_ANY;
+        if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(ls, 1) < 0) { perror("tcp listen"); return 1; }
+        pfd.fd = ls; pfd.events = POLLIN; pfd.revents = 0;
+        if (poll(&pfd, 1, (int)((stop_us - t0) / 1000)) <= 0) { printf("TIMEOUT tcp started=0\n"); return 0; }
+        fd = accept(ls, NULL, NULL);
+        close(ls);
+    } else {
+        struct addrinfo hints, *res;
+        char port[16];
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        snprintf(port, sizeof(port), "%d", g_port);
+        if (getaddrinfo(g_host, port, &hints, &res) != 0) { fprintf(stderr, "resolve %s failed\n", g_host); return 1; }
+        for (;;) {                                  /* the server may start a little later */
+            fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) break;
+            close(fd);
+            if (now_us() - t0 > 20000000u) { printf("TIMEOUT tcp connect\n"); return 0; }
+            usleep(200000);
+        }
+        freeaddrinfo(res);
+    }
+    if (fd < 0) { perror("tcp accept"); return 1; }
+    end_us = now_us() + (uint64_t)g_dur * 1000000u;
+    if (is_sender()) {
+        struct tcp_info ti;
+        socklen_t tl = sizeof(ti);
+        char cc[32] = "?";
+        socklen_t cl = sizeof(cc);
+        uint64_t sent = 0;
+        memset(buf, 'x', sizeof(buf));
+        while (now_us() < end_us) {
+            ssize_t n = send(fd, buf, sizeof(buf), MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent += (uint64_t)n;
+        }
+        memset(&ti, 0, sizeof(ti));
+        getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tl);
+        getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, &cl);
+        cc[sizeof(cc) - 1] = 0;
+        printf("SENDER tcp cc=%s sent=%llu retrans=%u rtt_ms=%.1f cwnd=%u secs=%d\n", cc, (unsigned long long)sent,
+               ti.tcpi_total_retrans, ti.tcpi_rtt / 1000.0, ti.tcpi_snd_cwnd, g_dur);
+        shutdown(fd, SHUT_WR);
+        while (recv(fd, buf, sizeof(buf), 0) > 0) {}
+    } else {
+        for (;;) {
+            struct pollfd pfd;
+            ssize_t n;
+            pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
+            if (poll(&pfd, 1, 1000) < 0 || now_us() > stop_us) break;
+            if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            {
+                uint64_t t = now_us(), sec;
+                if (g_bulk_first_us == 0) g_bulk_first_us = t;
+                g_bulk_rcvd += (uint64_t)n;
+                sec = (t - g_bulk_first_us) / 1000000u;
+                if (sec < MAXSEC) g_sec_bytes[sec] += (uint64_t)n;
+            }
+        }
+        report_receiver();
+    }
+    close(fd);
+    return 0;
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop]\n"
+    fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop|tcp]\n"
                     "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N]\n");
     exit(2);
 }
@@ -420,7 +553,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     int i;
-    uint64_t t0, start_us = 0, end_us = 0, last_rx_us = 0, last_hello_us = 0, stop_us;
+    uint64_t t0, start_us = 0, end_us = 0, last_rx_us = 0, last_hello_us = 0, stop_us, last_trace_us = 0;
     int started = 0, got_any = 0, pinged = 0;
     uint64_t ping_sent_us[20] = { 0 };
     double rtt_min = 1e9, rtt_sum = 0; int rtt_n = 0;
@@ -434,11 +567,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--port")) g_port = atoi(nx);
         else if (!strcmp(a, "--proto")) {
             int p;
-            for (p = 0; p < 5; p++) if (!strcmp(nx, proto_name[p])) g_proto = p;
-        } else if (!strcmp(a, "--test")) g_test = !strcmp(nx, "bulk");
+            for (p = 0; p < 6; p++) if (!strcmp(nx, proto_name[p])) g_proto = p;
+        } else if (!strcmp(a, "--test")) g_test = !strcmp(nx, "bulk") ? 1 : !strcmp(nx, "stream") ? 2 : 0;
         else if (!strcmp(a, "--dir")) g_up = strcmp(nx, "down") != 0;
         else if (!strcmp(a, "--dur")) g_dur = atoi(nx);
         else if (!strcmp(a, "--bulk")) g_bulk_mb = atoi(nx);
+        else if (!strcmp(a, "--wnd")) g_wnd = atoi(nx);
         else if (!strcmp(a, "--loss")) g_loss = atof(nx);
         else if (!strcmp(a, "--seed")) g_rng ^= (uint64_t)atoll(nx) * 0x9E3779B97F4A7C15ull + (g_server ? 7 : 3);
         else usage();
@@ -447,6 +581,7 @@ int main(int argc, char **argv)
     if (!g_server && !g_host) usage();
     if (g_port == 0) g_port = is_anl() ? 9836 : 9837;
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (g_proto == P_TCP) return tcp_run();
     flows_init();
 
     g_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -486,6 +621,9 @@ int main(int argc, char **argv)
         int r;
         pfd.fd = g_fd; pfd.events = POLLIN; pfd.revents = 0;
         r = poll(&pfd, 1, 1);
+        /* the protocols take RTT samples against the time of their last update:
+           give them the current time before the datagrams (anliu.h, anl_input) */
+        ep_update(now_ms());
         if (r > 0 && (pfd.revents & POLLIN)) {
             char in[2048];
             struct sockaddr_storage from;
@@ -537,14 +675,29 @@ int main(int argc, char **argv)
         }
         if (started && is_sender()) {
             if (g_test == 0) gen_media(t, end_us);
-            else gen_bulk();
+            else gen_bulk(t, end_us);
         }
         ep_update(now_ms());
         rx_frames();
+        if (started && is_sender() && is_anl() && getenv("REALNET_TRACE") && t - last_trace_us >= (uint64_t)atoi(getenv("REALNET_TRACE")) * 1000u) {
+            anl_stats st;
+            last_trace_us = t;
+            anl_get_stats(g_anl, &st);
+            fprintf(stderr, "TRACE t=%.1f st=%d cwnd=%u infl=%u bw=%u pace=%u srtt=%u minrtt=%u rtx=%u",
+                    (t - start_us) / 1e6, st.cc_state, st.cwnd, st.inflight, st.bw_estimate, st.pace_rate, st.srtt, st.min_rtt, st.retrans);
+#ifdef REALNET_INTERNAL
+            fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d",
+                    g_anl->btl_bw, g_anl->bw_lo, (unsigned long long)g_anl->inflight_hi, g_anl->probe_phase, g_anl->loss_rate,
+                    g_anl->qfall, bbr_queue_signal(g_anl), tdiff(g_anl->round_count, g_anl->rto_round) < 0, g_anl->prev_round_min_rtt,
+                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt_state);
+#endif
+            fprintf(stderr, "\n");
+        }
         /* end: the sender after the traffic plus 3 s of drain (bulk: once
            delivered and drained); the receiver 5 s after the last datagram */
         if (started && is_sender()) {
             int done = g_test == 0 ? t >= end_us + 3000000u
+                     : g_test == 2 ? t >= end_us + 1000000u
                                    : (g_bulk_sent >= ((uint64_t)g_bulk_mb << 20) && ep_waitsnd(3) == 0 && t >= start_us + 1000000u);
             if (done || t >= stop_us) {
                 double secs = (t - start_us) / 1e6;
@@ -555,7 +708,7 @@ int main(int argc, char **argv)
                     ep_update(now_ms());
                     usleep(1000);
                 }
-                report_sender(g_test == 0 ? g_dur : secs);
+                report_sender(g_test == 1 ? secs : g_dur);
                 break;
             }
         }

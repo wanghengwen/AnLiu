@@ -415,6 +415,7 @@ typedef struct anl_seg {
     uint8_t  fkey;          /* semi: the frame is a key frame (every fragment) */
     uint8_t  rack_rtx;      /* the last transmission was a retransmission by 1 RACK, 2 RTO (spurious check) */
     uint8_t  rs_app;        /* delivery rate sample (BBR): sent while app-limited */
+    uint32_t burst_id;      /* first sent in this app-limited burst (0: none; burst_on_acked) */
     uint64_t rs_delivered;  /* connection's delivered bytes when it was sent */
     uint64_t rs_fec;        /* ... and delivered_fec */
     uint32_t rs_ts;         /* ... and the time of that delivery */
@@ -571,6 +572,22 @@ struct anl_s {
     uint32_t net_sample_ts;             /* ... its time (| 1); 0 = none (stats.bw_estimate_age_ms) */
     uint32_t bw_lo;                     /* BBRv2 lower bound after congestive loss, until the next probe; 0 = none */
     uint32_t bw_idx;                    /* filter slot of the current round */
+    /* token-bucket policer detection (DESIGN 6.8): intervals of >= 16 rounds and 300 ms */
+    int lt_state;                       /* 0 watching, 1 testing at lt_rate, 2 policed at lt_rate */
+    int lt_bad;                         /* the interval had app-limited or queued rounds */
+    uint32_t lt_ts, lt_rounds, lt_left, lt_hold;
+    uint32_t lt_sent0;                  /* sent_wire at the start of the interval */
+    uint64_t lt_rd, lt_lost;
+    uint32_t lt_rate, lt_prev_rate, lt_prev_loss, lt_ref_loss;  /* bytes/s; loss per mille */
+    uint32_t burst_id;                  /* the last app-limited burst (a key frame); its segments carry it */
+    uint8_t  burst_open, burst_done;    /* its segments are being sent; its measurement is over */
+    uint32_t burst_left;                /* segments of it not sent yet (queued when it opened) */
+    uint32_t burst_t0, burst_t1;        /* first / last send of its segments */
+    uint32_t burst_sw0, burst_sw1;      /* sent_wire before its first / after its last segment */
+    uint32_t disp_ts, disp_bytes;       /* its first ACK (0: none yet); bytes acknowledged since */
+    uint32_t burst_rtt0;                /* the RTT at its first ACK (at least bbr_rtt) */
+    uint32_t burst_bw;                  /* the rate the last measured burst went through at (ACK dispersion), bytes/s */
+    uint32_t burst_cur;                 /* ... the current one so far (0: none), taken over by the next burst */
     uint32_t round_bw;                  /* largest sample of the current round (the slot keeps the
                                            peak of earlier rounds while app-limited rounds do not rotate) */
     int round_net_sample;               /* the current round had a sample that was not app-limited */
@@ -1069,6 +1086,7 @@ static void ack_schedule(anl_stream *st)
  * pacing (DESIGN 6.7)
  *-------------------------------------------------------------------*/
 static uint32_t bbr_bw(const anl_t *w);
+static int bbr_queue_signal(const anl_t *w);
 
 /* Burst headroom for an app-limited sender whose bandwidth estimate only
  * shows what the application offered: a key frame goes out at the STARTUP
@@ -1081,21 +1099,43 @@ static int bbr_headroom(const anl_t *w)
     return w->app_limited != 0 && (w->net_round == 0 || tdiff(w->round_count, w->net_round) > BBR_BW_ROUNDS);
 }
 
+/* An app-limited sender whose bursts go through much faster than its
+   average rate (the model's bandwidth): pace and window for the burst rate
+   (burst_bw). Not when they are about as fast - the application sends
+   about what the path takes, and bursts at 1.25x the path's rate only
+   queue (priority test: control p99 215 -> 350 ms). Nor while the path
+   shows a queue or a policer. */
+static int bbr_burst(const anl_t *w)
+{
+    return (w->app_limited != 0 || w->burst_open) && (uint64_t)w->burst_bw * 2 > (uint64_t)bbr_bw(w) * 3 &&
+           w->lt_state == 0 && !bbr_queue_signal(w);
+}
+
 static uint32_t compute_pace_rate(const anl_t *w)
 {
     /* gain * bottleneck bandwidth; before the first sample the initial window
        per RTT, at the STARTUP gain. Never below BBR_MIN_CWND segments per
        RTT; never above cfg.pace_rate when that is set. */
-    uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
+    /* not below the update interval (bbr_rtt): at 1 ms srtt the floor was
+       4 segments per ms, 44 Mbps, over a 28 Mbps policer - 40% of what was
+       sent was lost (real network, DESIGN 13.24) */
+    uint32_t srtt = umax32(w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF, (uint32_t)w->interval);
     uint64_t rate, floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000u / srtt;
     uint32_t gain = w->pacing_gain;
     /* app-limited (audio, video between key frames): btl_bw only shows
        what the application sent. Its bursts - a key frame - go out at the
        STARTUP gain; if the path takes them, their samples raise btl_bw */
     if (bbr_headroom(w) && gain < BBR_STARTUP_GAIN) gain = BBR_STARTUP_GAIN;
+    /* policed (or testing for it): the rate is known, probing above it is
+       only loss - 6% of what was sent at 1 ms RTT (BBRv1 does the same) */
+    if (w->lt_state != 0 && gain > BBR_UNIT) gain = BBR_UNIT;
     if (w->btl_bw != 0) rate = (uint64_t)bbr_bw(w) * gain / BBR_UNIT;
     else rate = (uint64_t)w->init_cwnd * w->mss * 1000u / srtt * BBR_STARTUP_GAIN / BBR_UNIT;
     if (rate < floor) rate = floor;
+    /* app-limited: bursts (key frames) at the rate the last ones went through
+       at, x 1.25 to find more (burst_bw, burst_on_acked) - to their end, when
+       the ACKs of their first segments ended the app-limited period */
+    if (bbr_burst(w) && (uint64_t)w->burst_bw * 5 / 4 > rate) rate = (uint64_t)w->burst_bw * 5 / 4;
     if (w->pace_rate_cfg > 0 && rate > (uint64_t)w->pace_rate_cfg) rate = (uint64_t)w->pace_rate_cfg;
     if (rate > 0xffffffffu) rate = 0xffffffffu;
     return (uint32_t)rate;
@@ -1894,12 +1934,99 @@ typedef struct bbr_sample {             /* the delivery rate sample of one ACK *
    the max filter alone would remember a bandwidth that is gone for 10 rounds */
 static uint32_t bbr_bw(const anl_t *w)
 {
-    return w->bw_lo != 0 && w->bw_lo < w->btl_bw ? w->bw_lo : w->btl_bw;
+    uint32_t bw = w->bw_lo != 0 && w->bw_lo < w->btl_bw ? w->bw_lo : w->btl_bw;
+    /* policed: the policer's rate itself - without probing (compute_pace_rate)
+       the filter only saw its own pace minus the loss and ratcheted down,
+       27 -> 18 Mbps over a minute on a 30 Mbps path (DESIGN 13.25); testing:
+       at most that rate */
+    if (w->lt_state == 2) return w->lt_rate;
+    return w->lt_state != 0 && w->lt_rate < bw ? w->lt_rate : bw;
+}
+
+/* A token-bucket policer drops what exceeds its rate without queueing it:
+ * loss without a queue, which BBR here does not take as congestion (random
+ * loss on a radio link looks the same), and the send-rate credit then keeps
+ * the sender at up to 1.5x the rate - 40% of the packets lost (a home uplink,
+ * real network, DESIGN 13.22). Told apart by the response (BBRv1's long-term
+ * sampling plus a test): two intervals (>= 16 rounds and 300 ms) in a row,
+ * network-limited, no queue, over 20% lost, delivering the same rate within
+ * 1/8 - then an interval paced at that rate. A policer's share of the loss
+ * goes (random loss on top of it stays): at least halved is a policer,
+ * policed for 48 intervals (then watched again); otherwise 48 intervals
+ * without suspicion. Bursty random loss varies a lot between intervals:
+ * with 10%, a third and 8 rounds 4 of 20 soak runs took 5% burst loss for a
+ * policer. */
+static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
+{
+    uint32_t dur, rate, loss;
+    if (w->lt_ts == 0) { w->lt_ts = w->current | 1; w->lt_sent0 = w->sent_wire; }
+    w->lt_rd += rd;
+    w->lt_lost += lost;
+    w->lt_rounds++;
+    if (app_limited || bbr_queue_signal(w)) w->lt_bad = 1;
+    dur = (uint32_t)tdiff(w->current, w->lt_ts);
+    if (w->lt_rounds < 16 || dur < 300) return;
+    rate = (uint32_t)umin32((uint32_t)(w->lt_rd * 1000 / dur), 0xffffffffu);
+    loss = w->lt_rd + w->lt_lost > 0 ? (uint32_t)(w->lt_lost * 1000 / (w->lt_rd + w->lt_lost)) : 0;
+    if (w->lt_state == 1) {                             /* the test interval */
+        /* its loss from what it sent and what was delivered: the losses
+           counted in it are mostly of what was sent before, found a round
+           or more later - at 100 ms RTT they failed every test (sent 1.21
+           MB/s, delivered 1.21, "lost" 36%), then held for 48 intervals at
+           1.5x the policer's rate, a third lost (DESIGN 13.25) */
+        uint32_t sent = w->sent_wire - w->lt_sent0;
+        loss = sent > w->lt_rd ? (uint32_t)((sent - w->lt_rd) * 1000 / sent) : 0;
+        if (loss * 2 < w->lt_ref_loss) {
+            /* what is still lost at the policer's rate is random loss: send
+               that much more, or random loss on top would pace below the rate */
+            w->lt_rate = (uint32_t)umin32((uint32_t)((uint64_t)w->lt_rate * 1000 / (1000 - umin32(loss, 500))), 0xffffffffu);
+            w->lt_state = 2;
+            w->lt_left = 48;
+        }
+        else { w->lt_state = 0; w->lt_hold = 48; }
+        w->lt_prev_rate = 0;
+    } else if (w->lt_state == 2) {
+        if (--w->lt_left == 0) { w->lt_state = 0; w->lt_prev_rate = 0; }
+    } else if (w->lt_hold > 0) {
+        w->lt_hold--;
+    } else if (!w->lt_bad && loss > 100) {
+        /* over 10% lost, rates within 1/4: a test costs one interval at the
+           delivery rate, and the test itself tells a policer from random
+           loss - over 20% and within 1/8 missed a 50 Mbps uplink whose rate
+           jitters, and the sender stayed at 1.7x it with a fifth of the
+           packets lost for over a minute (real network, DESIGN 13.26) */
+        if (w->lt_prev_rate != 0 && rate + w->lt_prev_rate / 4 >= w->lt_prev_rate && rate <= w->lt_prev_rate + w->lt_prev_rate / 4) {
+            w->lt_state = 1;
+            w->lt_rate = (uint32_t)(((uint64_t)rate + w->lt_prev_rate) / 2);
+            w->lt_ref_loss = (loss + w->lt_prev_loss) / 2;
+        } else {
+            w->lt_prev_rate = rate;
+            w->lt_prev_loss = loss;
+        }
+    } else {
+        w->lt_prev_rate = 0;
+    }
+    w->lt_rd = w->lt_lost = 0;
+    w->lt_rounds = 0;
+    w->lt_bad = 0;
+    w->lt_ts = w->current | 1;
+    w->lt_sent0 = w->sent_wire;
+}
+
+/* The RTT the model works with: min_rtt, but not below the update interval.
+ * RTT samples are taken against the time of the last anl_update, up to an
+ * interval old when a datagram arrives in between: on a path of a few ms a
+ * sample of 1 ms stood for 10 s in min_rtt, cwnd (2 x bw x min_rtt) fell to 4
+ * segments and the delivery rate - and btl_bw - with it (real network, DESIGN
+ * 13.22). The sender also acts only every interval: cwnd has to cover that. */
+static uint32_t bbr_rtt(const anl_t *w)
+{
+    return umax32(w->min_rtt, (uint32_t)w->interval);
 }
 
 static uint64_t bbr_bdp(const anl_t *w)
 {
-    return (uint64_t)bbr_bw(w) * w->min_rtt / 1000;
+    return (uint64_t)bbr_bw(w) * bbr_rtt(w) / 1000;
 }
 
 static uint64_t bbr_inflight_bytes(const anl_t *w)
@@ -1913,7 +2040,7 @@ static uint64_t bbr_inflight_bytes(const anl_t *w)
  * loss from random (radio) loss. */
 static int bbr_queue_signal(const anl_t *w)
 {
-    return w->min_rtt > 0 && w->prev_round_min_rtt > w->min_rtt + umax32(w->min_rtt / 4, 5);
+    return w->min_rtt > 0 && w->prev_round_min_rtt > bbr_rtt(w) + umax32(bbr_rtt(w) / 4, 5);
 }
 
 static void bbr_set_cwnd(anl_t *w)
@@ -1930,6 +2057,14 @@ static void bbr_set_cwnd(anl_t *w)
             segs = umin32(segs, (uint32_t)(bdp / 2 / w->avg_seg));
     }
     if (bbr_headroom(w)) segs = umax32(segs, w->init_cwnd);     /* room for an app-limited burst */
+    /* ... and a window for the rate bursts go out at: on a short path the
+       model's BDP (the application's average rate) held a key frame to 13
+       segments per RTT, 20 ms instead of 5 (DESIGN 13.23) */
+    if (bbr_burst(w) && w->min_rtt != 0) {
+        uint64_t target = (uint64_t)w->burst_bw * bbr_rtt(w) / 1000u * 2u + 3u * w->avg_seg;
+        if (w->inflight_hi != 0 && target > w->inflight_hi) target = w->inflight_hi;
+        segs = umax32(segs, (uint32_t)umin32((uint32_t)(target / w->avg_seg), ANL_MAX_WND));
+    }
     if (tdiff(w->round_count, w->rto_round) < 0)        /* after an RTO: packet conservation */
         segs = umin32(segs, umax32(w->rto_inflight, BBR_MIN_CWND));
     w->cwnd = umax32(segs, BBR_MIN_CWND);
@@ -1999,6 +2134,7 @@ static void bbr_round_end(anl_t *w, int app_limited)
     uint32_t i;
     w->prev_round_min_rtt = w->round_min_rtt;
     w->round_min_rtt = 0;
+    bbr_policer(w, rd, lost, app_limited);
     /* BBRv2: congestive loss bounds inflight - loss while a queue stands.
        Loss without a queue (radio, random) does not: on lossy links it would
        throttle to nothing. Heavy loss without a queue (a policer) counts only
@@ -2054,7 +2190,18 @@ static void bbr_round_end(anl_t *w, int app_limited)
     }
     w->round_delivered0 = w->delivered;
     w->round_lost0 = w->lost_bytes;
-    /* STARTUP ends when the bandwidth stops growing by 25% for 3 rounds */
+    /* STARTUP ends when the bandwidth stops growing by 25% for 3 rounds -
+       or when a round lost over 40% of what it sent: a policer's bucket let
+       the doubling run far past its rate (20000 of 26000 retransmissions of
+       a 75 s stream were STARTUP's, DESIGN 13.26). Only once the model has
+       grown to 4x the initial rate: a path that dropped everything in its
+       first second otherwise left STARTUP at almost nothing, and PROBE_BW
+       took 70 s to reach 60 Mbps (DESIGN 13.25). No inflight bound: the
+       loss may be random. */
+    if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && w->min_rtt != 0 &&
+        (uint64_t)w->btl_bw * w->min_rtt >= 4000ull * w->init_cwnd * w->mss &&
+        lost > 8u * w->avg_seg && lost * 100 > 40 * (rd + lost))
+        w->full_bw_reached = 1;
     if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && !app_limited && w->btl_bw != 0) {
         if (w->btl_bw >= w->full_bw + w->full_bw / 4) { w->full_bw = w->btl_bw; w->full_bw_cnt = 0; }
         else if (++w->full_bw_cnt >= 3) w->full_bw_reached = 1;
@@ -2139,6 +2286,14 @@ static void bbr_on_send(anl_t *w, anl_seg *seg)
         w->first_sent_ts = w->delivered_ts = w->current;
         w->first_sent_wire = w->sent_wire;
     }
+    seg->burst_id = 0;
+    if (w->burst_open && seg->xmit == 1) {
+        if (w->burst_t0 == 0) { w->burst_t0 = w->current | 1; w->burst_sw0 = w->sent_wire; }
+        seg->burst_id = w->burst_id;
+        w->burst_t1 = w->current | 1;
+        w->burst_sw1 = w->sent_wire + wire;
+        if (--w->burst_left == 0) w->burst_open = 0;    /* sent: later data is not part of it */
+    }
     w->sent_wire += wire;
     seg->rs_sent = w->sent_wire;
     seg->rs_sent_first = w->first_sent_wire;
@@ -2151,9 +2306,61 @@ static void bbr_on_send(anl_t *w, anl_seg *seg)
     w->avg_seg = (uint32_t)umax32((uint32_t)((int32_t)w->avg_seg + ((int32_t)wire - (int32_t)w->avg_seg) / 8), 32);
 }
 
+/* A burst of an app-limited sender (a key frame) on a path whose RTT is
+   longer than the burst: every rate sample spans burst plus RTT, a fraction
+   of the rate the burst went through at - on a 100 ms path the estimate stays
+   at the video's average rate and a 30 KB key frame takes 20 ms to leave
+   (real network, DESIGN 13.23). The spacing of its ACKs shows the rate
+   (packet-train dispersion): bytes of its segments acknowledged after the
+   first one over the time since, capped at the rate it was sent at (ACK
+   compression cannot raise it above that). Its own segments, tagged when
+   sent: other traffic in flight (audio) does not matter. Not for the model -
+   an estimate that full at once filled bottleneck queues in STARTUP and next
+   to bulk traffic (s5, priority test) - but burst_bw, the rate an
+   app-limited sender paces at (compute_pace_rate): 1.25x of it, so that the
+   next burst can find more; less by a fifth when the burst queued. */
+static void burst_on_acked(anl_t *w, const anl_seg *s)
+{
+    uint32_t el;
+    uint64_t disp;
+    if (s->burst_id == 0 || s->burst_id != w->burst_id || w->burst_done || s->xmit != 1) return;
+    /* a queue the burst added beyond what it built itself: over the RTT
+       its first segment saw (a home downlink jitters by 10 ms and more
+       without any queue of ours: against min_rtt that halved burst_bw
+       again and again, DESIGN 13.23); its segments wait behind each other
+       at most the time its ACKs have taken so far (a burst sent at the
+       bottleneck rate queues too). A queue already there is the model's
+       (bbr_queue_signal stops burst pacing). */
+    if (w->disp_ts == 0) {
+        w->disp_ts = w->current | 1;
+        w->disp_bytes = 0;
+        w->burst_rtt0 = umax32(w->last_rtt > 0 ? (uint32_t)w->last_rtt : 0, bbr_rtt(w));
+        return;
+    }
+    el = (uint32_t)tdiff(w->current, w->disp_ts);
+    if (w->last_rtt > 0 && (uint32_t)w->last_rtt > w->burst_rtt0 + umax32(bbr_rtt(w) / 4, 5) + el) {
+        /* what it went through at so far, at most 4/5 of the last; half
+           without a measurement (a link that slowed down: soak bw2m) */
+        w->burst_bw = w->burst_cur != 0 ? umin32(w->burst_cur, w->burst_bw / 5 * 4) : w->burst_bw / 2;
+        w->burst_cur = 0;
+        w->burst_done = 1;
+        return;
+    }
+    w->disp_bytes += seg_wire(s) + s->fec_share;
+    if (w->disp_bytes < 8u * w->avg_seg || el < 4) return;
+    disp = (uint64_t)w->disp_bytes * 1000 / el;
+    if (tdiff(w->burst_t1, w->burst_t0) > 0) {
+        uint64_t sr = (uint64_t)(w->burst_sw1 - w->burst_sw0) * 1000 / (uint32_t)tdiff(w->burst_t1, w->burst_t0);
+        if (disp > sr) disp = sr;
+    }
+    if (disp > 0xffffffffu) disp = 0xffffffffu;
+    w->burst_cur = (uint32_t)disp;
+}
+
 /* a data segment was acknowledged */
 static void bbr_on_acked(anl_t *w, const anl_seg *s, bbr_sample *rs)
 {
+    burst_on_acked(w, s);
     w->delivered += seg_wire(s);
     w->delivered_fec += s->fec_share;
     w->delivered_ts = w->current;
@@ -2203,8 +2410,8 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
            overflow loss never counts. (The round's smallest sample would
            let jittery paths qualify too, but it lags a building queue by a
            round: measured worse on shared bottlenecks, DESIGN 13.14.) */
-        if (w->min_rtt > 0 && send_el > 0 && send_el >= (int32_t)(w->min_rtt / 2) && w->last_rtt > 0 &&
-            (uint32_t)w->last_rtt <= w->min_rtt + umax32(w->min_rtt / 16, 3)) {
+        if (w->min_rtt > 0 && w->lt_state == 0 && send_el > 0 && send_el >= (int32_t)(w->min_rtt / 2) && w->last_rtt > 0 &&
+            (uint32_t)w->last_rtt <= bbr_rtt(w) + umax32(bbr_rtt(w) / 16, 3)) {
             uint64_t sr = (uint64_t)rs->sent * 1000 / (uint32_t)send_el;
             if (sr > bw * 3 / 2) sr = bw * 3 / 2;
             if (sr > bw) bw = sr;
@@ -3275,7 +3482,18 @@ static void anl_flush_internal(anl_t *w)
     FOR_EACH_STREAM(w, st, n, nx) {
         if (stream_sendable(st)) semi_drop_check(w, st);
     }
-    FOR_EACH_STREAM(w, st, n, nx) inflight += st->nsnd_buf;
+    /* in flight: sent and not acknowledged, minus what RACK declared lost
+       and is not resent yet (BBR's pipe). With the lost segments counted, a
+       policer that dropped half of a STARTUP overshoot kept DRAIN from ever
+       ending: inflight stayed far above the BDP, the drain gain slowed the
+       retransmissions, their samples lowered btl_bw and so the pace - down
+       to 0.4 Mbps on a 10 Mbps path for 20 s (DESIGN 13.25) */
+    FOR_EACH_STREAM(w, st, n, nx) {
+        anl_node *pos;
+        inflight += st->nsnd_buf;
+        for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next)
+            if (QENTRY(pos, anl_seg, node)->lost && inflight > 0) inflight--;
+    }
     w->inflight_segs = inflight;
     w->flush_budget = (int64_t)w->cwnd - (int64_t)inflight;
 
@@ -3328,6 +3546,21 @@ static void anl_flush_internal(anl_t *w)
     /* 4: parities and new data. The default stream has strict priority, the
        others share by weighted round robin; a stream's due parity goes first
        in its turn: it repairs data already sent. */
+    if (w->app_limited != 0 && !w->burst_open) {    /* a burst after app-limited sending (burst_on_acked) */
+        uint32_t q = 0;
+        FOR_EACH_STREAM(w, st, n, nx) {
+            if (stream_sendable(st)) q += st->nsnd_que;
+        }
+        if (q >= 8) {
+            if (++w->burst_id == 0) w->burst_id = 1;
+            if (w->burst_cur > w->burst_bw) w->burst_bw = w->burst_cur;
+            w->burst_cur = 0;
+            w->burst_open = 1;
+            w->burst_left = q;
+            w->burst_done = 0;
+            w->burst_t0 = w->disp_ts = 0;
+        }
+    }
     st = w->dflt;
     if (st->fec && !w->pace_blocked) fec_pump(w, st, 0);
     while (!w->pace_blocked && w->flush_budget > 0 && st->nsnd_que > 0 && stream_sendable(st) &&
@@ -3365,8 +3598,10 @@ static void anl_flush_internal(anl_t *w)
        held back by a stream window is not: that is the receiver's limit, and
        an app-limited sender gets burst headroom a window-limited one must not
        have (it would pace at the STARTUP gain for good) */
-    if (!w->pace_blocked && w->flush_budget > 0 && !has_queued_data(w))
+    if (!w->pace_blocked && w->flush_budget > 0 && !has_queued_data(w)) {
         w->app_limited = (w->delivered + bbr_inflight_bytes(w)) | 1;
+        w->burst_open = 0;
+    }
 
     /* 5: FEC: blocks that collected FEC_BLOCK_MS, parities still due (streams
        without new data), in priority order; stale parities */

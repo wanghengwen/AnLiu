@@ -252,7 +252,10 @@ void     anl_set_rate_callback(anl_t *w, anl_rate_fn fn);
 void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
 
 /* Feed a raw UDP datagram; on ANL_EAUTH the caller must not respond.
- * It may send an ACK at once: the output callback may be invoked synchronously. */
+ * It may send an ACK at once: the output callback may be invoked synchronously.
+ * RTT samples are taken against the time of the last anl_update: calling
+ * anl_update(now) before anl_input keeps them exact (the model tolerates up
+ * to one interval of staleness, DESIGN 6.8). */
 int      anl_input(anl_t *w, const char *data, long size);
 /* feed plaintext already verified by anl_peek_conv (skips crypto) */
 int      anl_input_plain(anl_t *w, const char *plain, long size);

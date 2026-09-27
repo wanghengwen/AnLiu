@@ -130,6 +130,7 @@ typedef struct dir {
     pkt *head, *tail;
     uint64_t rng;
     uint64_t pkts, bytes, lost_rand, lost_queue, delivered;
+    double tokens, tok_t;   /* --policer: token bucket (bytes), time of the last refill */
 } dir;
 
 enum { P_ANL, P_KCP };
@@ -247,6 +248,8 @@ static int link_lost(dir *d, uint64_t now)
     return rnd_unit(&d->rng) < c->loss;
 }
 
+static int g_pol_kbps, g_pol_kb = 64;     /* --policer: token bucket rate, depth (0 = off) */
+
 static void sim_send(sim *s, int from, const char *buf, int len)
 {
     dir *d = &s->d[from];
@@ -262,6 +265,15 @@ static void sim_send(sim *s, int from, const char *buf, int len)
     if (s->blackhole) return;
     d->pkts++;
     d->bytes += (uint64_t)len;
+    if (g_pol_kbps > 0) {       /* a policer: over the rate beyond the bucket is dropped, no queue */
+        double cap = g_pol_kb * 1024.0;
+        if (d->tok_t == 0 && d->tokens == 0) { d->tokens = cap; d->tok_t = t; }
+        d->tokens += (t - d->tok_t) * g_pol_kbps / 8.0;
+        if (d->tokens > cap) d->tokens = cap;
+        d->tok_t = t;
+        if (d->tokens < len + IPUDP_HDR) { d->lost_queue++; return; }
+        d->tokens -= len + IPUDP_HDR;
+    }
     if (d->c.bw_kbps > 0) {
         double ser = (len + IPUDP_HDR) * 8.0 / d->c.bw_kbps;     /* ms */
         double start = d->free_at > t ? d->free_at : t;
@@ -653,6 +665,7 @@ static void flow_gen(sim *s, flow *f)
                     double rate = st.target_rate > 16000 ? st.target_rate - 8000.0 : 8000.0;
                     len = (int)(len * rate / nominal);
                     if (len < 200) len = 200;
+                    if (len > (int)sizeof(g_buf) / 2) len = (int)sizeof(g_buf) / 2;   /* 128 KB: the buffer is 256 KB */
                 }
             }
             gen_one(s, f, len, key);
@@ -1417,6 +1430,8 @@ static void usage(void)
            "  --fec-ratio N   FEC flows: redundancy in %%, 1..100, 0 = adaptive (default 25)\n"
            "  bwstep          bottleneck steps 8/2/5/1/8 Mbps: bandwidth estimate, utilisation, latency\n"
            "  --step S        bwstep: seconds per step (default 10); --step-loss P: loss %%\n"
+           "  --qdelay MS     bottleneck buffer in ms of queueing (default 100; small = policer-like)\n"
+           "  --policer KBPS  token-bucket policer in front of the bottleneck (drops, no queue); --pbucket KB depth (64)\n"
            "  --abr           bwstep: no bulk flow, the video bitrate follows stats.target_rate\n"
            "  --nobulk        bwstep: no bulk flow, fixed video bitrate (the baseline for --abr)\n"
            "  --soak S        soak duration (default 3600), --phase S (60), --sample S (60)\n"
@@ -1442,6 +1457,9 @@ int main(int argc, char **argv)
         if (a[0] == 's' && a[1] >= '1' && a[1] <= '5' && a[2] == 0) { want[a[1] - '0'] = 1; any = 1; }
         else if (!strcmp(a, "soak")) { soak = 1; any = 1; }
         else if (!strcmp(a, "bwstep")) { bwstep = 1; any = 1; }
+        else if (!strcmp(a, "--qdelay")) { g_qdelay = atoi(nx); i++; }
+        else if (!strcmp(a, "--policer")) { g_pol_kbps = atoi(nx); i++; }
+        else if (!strcmp(a, "--pbucket")) { g_pol_kb = atoi(nx); i++; }
         else if (!strcmp(a, "--abr")) g_abr = 1;
         else if (!strcmp(a, "--nobulk")) g_abr = 2;
         else if (!strcmp(a, "--step")) { g_step_s = atoi(nx); i++; }
