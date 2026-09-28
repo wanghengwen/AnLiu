@@ -42,6 +42,7 @@ void anl_allocator(void *(*new_malloc)(size_t), void (*new_free)(void *))
 static int32_t tdiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 static uint32_t umin32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 static uint32_t umax32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+static uint32_t sat32(uint64_t v) { return v > 0xffffffffu ? 0xffffffffu : (uint32_t)v; }
 static uint32_t ubound32(uint32_t lo, uint32_t v, uint32_t hi)
 {
     return umin32(umax32(lo, v), hi);
@@ -381,6 +382,13 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define BBR_PATH_ROUNDS     3       /* rounds a queue outlives our cuts before it counts as the path RTT */
 #define BBR_BETA            179     /* 0.7: inflight_hi after congestive loss */
 #define BBR_MIN_CWND        4
+#define BBR_DW_SLOTS        16      /* delivered-bytes checkpoints spanning at least the sampling window */
+#define BBR_DW_MIN_MS       10      /* smooth millisecond clock quantization even with 1 ms updates */
+#define BBR_LT_SPAN         8       /* policed intervals before the first probe above the rate; doubles up to BBR_LT_SPAN_MAX */
+#define BBR_LT_SPAN_MAX     64
+#define BBR_LT_PROBE_MAX    16      /* probe steps of 1/4 lt_rate without finding the ceiling: the policer is gone */
+#define BBR_LT_ROUNDS       4       /* rounds per policer-detection interval (and >= BBR_LT_MS) */
+#define BBR_LT_MS           300
 #define SEG_WIRE_OVH        30      /* per-segment share of datagram / segment headers */
 #define FEC_K_MAX       64      /* data packets per Reed-Solomon block */
 #define FEC_M_MAX       16      /* parities per block */
@@ -407,6 +415,7 @@ typedef struct anl_seg {
     uint32_t ts_sent;       /* time of the last transmission (RACK); receiver: the peer's send time */
     uint32_t fec_ts;        /* its FEC block's last parity goes out (first transmission only) */
     uint16_t fec_share;     /* its share of the block's parity bytes (delivery rate) */
+    uint8_t  lost_cnt;      /* counted in lost_bytes (RACK marked it; undone if the original arrives) */
     uint32_t resendts;
     uint32_t rto;
     uint32_t lost;          /* RACK declared it lost: retransmit at the next flush */
@@ -560,7 +569,7 @@ struct anl_s {
     uint32_t first_sent_ts;             /* send time of the packet starting the sampling interval */
     uint32_t sent_wire, first_sent_wire; /* wire bytes sent (data, retransmissions, parity; wraps) */
     uint64_t app_limited;               /* != 0: samples are app-limited until delivered passes it */
-    uint64_t lost_bytes;                /* data bytes lost: RTO, or RACK once the retransmission is acknowledged and not spurious */
+    uint64_t lost_bytes;                /* RACK-marked bytes (spurious marks undone); RTO losses counted at ACK */
     uint32_t inflight_segs;             /* segments in flight (exact at each flush) */
     uint32_t avg_seg;                   /* average wire size of a data segment, bytes */
     uint64_t next_round_delivered;
@@ -572,13 +581,27 @@ struct anl_s {
     uint32_t net_sample_ts;             /* ... its time (| 1); 0 = none (stats.bw_estimate_age_ms) */
     uint32_t bw_lo;                     /* BBRv2 lower bound after congestive loss, until the next probe; 0 = none */
     uint32_t bw_idx;                    /* filter slot of the current round */
-    /* token-bucket policer detection (DESIGN 6.8): intervals of >= 16 rounds and 300 ms */
-    int lt_state;                       /* 0 watching, 1 testing at lt_rate, 2 policed at lt_rate */
-    int lt_bad;                         /* the interval had app-limited or queued rounds */
+    /* token-bucket policer detection (DESIGN 6.8): intervals of >= BBR_LT_ROUNDS rounds and 300 ms */
+    int lt_state;                       /* 0 watching, 1 testing at lt_rate, 2 policed at lt_rate, 3 probing above it */
+    int lt_bad;                         /* the interval had app-limited (1) or queued (2) rounds */
     uint32_t lt_ts, lt_rounds, lt_left, lt_hold;
     uint32_t lt_sent0;                  /* sent_wire at the start of the interval */
+    uint8_t  post_startup;              /* rounds after STARTUP in which heavy loss can trim stale bandwidth peaks */
+    uint8_t  lt_k;                      /* probing: the step above lt_rate, pace = lt_rate * (4 + k) / 4 */
+    uint8_t  lt_from;                   /* probing: 1 confirming a test, 2 after the policed intervals */
+    uint32_t lt_span;                   /* policed intervals before the next probe (doubles while confirmed) */
+    uint8_t  lt_tail;                   /* probing: the step showed the ceiling, this interval measures its rate */
+    uint8_t  lt_skip;                   /* the pace just changed: the next round is the transition, not measured */
+    uint32_t lt_res;                    /* residual (random) loss at lt_rate, per mille, from the test */
+    uint64_t lt_infl0;                  /* inflight bytes at the start of the interval */
     uint64_t lt_rd, lt_lost;
-    uint32_t lt_rate, lt_prev_rate, lt_prev_loss, lt_ref_loss;  /* bytes/s; loss per mille */
+    uint32_t lt_rate, lt_prev_rate, lt_prev_loss, lt_ref_loss;  /* prev_rate: prior watching interval / probe step; loss per mille */
+    uint32_t lt_save_btl;               /* btl_bw before the test (restored if it fails) */
+    /* delivered-byte checkpoints spanning max(update interval, 10 ms)
+       for bbr_window_bw, even when updates arrive every millisecond */
+    uint32_t dw_ts[BBR_DW_SLOTS];
+    uint64_t dw_bytes[BBR_DW_SLOTS];
+    uint32_t dw_idx, dw_n;              /* newest slot; slots filled */
     uint32_t burst_id;                  /* the last app-limited burst (a key frame); its segments carry it */
     uint8_t  burst_open, burst_done;    /* its segments are being sent; its measurement is over */
     uint32_t burst_left;                /* segments of it not sent yet (queued when it opened) */
@@ -599,12 +622,16 @@ struct anl_s {
     int probe_phase;                    /* PROBE_BW: BBR_DOWN .. BBR_UP */
     uint32_t phase_ts, phase_round;     /* start of the phase; REFILL: the round it ends */
     uint32_t probe_ts, probe_round;     /* the last probe ended: wall clock (+ 2..3 s), round */
-    uint32_t up_bw, up_stall;           /* UP: btl_bw at the last 25% growth; rounds since */
+    uint32_t up_bw, up_stall;           /* UP: btl_bw at the last 12.5% growth; rounds since */
     uint32_t probe_rtt_done_ts, probe_rtt_round;
     uint32_t prior_cwnd;
     uint64_t inflight_hi;               /* BBRv2 loss bound on inflight, bytes; 0 = none */
     uint32_t loss_rate;                 /* smoothed per-round loss fraction, 1/256 */
     uint32_t qfall;                     /* consecutive congestive rounds whose delivery rate fell with our cuts */
+    uint32_t qflat, qflat_rtt;          /* consecutive loss-free rounds at gain <= 1 whose RTT stayed above min_rtt, and that RTT */
+    uint8_t  qflat_probe;               /* the current PROBE_RTT was asked for by qflat: its RTT becomes min_rtt */
+    uint8_t  min_rtt_probed;            /* a PROBE_RTT has run since min_rtt last took a lower value */
+    uint32_t qfall_rtt, qfall_rate;     /* ... the round min RTT and delivery rate of the last one counted */
     uint32_t round_ts, last_round_rate; /* start of the round; delivery rate of the last round, bytes/s */
     uint32_t clean_rounds;              /* rounds without congestive loss since inflight_hi was set */
     uint32_t rto_round, rto_inflight;   /* after an RTO: packet conservation for a round */
@@ -1086,7 +1113,9 @@ static void ack_schedule(anl_stream *st)
  * pacing (DESIGN 6.7)
  *-------------------------------------------------------------------*/
 static uint32_t bbr_bw(const anl_t *w);
+static uint32_t bbr_lt_probe_rate(const anl_t *w);
 static int bbr_queue_signal(const anl_t *w);
+static uint64_t bbr_inflight_bytes(const anl_t *w);
 
 /* Burst headroom for an app-limited sender whose bandwidth estimate only
  * shows what the application offered: a key frame goes out at the STARTUP
@@ -1897,6 +1926,18 @@ static int rack_detect(anl_t *w, anl_stream *st)
         if (rack_candidate(w, st, s) && tdiff(w->current, rack_sent(s) + wait) >= 0) {
             s->lost = 1;
             marked++;
+            /* counted for congestion control now (Linux BBR does the same):
+               waiting for the retransmission's ACK put the loss 1-2 RTTs
+               late, after a policer's bucket had let STARTUP overshoot -
+               the rounds that should have stopped it saw none (DESIGN 13.28).
+               Undone if the original turns up (handle_ack, Eifel). Not for a
+               segment the RTO already retransmitted: after an outage the
+               first ACK marks everything sent during it at once - 86% of the
+               round, which reads as a policer (BBR_LOSS_BLIND) and held bw_lo
+               and inflight_hi down for 800 ms after the link came back (soak
+               outage, inter p99 +8%). Those count when their recovery is
+               acknowledged (handle_ack), spread over the rounds it takes. */
+            if (!s->lost_cnt && s->rack_rtx != 2) { s->lost_cnt = 1; w->lost_bytes += seg_wire(s); }
         }
     }
     if (marked && w->reo_mult > 1) {
@@ -1940,6 +1981,8 @@ static uint32_t bbr_bw(const anl_t *w)
        27 -> 18 Mbps over a minute on a 30 Mbps path (DESIGN 13.25); testing:
        at most that rate */
     if (w->lt_state == 2) return w->lt_rate;
+    /* probing above it: one step of a quarter per interval (bbr_policer) */
+    if (w->lt_state == 3) return bbr_lt_probe_rate(w);
     return w->lt_state != 0 && w->lt_rate < bw ? w->lt_rate : bw;
 }
 
@@ -1948,48 +1991,229 @@ static uint32_t bbr_bw(const anl_t *w)
  * loss on a radio link looks the same), and the send-rate credit then keeps
  * the sender at up to 1.5x the rate - 40% of the packets lost (a home uplink,
  * real network, DESIGN 13.22). Told apart by the response (BBRv1's long-term
- * sampling plus a test): two intervals (>= 16 rounds and 300 ms) in a row,
- * network-limited, no queue, over 20% lost, delivering the same rate within
- * 1/8 - then an interval paced at that rate. A policer's share of the loss
- * goes (random loss on top of it stays): at least halved is a policer,
- * policed for 48 intervals (then watched again); otherwise 48 intervals
- * without suspicion. Bursty random loss varies a lot between intervals:
- * with 10%, a third and 8 rounds 4 of 20 soak runs took 5% burst loss for a
- * policer. */
+ * sampling plus a test): two intervals (>= BBR_LT_ROUNDS rounds and 300 ms)
+ * in a row, network-limited, no queue, over 10% lost, delivering the same
+ * rate within 1/4 - then an interval paced at that rate. Halving the loss
+ * starts a probe for the ceiling; a failed test holds off for 48 intervals.
+ *
+ * The test alone passes on any path whose capacity is above the rate (a
+ * jittery 50 Mbps uplink was locked at 33 for two minutes, DESIGN 13.27): a
+ * policer is a ceiling, so the test is followed by intervals paced a
+ * quarter above the rate, then another quarter, and so on (lt_state 3,
+ * lt_k). Delivery stays at the rate and the excess is lost: the ceiling,
+ * and the policed state starts there. Delivery follows the pace: the
+ * ceiling, if there is one, is higher - the next step looks for it. Not
+ * "no policer": a 48 Mbps shaper with a burst allowance passed the first
+ * step for a whole interval (real network, DESIGN 13.29), and rejected, the
+ * sender went back to 1.5x the rate with a fifth lost for a minute. After
+ * BBR_LT_PROBE_MAX steps (5x the rate) exhaust the probe budget; a larger
+ * bucket or higher ceiling can still escape detection.
+ *
+ * Intervals are >= BBR_LT_ROUNDS rounds and 300 ms: at 280 ms RTT the
+ * 16-round intervals of DESIGN 13.22 took 9 s to enter the test and 18 s
+ * to a verdict, at 1.5x the policer's rate with a quarter lost.
+ *
+ * The policed state does not simply expire either: on a sub-millisecond
+ * path the token bucket the policer refilled while we paced below its rate
+ * passed everything, the samples ran off to the line rate within tens of
+ * milliseconds and 2400 segments were in flight before the bucket was empty
+ * (10000 retransmissions every 15 s, DESIGN 13.28). Instead the same probe
+ * runs after lt_span intervals: pace a quarter above the rate, then another
+ * quarter, and so on. The ceiling shows again - lt_rate becomes what was
+ * delivered (the policer's rate may have changed) and the policed state
+ * resumes for twice as many intervals (up to BBR_LT_SPAN_MAX); after
+ * BBR_LT_PROBE_MAX steps without a ceiling the policer is gone, and the
+ * bandwidth filter restarts from what the last step delivered. A bucket can
+ * pass multiple steps; once it empties, the excess is bounded by the probe
+ * rate instead of a window that grew to the line rate. A
+ * queue during a probe (a buffered bottleneck) is not a policer either. */
+static uint32_t bbr_lt_probe_rate(const anl_t *w)
+{
+    return sat32((uint64_t)w->lt_rate * (4u + w->lt_k) / 4u);
+}
+
+/* the bandwidth filter restarts from a rate (the probe's delivery) */
+static void bbr_reset_filter(anl_t *w, uint32_t rate)
+{
+    uint32_t k;
+    for (k = 0; k < BBR_BW_ROUNDS; k++) w->bw_round[k] = rate;
+    w->btl_bw = rate;
+    w->bw_lo = 0;
+}
+
 static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
 {
-    uint32_t dur, rate, loss;
-    if (w->lt_ts == 0) { w->lt_ts = w->current | 1; w->lt_sent0 = w->sent_wire; }
+    uint32_t dur, rate, loss, counted;
+    if (w->lt_ts == 0) { w->lt_ts = w->current | 1; w->lt_sent0 = w->sent_wire; w->lt_infl0 = bbr_inflight_bytes(w); }
+    /* Just after STARTUP a round over 25% lost, delivering less than half
+       the estimate, clears what the filter kept
+       of STARTUP: a policer with a large bucket let STARTUP measure 4x its
+       rate, and the filter took 10 s to come down through its rounds at
+       277 ms RTT - retransmissions sent at 2-4x the rate were lost again and
+       again, delivery stalled and resumed second by second (29000
+       retransmissions in 13 s, DESIGN 13.27). The round's delivery rate is
+       where the model restarts; probing finds any more. (Starting the
+       policer test there instead locked a 45 Mbps path at 33 for two
+       minutes: the test passes whenever the rate is below the capacity.) */
+    if (w->post_startup > 0) {
+        w->post_startup--;
+        /* a round of at least half the window: losses are counted when RACK
+           marks them (rack_detect), and a short round of a 20% random-loss
+           path (a few segments delivered between two marks) showed 27%
+           and pulled the filter down to a quarter (s1 20%/200 ms) */
+        if (!app_limited && rd > 0 && lost * 4 > rd + lost && rd + lost >= (uint64_t)w->cwnd * w->avg_seg / 2) {     /* over 25%: a burst or jitter makes 10% */
+            uint32_t dur0 = (uint32_t)tdiff(w->current, w->round_ts);
+            uint32_t r = dur0 > 0 ? (uint32_t)umin32((uint32_t)(rd * 1000 / dur0), 0xffffffffu) : 0;
+            if (r != 0 && (uint64_t)r * 2 < w->btl_bw) {       /* random loss still delivers most of it */
+                uint32_t k;
+                for (k = 0; k < BBR_BW_ROUNDS; k++) w->bw_round[k] = umin32(w->bw_round[k], r);
+                w->btl_bw = r;
+                w->bw_lo = 0;
+            }
+            w->post_startup = 0;
+        }
+    }
+    /* the first round at a new pace is the transition: what was in flight
+       at the old pace is still being dropped (a third of it after 1.5x the
+       rate) and would be the new interval's loss - 14% in a test paced at
+       the rate, which failed (30 Mbps policer, 100 ms); it is left out */
+    if (w->lt_skip) {
+        w->lt_skip = 0;
+        w->lt_rd = w->lt_lost = 0;
+        w->lt_rounds = 0;
+        w->lt_bad = 0;
+        w->lt_ts = w->current | 1;
+        w->lt_sent0 = w->sent_wire;
+        w->lt_infl0 = bbr_inflight_bytes(w);
+        return;
+    }
     w->lt_rd += rd;
     w->lt_lost += lost;
     w->lt_rounds++;
-    if (app_limited || bbr_queue_signal(w)) w->lt_bad = 1;
+    if (app_limited) w->lt_bad |= 1;
+    if (bbr_queue_signal(w)) w->lt_bad |= 2;
     dur = (uint32_t)tdiff(w->current, w->lt_ts);
-    if (w->lt_rounds < 16 || dur < 300) return;
-    rate = (uint32_t)umin32((uint32_t)(w->lt_rd * 1000 / dur), 0xffffffffu);
-    loss = w->lt_rd + w->lt_lost > 0 ? (uint32_t)(w->lt_lost * 1000 / (w->lt_rd + w->lt_lost)) : 0;
-    if (w->lt_state == 1) {                             /* the test interval */
-        /* its loss from what it sent and what was delivered: the losses
-           counted in it are mostly of what was sent before, found a round
-           or more later - at 100 ms RTT they failed every test (sent 1.21
-           MB/s, delivered 1.21, "lost" 36%), then held for 48 intervals at
-           1.5x the policer's rate, a third lost (DESIGN 13.25) */
-        uint32_t sent = w->sent_wire - w->lt_sent0;
+    if (w->lt_rounds < BBR_LT_ROUNDS || dur < BBR_LT_MS) return;
+    rate = sat32(w->lt_rd * 1000 / dur);
+    counted = w->lt_rd + w->lt_lost > 0 ? (uint32_t)(w->lt_lost * 1000 / (w->lt_rd + w->lt_lost)) : 0;
+    /* The interval's loss from what it sent and what was delivered - what
+       is still in flight at its end was sent but could not be delivered yet,
+       what was in flight at its start is delivered in it but was sent
+       before: both are taken out, or a 4-round interval is a quarter off.
+       The losses counted (RACK) are mostly of what was sent before, found a
+       round or more later - at 100 ms RTT they failed every test (sent 1.21
+       MB/s, delivered 1.21, "lost" 36%), then held for 48 intervals at 1.5x
+       the policer's rate, a third lost (DESIGN 13.25). */
+    {
+        uint64_t sent = (uint64_t)(w->sent_wire - w->lt_sent0) + w->lt_infl0;
+        uint64_t infl = bbr_inflight_bytes(w);
+        sent = sent > infl ? sent - infl : 0;
         loss = sent > w->lt_rd ? (uint32_t)((sent - w->lt_rd) * 1000 / sent) : 0;
-        if (loss * 2 < w->lt_ref_loss) {
+    }
+#ifdef ANL_POLICER_TRACE
+    /* Optional internal diagnostics: observe the completed interval before
+       the decision, and afterwards while its counters are still intact. */
+    ANL_POLICER_TRACE(w, dur, rate, loss, counted, 0);
+#endif
+    if (w->lt_state == 1) {                             /* the test interval */
+        if (loss * 2 < w->lt_ref_loss && !(w->lt_bad & 1)) {
             /* what is still lost at the policer's rate is random loss: send
-               that much more, or random loss on top would pace below the rate */
-            w->lt_rate = (uint32_t)umin32((uint32_t)((uint64_t)w->lt_rate * 1000 / (1000 - umin32(loss, 500))), 0xffffffffu);
-            w->lt_state = 2;
-            w->lt_left = 48;
+               that much more, or random loss on top would pace below the rate.
+               The smaller of the two measures: what was sent includes the
+               retransmissions of the intervals before (10% on a clean 30
+               Mbps policer, paced 6% above it for good), what was counted
+               includes their tail (RACK, a round late) */
+            w->lt_res = umin32(umin32(loss, counted), 500);
+            w->lt_rate = sat32((uint64_t)w->lt_rate * 1000 / (1000 - w->lt_res));
+            w->lt_state = 3;                            /* look for the ceiling: a quarter above it */
+            w->lt_k = 1;
+            w->lt_from = 1;
+            w->lt_tail = 0;
+            w->lt_skip = 1;
+            if (w->lt_span == 0) w->lt_span = BBR_LT_SPAN;
         }
-        else { w->lt_state = 0; w->lt_hold = 48; }
+        else {
+            w->lt_state = 0;
+            w->lt_hold = 48;
+            /* the loss is random: the estimate from before the test stands
+               for another filter window (the test's samples, paced at the
+               rate, had taken the filter down to it - heavy20 video on time
+               99 -> 96%, DESIGN 13.26) */
+            w->bw_round[w->bw_idx] = umax32(w->bw_round[w->bw_idx], w->lt_save_btl);
+            w->btl_bw = umax32(w->btl_bw, w->lt_save_btl);
+        }
         w->lt_prev_rate = 0;
+    } else if (w->lt_state == 3) {                      /* probing above the rate, step lt_k */
+        /* Paced lt_rate * (4 + k) / 4, a share k / (4 + k) of what is sent
+           is above the rate. A ceiling drops it: the loss rises by that
+           much over the residual (lt_res). Random loss does not depend on
+           the pace: at 20% it read "an eighth more sent than delivered" and
+           locked a 20 Mbps path at 0.8 (s1 20%/50 ms) - it is the rise that
+           tells. Half the share: a jittery ceiling drops less. */
+        uint32_t excess = 1000u * w->lt_k / (4u + w->lt_k);
+        uint32_t sent_rate = sat32((uint64_t)(w->sent_wire - w->lt_sent0) * 1000 / dur);
+        /* A window stall can leave a tail below the offered probe rate with
+           little loss: its low delivery does not measure the ceiling. Keep
+           the old rate without lengthening the retry interval. Still use a
+           lossy tail when capacity really fell, even if sending slowed.
+           Use the first step's loss margin at every k: a larger nominal
+           probe must not make a 15% lossy, underfed tail look loss-free. */
+        int tail_limited = w->lt_tail && loss < w->lt_res + 100 &&
+            (uint64_t)sent_rate * 8 < (uint64_t)bbr_lt_probe_rate(w) * 7;
+        if (w->lt_bad & 2) {                            /* a queue: a buffered bottleneck, not a policer */
+            w->lt_state = 0;
+            w->lt_hold = 48;
+            w->lt_span = 0;
+            w->lt_tail = 0;
+        } else if ((w->lt_bad & 1) || tail_limited) {  /* insufficient offered load: no verdict */
+            if (w->lt_from == 1) { w->lt_state = 0; w->lt_hold = BBR_LT_SPAN; w->lt_span = 0; }
+            else { w->lt_state = 2; w->lt_left = w->lt_span; }
+            w->lt_tail = 0;
+        } else if (w->lt_tail) {
+            /* the tail: the same pace for an interval with the bucket empty
+               (the interval that showed the ceiling delivered the bucket the
+               policed state had refilled on top of the rate: 6% over on a
+               30 Mbps policer, then 6% lost for good). Its delivery, plus
+               the residual, is the policer's rate; not below 7/8 of the
+               estimate - one tail can be unlucky, the next probe measures
+               again (50 ms tails read 1.35, 1.18, 1.03 MB/s for 1.25 on a
+               10 Mbps policer that passes its rate in slices: an interval
+               at least, DESIGN 13.29) */
+            uint32_t r = sat32((uint64_t)rate * 1000 / (1000 - w->lt_res));
+            w->lt_rate = umax32(umin32(r, bbr_lt_probe_rate(w)), w->lt_rate / 8 * 7);
+            w->lt_state = 2;
+            w->lt_left = w->lt_span;
+            w->lt_span = umin32(w->lt_span * 2, BBR_LT_SPAN_MAX);
+            w->lt_tail = 0;
+        } else if (loss >= w->lt_res + excess / 2 ||
+                   (w->lt_prev_rate != 0 && sent_rate >= w->lt_prev_rate &&
+                    rate < w->lt_prev_rate - w->lt_prev_rate / 32 && loss >= w->lt_res + 100)) {
+            /* A bucket can empty well above the old estimate: the larger
+               k's loss threshold would keep rising while delivery falls.
+               Stop also when offered load still covers the previous step's
+               delivery, delivery falls >1/32 and loss rises >=100 per mille
+               above the residual (the first step's half-excess threshold).
+               Neither a delivery dip nor residual random loss alone counts. */
+            w->lt_tail = 1;                             /* the ceiling: measure it */
+        } else if (++w->lt_k <= BBR_LT_PROBE_MAX) {
+            w->lt_prev_rate = rate;
+            w->lt_skip = 1;                             /* delivered: the ceiling, if any, is higher - the next step */
+        } else {
+            /* BBR_LT_PROBE_MAX steps (5x the rate) without a measured ceiling
+               (confirming a test: none at the rate it passed at, 48
+               intervals without suspicion; the policed state's: it is
+               gone, the filter restarts from what the last step delivered) */
+            w->lt_state = 0;
+            w->lt_hold = w->lt_from == 1 ? 48 : 0;
+            w->lt_span = 0;
+            bbr_reset_filter(w, rate);
+        }
+        if (w->lt_state != 3 || w->lt_tail) w->lt_prev_rate = 0;
     } else if (w->lt_state == 2) {
-        if (--w->lt_left == 0) { w->lt_state = 0; w->lt_prev_rate = 0; }
+        if (--w->lt_left == 0) { w->lt_state = 3; w->lt_k = 1; w->lt_from = 2; w->lt_tail = 0; w->lt_skip = 1; }
     } else if (w->lt_hold > 0) {
         w->lt_hold--;
-    } else if (!w->lt_bad && loss > 100) {
+    } else if (!w->lt_bad && counted > 100) {
         /* over 10% lost, rates within 1/4: a test costs one interval at the
            delivery rate, and the test itself tells a policer from random
            loss - over 20% and within 1/8 missed a 50 Mbps uplink whose rate
@@ -1997,20 +2221,26 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            packets lost for over a minute (real network, DESIGN 13.26) */
         if (w->lt_prev_rate != 0 && rate + w->lt_prev_rate / 4 >= w->lt_prev_rate && rate <= w->lt_prev_rate + w->lt_prev_rate / 4) {
             w->lt_state = 1;
+            w->lt_skip = 1;
             w->lt_rate = (uint32_t)(((uint64_t)rate + w->lt_prev_rate) / 2);
-            w->lt_ref_loss = (loss + w->lt_prev_loss) / 2;
+            w->lt_ref_loss = (counted + w->lt_prev_loss) / 2;
+            w->lt_save_btl = w->btl_bw;
         } else {
             w->lt_prev_rate = rate;
-            w->lt_prev_loss = loss;
+            w->lt_prev_loss = counted;
         }
     } else {
         w->lt_prev_rate = 0;
     }
+#ifdef ANL_POLICER_TRACE
+    ANL_POLICER_TRACE(w, dur, rate, loss, counted, 1);
+#endif
     w->lt_rd = w->lt_lost = 0;
     w->lt_rounds = 0;
     w->lt_bad = 0;
     w->lt_ts = w->current | 1;
     w->lt_sent0 = w->sent_wire;
+    w->lt_infl0 = bbr_inflight_bytes(w);
 }
 
 /* The RTT the model works with: min_rtt, but not below the update interval.
@@ -2113,6 +2343,7 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
 {
     int expired = w->min_rtt != 0 && tdiff(w->current, w->min_rtt_ts) > BBR_MIN_RTT_WIN;
     if (w->min_rtt == 0 || (uint32_t)rtt <= w->min_rtt || expired) {
+        if (w->min_rtt == 0 || (uint32_t)rtt < w->min_rtt) w->min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
         w->min_rtt = umax32((uint32_t)rtt, 1);
         w->min_rtt_ts = w->current;
     }
@@ -2130,8 +2361,11 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
 /* a new round trip begins: bandwidth filter slot, loss bounds, STARTUP exit */
 static void bbr_round_end(anl_t *w, int app_limited)
 {
-    uint64_t rd = w->delivered - w->round_delivered0, lost = w->lost_bytes - w->round_lost0;
+    uint64_t rd = w->delivered - w->round_delivered0;
+    uint64_t lost = w->lost_bytes > w->round_lost0 ? w->lost_bytes - w->round_lost0 : 0;   /* undone losses (handle_ack) */
     uint32_t i;
+    uint32_t rdur = (uint32_t)tdiff(w->current, w->round_ts);   /* the round's duration and delivery rate */
+    uint32_t rrate = rdur > 0 ? sat32(rd * 1000 / rdur) : 0;
     w->prev_round_min_rtt = w->round_min_rtt;
     w->round_min_rtt = 0;
     bbr_policer(w, rd, lost, app_limited);
@@ -2150,13 +2384,30 @@ static void bbr_round_end(anl_t *w, int app_limited)
        one before (or app-limited), while the queue signal stays (rounds
        without loss in between do not reset the count, only the queue going
        away does): take the round's RTT as min_rtt and undo the cuts (btl_bw
-       still holds the rate). */
+       still holds the rate). The rounds counted must also agree on the RTT
+       (within a quarter): a longer path's RTT stays put while we cut, a
+       queue's moves with the cuts - a 100 ms buffer at a bottleneck that
+       dropped 8 -> 2 Mbps showed 86 / 114 / 126 ms over the three rounds
+       and passed for a longer path once losses were counted a round
+       earlier (bwstep, RACK-marked losses): cwnd 32 -> 155, 72% lost. And
+       each counted round must deliver less than the last one counted. */
     {
-        uint32_t dur = (uint32_t)tdiff(w->current, w->round_ts);
-        uint32_t rate = dur > 0 ? (uint32_t)umin32((uint32_t)(rd * 1000 / dur), 0xffffffffu) : 0;
+        uint32_t rate = rrate;
         int cong = rd + lost > 0 && lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w);
         /* an app-limited sender builds no queue at all: counts too */
-        if (cong && (app_limited || (w->last_round_rate != 0 && (uint64_t)rate * 100 < (uint64_t)w->last_round_rate * 85))) w->qfall++;
+        if (cong && (app_limited || (w->last_round_rate != 0 && (uint64_t)rate * 100 < (uint64_t)w->last_round_rate * 85))) {
+            /* "less than the one before" is the last round counted, not the
+               last round: between them a bursty sender's rate goes up and
+               down (video), and a slower bottleneck's would pass on the way
+               down (5000 -> 1000 kbps: 75, 62, 70 KB/s counted 3) */
+            uint32_t r = w->prev_round_min_rtt;
+            int same_path = r + r / 4 >= w->qfall_rtt && w->qfall_rtt + w->qfall_rtt / 4 >= r;
+            int falling = app_limited || (uint64_t)rate * 100 < (uint64_t)w->qfall_rate * 85;
+            if (w->qfall == 0 || (same_path && falling)) w->qfall++;
+            else w->qfall = 1;
+            w->qfall_rtt = r;
+            w->qfall_rate = rate;
+        }
         else if (!bbr_queue_signal(w)) w->qfall = 0;
         w->last_round_rate = rate;
         w->round_ts = w->current;
@@ -2167,6 +2418,38 @@ static void bbr_round_end(anl_t *w, int app_limited)
             w->inflight_hi = 0;
             w->qfall = 0;
         }
+        /* The same without loss: the round RTT sits above 1.25x min_rtt while
+           we pace at or below the estimate (DOWN, CRUISE) and does not move
+           from one round to the next. Either a standing queue or the path -
+           passively the two look alike (taking the RTT as the path's ratcheted
+           a standing queue up: bwstep audio p95 115 -> 219 ms), so ask the
+           network: PROBE_RTT now instead of at the 10 s expiry, and take the
+           drained RTT as min_rtt (bbr_update_state). A queue drains and the
+           old min_rtt comes back; the path does not. Until then the smaller
+           BDP ended every probe after one round with "the pipe is full" and
+           DOWN never reached CRUISE: min_rtt 104 ms on a 185 ms path held
+           24 Mbps of a 50 Mbps uplink for 10 s (s_hz, DESIGN 13.29). Once
+           per min_rtt value (min_rtt_probed): a sender whose bursts keep a
+           standing queue at the bottleneck would otherwise drain it every
+           few seconds, and each drain holds the control stream behind the
+           minimum cwnd (priority test: p99 193 -> 234 ms at once per 3 s). */
+        if (!cong && bbr_queue_signal(w) && w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase <= BBR_CRUISE) {
+            uint32_t r = w->prev_round_min_rtt;
+            int flat = r + r / 16 >= w->qflat_rtt && w->qflat_rtt + w->qflat_rtt / 16 >= r;
+            if (w->qflat == 0 || flat) w->qflat++;
+            else w->qflat = 1;
+            w->qflat_rtt = r;
+            if (w->qflat > BBR_PATH_ROUNDS && !app_limited && !w->min_rtt_probed &&
+                tdiff(w->current, w->min_rtt_ts) >= 1000) {
+                w->qflat = 0;
+                w->qflat_probe = 1;
+                w->bbr_state = ANL_BBR_PROBE_RTT;
+                w->pacing_gain = BBR_UNIT;
+                w->cwnd_gain = BBR_CWND_GAIN;
+                w->prior_cwnd = w->cwnd;
+                w->probe_rtt_done_ts = 0;
+            }
+        } else w->qflat = 0;
     }
     if (rd + lost > 0 && ((lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w)) ||
                           (w->bbr_state == ANL_BBR_PROBE_BW && lost * 100 > BBR_LOSS_BLIND * (rd + lost)))) {
@@ -2200,8 +2483,19 @@ static void bbr_round_end(anl_t *w, int app_limited)
        loss may be random. */
     if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && w->min_rtt != 0 &&
         (uint64_t)w->btl_bw * w->min_rtt >= 4000ull * w->init_cwnd * w->mss &&
-        lost > 8u * w->avg_seg && lost * 100 > 40 * (rd + lost))
+        lost > 8u * w->avg_seg && lost * 100 > 40 * (rd + lost)) {
         w->full_bw_reached = 1;
+        /* ... and the round's delivery rate, well below the estimate, is
+           where the model restarts (as bbr_policer does after STARTUP):
+           RACK's marks put the bucket's whole overshoot into this round,
+           the rounds after it saw little and kept the peak for a filter
+           window (30 Mbps policer, 280 ms: 21000 -> 30000 retransmissions) */
+        if (rrate != 0 && (uint64_t)rrate * 2 < w->btl_bw) {
+            for (i = 0; i < BBR_BW_ROUNDS; i++) w->bw_round[i] = umin32(w->bw_round[i], rrate);
+            w->btl_bw = rrate;
+            w->bw_lo = 0;
+        }
+    }
     if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && !app_limited && w->btl_bw != 0) {
         if (w->btl_bw >= w->full_bw + w->full_bw / 4) { w->full_bw = w->btl_bw; w->full_bw_cnt = 0; }
         else if (++w->full_bw_cnt >= 3) w->full_bw_reached = 1;
@@ -2219,7 +2513,14 @@ static void bbr_round_end(anl_t *w, int app_limited)
     w->round_net_sample = 0;
     w->round_bw = 0;
     if (w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase == BBR_UP) {
-        if (w->btl_bw >= w->up_bw + w->up_bw / 4) { w->up_bw = w->btl_bw; w->up_stall = 0; }
+        /* growing by an eighth per round keeps the probe going: the pace is
+           1.25x, so a quarter - the most a round can show - failed on any
+           noise and every probe ended after two rounds. After min_rtt had
+           been taken from a 104 ms dip on a 185 ms path, the queue signal
+           made a loss round cut the model to a quarter, and at one probe
+           per 2-3 s it took 25 s to climb back (s_hz uplink, 4 times,
+           DESIGN 13.29) */
+        if (w->btl_bw >= w->up_bw + w->up_bw / 8) { w->up_bw = w->btl_bw; w->up_stall = 0; }
         else w->up_stall++;
     }
 }
@@ -2232,6 +2533,7 @@ static void bbr_update_state(anl_t *w)
         if (w->full_bw_reached) {
             w->bbr_state = ANL_BBR_DRAIN;
             w->pacing_gain = BBR_DRAIN_GAIN;
+            w->post_startup = 8;
         }
         break;
     case ANL_BBR_DRAIN:
@@ -2244,7 +2546,7 @@ static void bbr_update_state(anl_t *w)
            (sooner at a small BDP, bbr_probe_due); REFILL (1.0) refills the
            pipe for a round, UP (1.25) probes and keeps going while btl_bw
            grows, until the pipe is full (inflight 1.25 BDP), loss
-           (bbr_round_end) or two rounds without 25% growth */
+           (bbr_round_end) or two rounds without growth by an eighth */
         switch (w->probe_phase) {
         case BBR_DOWN:
             if (bbr_probe_due(w)) bbr_set_phase(w, BBR_REFILL);
@@ -2270,6 +2572,14 @@ static void bbr_update_state(anl_t *w)
                 w->probe_rtt_round = w->round_count + 1;
             }
         } else if (tdiff(w->current, w->probe_rtt_done_ts) >= 0 && tdiff(w->round_count, w->probe_rtt_round) >= 0) {
+            /* a probe the flat queue signal asked for: the RTT of the drained
+               pipe is the path's, above the old min_rtt or not (bbr_round_end) */
+            if (w->qflat_probe) {
+                uint32_t m = w->round_min_rtt ? w->round_min_rtt : w->prev_round_min_rtt;
+                if (m != 0) w->min_rtt = m;
+                w->qflat_probe = 0;
+            }
+            w->min_rtt_probed = 1;
             w->min_rtt_ts = w->current;
             if (w->full_bw_reached) bbr_enter_probe_bw(w);
             else { w->bbr_state = ANL_BBR_STARTUP; w->pacing_gain = BBR_STARTUP_GAIN; }
@@ -2381,6 +2691,47 @@ static void bbr_on_acked(anl_t *w, const anl_seg *s, bbr_sample *rs)
     }
 }
 
+static uint32_t bbr_window_ms(const anl_t *w)
+{
+    return umax32((uint32_t)w->interval, BBR_DW_MIN_MS);
+}
+
+/* Delivered bytes sampled from ACKs and updates (a ring of BBR_DW_SLOTS),
+ * for the delivery rate over a window of
+ * at least span ms: bbr_window_bw. A rate sample spans about one RTT; when
+ * that is below the clock's resolution (a 0.5 ms path, a 1 ms clock) the
+ * sample's interval is 1 ms for anything up to 2 ms - up to twice the rate,
+ * and the pace set from it doubled the next sample too: through a policer's
+ * refilled token bucket the estimate ran from 3.5 to 128 MB/s in 50 ms
+ * (real network, DESIGN 13.28). Over 10 ms the truncation is 10% at most.
+ * Returns 0 without enough history. */
+static void bbr_dw_checkpoint(anl_t *w)
+{
+    /* One entry per ms retained only 15 ms: with the default 20 ms update
+       interval the requested window never existed. Space checkpoints so
+       even a full ring always retains at least one complete window. */
+    uint32_t step = (bbr_window_ms(w) + BBR_DW_SLOTS - 2) / (BBR_DW_SLOTS - 1);
+    if (w->dw_n != 0 && tdiff(w->current, w->dw_ts[w->dw_idx]) < (int32_t)step) return;
+    w->dw_idx = w->dw_n == 0 ? 0 : (w->dw_idx + 1) % BBR_DW_SLOTS;
+    w->dw_ts[w->dw_idx] = w->current;
+    w->dw_bytes[w->dw_idx] = w->delivered + w->delivered_fec;
+    if (w->dw_n < BBR_DW_SLOTS) w->dw_n++;
+}
+
+static uint32_t bbr_window_bw(const anl_t *w, uint32_t span)
+{
+    uint32_t i;
+    for (i = 0; i < w->dw_n; i++) {                     /* newest to oldest */
+        uint32_t k = (w->dw_idx + BBR_DW_SLOTS - i) % BBR_DW_SLOTS;
+        int32_t el = tdiff(w->current, w->dw_ts[k]);
+        if (el >= (int32_t)span) {
+            uint64_t d = w->delivered + w->delivered_fec - w->dw_bytes[k];
+            return sat32(d * 1000 / (uint32_t)el);
+        }
+    }
+    return 0;
+}
+
 /* all segments of an input datagram are processed: one rate sample */
 static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
 {
@@ -2415,6 +2766,15 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
             uint64_t sr = (uint64_t)rs->sent * 1000 / (uint32_t)send_el;
             if (sr > bw * 3 / 2) sr = bw * 3 / 2;
             if (sr > bw) bw = sr;
+        }
+        /* an RTT below the smoothing window: the sample's interval is a
+           few clock ticks and its truncation up to 2x - at most 9/8 of the
+           delivery rate over max(update interval, 10 ms). Network-
+           limited samples only: an app-limited burst is meant to stand out
+           of its window. */
+        if (!rs->app_limited && w->min_rtt != 0 && w->min_rtt < bbr_window_ms(w)) {
+            uint64_t win = bbr_window_bw(w, bbr_window_ms(w));
+            if (win != 0 && bw > win * 9 / 8) bw = win * 9 / 8;
         }
         if (bw > 0xffffffffu) bw = 0xffffffffu;
         if (bw > w->round_bw) w->round_bw = (uint32_t)bw;
@@ -2462,6 +2822,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint16_t una16, uint
     anl_node *pos;
     int acked = 0, spurious = 0;
     st->rmt_wnd = wnd;
+    if (w->updated) bbr_dw_checkpoint(w);               /* delivered before this tick's ACKs */
     if (b1 & ACK_F_WASK) { st->probe_tell = 1; ack_schedule(st); }
     una = extend16(una16, st->snd_una);
     if (tdiff(una, st->snd_nxt) > 0) una = st->snd_una;         /* garbage: ignore */
@@ -2488,12 +2849,20 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint16_t una16, uint
                    the retransmission was spurious (only reordered) */
                 int orig = s->xmit > 1 && (b1 & ACK_F_FRESH) && tdiff(ts_echo, s->ts_sent) < 0;
                 if (orig && s->rack_rtx == 1) spurious = 1;
-                /* a loss counts for congestion control only now, when it is
-                   known not to be reordering or a late ACK: under heavy
-                   jitter the RACK window and the RTO fire for segments that
-                   were never lost */
-                else if (!orig && s->rack_rtx) {
-                    w->lost_bytes += seg_wire(s);
+                if (orig || s->xmit <= 1) {
+                    /* never lost (reordering, a late ACK under heavy jitter;
+                       or RACK marked it and it arrived before the flush
+                       resent it): take it out of the loss count */
+                    if (s->lost_cnt) {
+                        uint32_t wire = seg_wire(s);
+                        w->lost_bytes -= (uint64_t)wire < w->lost_bytes ? wire : w->lost_bytes;
+                    }
+                }
+                /* an RTO retransmission's loss counts only now, when it is
+                   known not to be a late ACK (RACK's is counted when it is
+                   marked, rack_detect) */
+                else if (s->rack_rtx) {
+                    if (!s->lost_cnt) w->lost_bytes += seg_wire(s);
                     /* FEC did not repair it either - known only from a FRESH ACK;
                        late if it reached the peer (half an RTT before this ACK)
                        after the deadline (DESIGN 8.5) */
@@ -3796,6 +4165,7 @@ void anl_update(anl_t *w, uint32_t current)
     }
     if (w->state >= 0 && w->idle_timeout_ms && tdiff(current, w->last_rx) >= (int32_t)w->idle_timeout_ms)
         w->state = -1;
+    bbr_dw_checkpoint(w);
 
     slap = tdiff(current, w->ts_flush);
     if (slap >= 10000 || slap < -10000) { w->ts_flush = current; slap = 0; }

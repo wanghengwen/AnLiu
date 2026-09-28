@@ -16,6 +16,7 @@
  *   --wnd N       bulk / stream: send and receive window in segments (default 1024;
  *                 about 1 MB, 30 Mbps at 280 ms RTT)
  *   --loss P      extra random loss in % on every datagram sent (both ends)
+ *   --interval MS AnLiu cfg.interval (default 10)
  *   --seed N
  *
  * One UDP port carries everything: every datagram starts with one byte,
@@ -41,7 +42,13 @@
 #include <unistd.h>
 
 #ifdef REALNET_INTERNAL
+#include "anliu.h"
+static void trace_lt_interval(const anl_t *, uint32_t, uint32_t, uint32_t, uint32_t, int);
+#define ANL_POLICER_TRACE trace_lt_interval
 #include "../anliu.c"       /* build without ../anliu.c: REALNET_TRACE shows BBR internals */
+#undef ANL_POLICER_TRACE
+#elif defined(ANL_V2)
+#include "anliuv2.h"
 #else
 #include "anliu.h"
 #endif
@@ -72,8 +79,10 @@ typedef struct flow {
 
 static flow g_fl[NFLOW];
 static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk, 2 stream */, g_up = 1, g_server = 0;
-static int g_dur = 60, g_bulk_mb = 16, g_port = 0, g_wnd = 1024;      /* 0: anl 9836, kcp 9837 */
+static int g_dur = 60, g_bulk_mb = 16, g_port = 0, g_wnd = 1024, g_interval = 10;      /* 0: anl 9836, kcp 9837 */
 static double g_loss = 0;
+static int g_verify;
+static uint64_t g_input_errors, g_output_errors, g_payload_errors, g_checked_bytes;
 static uint64_t g_rng = 88172645463325252ull;
 static const char *g_host = NULL;
 
@@ -81,6 +90,14 @@ static int g_fd = -1;
 static struct sockaddr_storage g_peer;
 static socklen_t g_peerlen = 0;
 static uint64_t g_tx_bytes, g_tx_pkts, g_rx_bytes, g_rx_pkts, g_tx_dropped;
+/* REALNET_CLOCK=1: give the protocol the current millisecond before every datagram
+   of a receive batch (otherwise one update per batch) and end a batch after 5 ms
+   (otherwise it runs while datagrams keep coming); batch size / duration and the
+   protocol clock's lag behind the real clock at input are reported (CLOCK line) */
+static int g_clock_refresh;
+static uint32_t g_protocol_ms;  /* timestamp actually supplied to ep_update */
+static uint64_t g_clk_batches, g_clk_refreshes;
+static uint32_t g_clk_max_pkts, g_clk_max_us, g_clk_max_lag;
 
 static anl_t *g_anl;
 static anl_stream_t *g_h[NFLOW];
@@ -109,6 +126,33 @@ static int rnd_range(int a, int b) { return a >= b ? a : a + (int)(rnd() % (uint
 static int is_anl(void) { return g_proto <= P_ANLAUTO; }
 static int is_sender(void) { return g_server ? !g_up : g_up; }
 
+#ifdef REALNET_INTERNAL
+/* Completed intervals, including local measurements lost when the detector
+   resets its counters. "after" still has that interval's byte counters. */
+static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
+                              uint32_t loss, uint32_t counted, int after)
+{
+    uint32_t sent = w->sent_wire - w->lt_sent0;
+    const anl_stream_t *bulk = g_h[3];
+    if (!is_sender() || !getenv("REALNET_TRACE")) return;
+    fprintf(stderr, "LTINT now=%u stage=%s st=%d ph=%d lt=%d k=%u from=%u tail=%u bad=%d hold=%u left=%u span=%u rounds=%u dur=%u"
+            " sent=%u infl0=%llu infl1=%llu delivered=%llu lost=%llu loss=%u counted=%u"
+            " rate=%u ref_loss=%u prev_rate=%u prev_loss=%u res=%u compensated=%u base=%u floor=%u probe=%u send_rate=%u pace=%u applied_pace=%u"
+            " cwnd=%u infl=%u queued=%d sendable=%d rmt_wnd=%u snd_span=%u snd_queued=%u snd_buf=%u"
+            " minrtt=%u qprobe=%u lag_ms=%d\n",
+            w->current, after ? "after" : "before", w->bbr_state, w->probe_phase, w->lt_state, w->lt_k, w->lt_from,
+            w->lt_tail, w->lt_bad, w->lt_hold, w->lt_left, w->lt_span, w->lt_rounds, dur,
+            sent, (unsigned long long)w->lt_infl0, (unsigned long long)bbr_inflight_bytes(w),
+            (unsigned long long)w->lt_rd, (unsigned long long)w->lt_lost, loss, counted,
+            rate, w->lt_ref_loss, w->lt_prev_rate, w->lt_prev_loss, w->lt_res,
+            sat32((uint64_t)rate * 1000 / (1000 - w->lt_res)), w->lt_rate, w->lt_rate / 8 * 7,
+            bbr_lt_probe_rate(w), sat32((uint64_t)sent * 1000 / dur), compute_pace_rate(w), w->pace_rate,
+            w->cwnd, w->inflight_segs, has_queued_data(w), has_new_data(w), bulk ? bulk->rmt_wnd : 0,
+            bulk ? bulk->snd_nxt - bulk->snd_una : 0, bulk ? bulk->nsnd_que : 0, bulk ? bulk->nsnd_buf : 0,
+            w->min_rtt, w->qflat_probe, tdiff(now_ms(), w->current));
+}
+#endif
+
 /*--------------------------------------------------------------------
  * UDP
  *-------------------------------------------------------------------*/
@@ -122,7 +166,7 @@ static void udp_send(char tag, const char *buf, int len)
     if (sendto(g_fd, out, (size_t)len + 1, 0, (struct sockaddr *)&g_peer, g_peerlen) > 0) {
         g_tx_bytes += (uint64_t)len + 1 + 28;
         g_tx_pkts++;
-    }
+    } else g_output_errors++;
 }
 
 static int anl_out(const char *buf, int len, anl_t *w, void *user)
@@ -189,7 +233,7 @@ static void ep_create(void)
         anl_config_default(&cfg, g_server ? ANL_ROLE_SERVER : ANL_ROLE_CLIENT);
         memset(cfg.psk, 0x5a, sizeof(cfg.psk));
         cfg.mtu = MTU;
-        cfg.interval = 10;
+        cfg.interval = g_interval;
         g_anl = anl_create(0x5a5a0001, &cfg, NULL);
         anl_setoutput(g_anl, anl_out);
         anl_set_accept(g_anl, accept_cb);
@@ -224,13 +268,27 @@ static void ep_open_streams(void)
 static void ep_update(uint32_t now)
 {
     int i;
+    g_protocol_ms = now;
     if (is_anl()) { anl_update(g_anl, now); return; }
     for (i = 1; i < NFLOW; i++) if (g_kcp[i]) ikcp_update(g_kcp[i], now);
 }
 
 static void ep_input(const char *d, int len)
 {
-    if (is_anl()) { anl_input(g_anl, d, len); return; }
+    if (g_clock_refresh) {
+        uint32_t now = now_ms();
+        if (now != g_protocol_ms) {
+            ep_update(now);
+            g_clk_refreshes++;
+        }
+    }
+#ifdef REALNET_INTERNAL
+    if (is_anl() && g_anl) {
+        int32_t lag = tdiff(now_ms(), g_anl->current);
+        if (lag > 0 && (uint32_t)lag > g_clk_max_lag) g_clk_max_lag = (uint32_t)lag;
+    }
+#endif
+    if (is_anl()) { if (anl_input(g_anl, d, len) < 0) g_input_errors++; return; }
     if (len >= 24) {
         IUINT32 conv = ikcp_getconv(d);
         uint32_t id = conv - KCP_CONV0;
@@ -315,6 +373,10 @@ static void gen_bulk(uint64_t t, uint64_t end_us)
         int len = 1024;
         if (g_bulk_sent + (uint64_t)len > total) len = (int)(total - g_bulk_sent);
         put_hdr(g_buf, f, 0, f->seq, now_us());
+        if (g_verify) {
+            int j;
+            for (j = 0; j < len; j++) g_buf[j] = (char)((g_bulk_sent + (uint64_t)j) * 31u + 7u);
+        }
         if (ep_send(f, g_buf, len, 0) != 0) break;
         f->seq++;
         f->sent++;
@@ -333,6 +395,12 @@ static void rx_frames(void)
             uint64_t t = now_us();
             if (i == 3) {
                 uint64_t sec;
+                if (g_verify) {
+                    int j;
+                    for (j = 0; j < r; j++)
+                        if ((uint8_t)g_buf[j] != (uint8_t)((g_bulk_rcvd + (uint64_t)j) * 31u + 7u)) g_payload_errors++;
+                    g_checked_bytes += (uint64_t)r;
+                }
                 if (g_bulk_first_us == 0) g_bulk_first_us = t;
                 g_bulk_rcvd += (uint64_t)r;
                 sec = (t - g_bulk_first_us) / 1000000u;
@@ -452,6 +520,8 @@ static void report_sender(double secs)
     }
     printf("SENDER %s wire_kbps=%.0f pkts=%llu emulated_drop=%llu srtt=%u xmit=%u secs=%.1f\n", proto_name[g_proto],
            g_tx_bytes * 8.0 / 1000.0 / secs, (unsigned long long)g_tx_pkts, (unsigned long long)g_tx_dropped, srtt, rtx, secs);
+    printf("CLOCK refresh=%d batches=%llu refreshes=%llu max_batch_pkts=%u max_batch_ms=%.1f max_input_lag_ms=%u\n", g_clock_refresh,
+           (unsigned long long)g_clk_batches, (unsigned long long)g_clk_refreshes, g_clk_max_pkts, g_clk_max_us / 1000.0, g_clk_max_lag);
 }
 
 /*--------------------------------------------------------------------
@@ -554,7 +624,7 @@ int main(int argc, char **argv)
 {
     int i;
     uint64_t t0, start_us = 0, end_us = 0, last_rx_us = 0, last_hello_us = 0, stop_us, last_trace_us = 0;
-    int started = 0, got_any = 0, pinged = 0;
+    int started = 0, got_any = 0, pinged = 0, failed = 0;
     uint64_t ping_sent_us[20] = { 0 };
     double rtt_min = 1e9, rtt_sum = 0; int rtt_n = 0;
     if (argc < 2) usage();
@@ -573,7 +643,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dur")) g_dur = atoi(nx);
         else if (!strcmp(a, "--bulk")) g_bulk_mb = atoi(nx);
         else if (!strcmp(a, "--wnd")) g_wnd = atoi(nx);
+        else if (!strcmp(a, "--interval")) g_interval = atoi(nx);
         else if (!strcmp(a, "--loss")) g_loss = atof(nx);
+        else if (!strcmp(a, "--verify")) g_verify = atoi(nx) != 0;
         else if (!strcmp(a, "--seed")) g_rng ^= (uint64_t)atoll(nx) * 0x9E3779B97F4A7C15ull + (g_server ? 7 : 3);
         else usage();
         i++;
@@ -582,9 +654,14 @@ int main(int argc, char **argv)
     if (g_port == 0) g_port = is_anl() ? 9836 : 9837;
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (g_proto == P_TCP) return tcp_run();
+    {
+        const char *clock_mode = getenv("REALNET_CLOCK");
+        g_clock_refresh = clock_mode && atoi(clock_mode) > 0;
+    }
     flows_init();
 
     g_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_fd < 0) { perror("socket"); return 1; }
     {
         int sz = 4 << 20;
         setsockopt(g_fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
@@ -629,12 +706,15 @@ int main(int argc, char **argv)
             struct sockaddr_storage from;
             socklen_t fl = sizeof(from);
             ssize_t n;
+            uint64_t b0 = now_us();
+            uint32_t bn = 0;
             while ((n = recvfrom(g_fd, in, sizeof(in), MSG_DONTWAIT, (struct sockaddr *)&from, &fl)) > 0) {
+                bn++;
                 g_rx_bytes += (uint64_t)n + 28;
                 g_rx_pkts++;
                 if (g_server && g_peerlen == 0) { memcpy(&g_peer, &from, fl); g_peerlen = fl; }
                 last_rx_us = now_us();
-                if (in[0] == 'P') {                                         /* ping: echo */
+                if (in[0] == 'P' && n >= 9) {                               /* ping: echo */
                     char q[16]; memcpy(q, in + 1, 8); udp_send('Q', q, 8);
                 } else if (in[0] == 'Q' && n >= 9) {
                     uint64_t st; double rtt;
@@ -650,7 +730,13 @@ int main(int argc, char **argv)
                     ep_input(in + 1, (int)n - 1); got_any = 1;
                 }
                 fl = sizeof(from);
+                /* refresh mode: at most 5 ms per batch, so the updates made inside it
+                   cannot keep the loop going and starve the rest of the main loop */
+                if (g_clock_refresh && now_us() - b0 > 5000) break;
             }
+            g_clk_batches++;
+            if (bn > g_clk_max_pkts) g_clk_max_pkts = bn;
+            if (now_us() - b0 > g_clk_max_us) g_clk_max_us = (uint32_t)(now_us() - b0);
         }
         t = now_us();
         /* client: ping, then hello until the test starts, keep the NAT open */
@@ -686,13 +772,35 @@ int main(int argc, char **argv)
             fprintf(stderr, "TRACE t=%.1f st=%d cwnd=%u infl=%u bw=%u pace=%u srtt=%u minrtt=%u rtx=%u",
                     (t - start_us) / 1e6, st.cc_state, st.cwnd, st.inflight, st.bw_estimate, st.pace_rate, st.srtt, st.min_rtt, st.retrans);
 #ifdef REALNET_INTERNAL
-            fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d",
+            fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d lt_rate=%u lt_k=%u lt_span=%u rto=%d qflat=%u probed=%d",
                     g_anl->btl_bw, g_anl->bw_lo, (unsigned long long)g_anl->inflight_hi, g_anl->probe_phase, g_anl->loss_rate,
                     g_anl->qfall, bbr_queue_signal(g_anl), tdiff(g_anl->round_count, g_anl->rto_round) < 0, g_anl->prev_round_min_rtt,
-                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt_state);
+                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt_state, g_anl->lt_rate, g_anl->lt_k, g_anl->lt_span, g_anl->rx_rto, g_anl->qflat, g_anl->min_rtt_probed);
+            fprintf(stderr, " lt_hold=%u lt_bad=%d lt_from=%u lt_tail=%u lt_skip=%u lt_res=%u lt_prev_rate=%u lt_prev_loss=%u post_su=%u qprobe=%u",
+                    g_anl->lt_hold, g_anl->lt_bad, g_anl->lt_from, g_anl->lt_tail, g_anl->lt_skip, g_anl->lt_res,
+                    g_anl->lt_prev_rate, g_anl->lt_prev_loss, g_anl->post_startup, g_anl->qflat_probe);
 #endif
             fprintf(stderr, "\n");
         }
+#ifdef REALNET_INTERNAL
+        /* limiter events: one line whenever the policer detector or the BBR state changes
+           (interval ends show as lt_hold / lt_k / lt_rate steps), between the periodic lines */
+        if (started && is_sender() && is_anl() && getenv("REALNET_TRACE")) {
+            static int ev_init, ev_lt, ev_bad, ev_st;
+            static uint32_t ev_k, ev_rate, ev_hold, ev_tail, ev_skip, ev_prev;
+            if (!ev_init || ev_lt != g_anl->lt_state || ev_k != g_anl->lt_k || ev_rate != g_anl->lt_rate || ev_hold != g_anl->lt_hold
+                || ev_tail != g_anl->lt_tail || ev_skip != g_anl->lt_skip || ev_prev != g_anl->lt_prev_rate || ev_st != (int)g_anl->bbr_state) {
+                anl_stats es;
+                anl_get_stats(g_anl, &es);
+                ev_init = 1; ev_lt = g_anl->lt_state; ev_k = g_anl->lt_k; ev_rate = g_anl->lt_rate; ev_hold = g_anl->lt_hold;
+                ev_tail = g_anl->lt_tail; ev_skip = g_anl->lt_skip; ev_prev = g_anl->lt_prev_rate; ev_st = (int)g_anl->bbr_state; ev_bad = g_anl->lt_bad;
+                fprintf(stderr, "LTEV t=%.3f st=%d lt=%d k=%u rate=%u prev_rate=%u prev_loss=%u res=%u hold=%u bad=%d from=%u tail=%u skip=%u rounds=%u btl=%u lo=%u pace=%u minrtt=%u lr=%u q=%d rtx=%u post_su=%u qprobe=%u now=%u\n",
+                        (t - start_us) / 1e6, ev_st, ev_lt, ev_k, ev_rate, ev_prev, g_anl->lt_prev_loss, g_anl->lt_res, ev_hold, ev_bad,
+                        g_anl->lt_from, ev_tail, ev_skip, g_anl->lt_rounds, g_anl->btl_bw, g_anl->bw_lo, es.pace_rate, g_anl->min_rtt,
+                        g_anl->loss_rate, bbr_queue_signal(g_anl), es.retrans, g_anl->post_startup, g_anl->qflat_probe, g_anl->current);
+            }
+        }
+#endif
         /* end: the sender after the traffic plus 3 s of drain (bulk: once
            delivered and drained); the receiver 5 s after the last datagram */
         if (started && is_sender()) {
@@ -700,6 +808,7 @@ int main(int argc, char **argv)
                      : g_test == 2 ? t >= end_us + 1000000u
                                    : (g_bulk_sent >= ((uint64_t)g_bulk_mb << 20) && ep_waitsnd(3) == 0 && t >= start_us + 1000000u);
             if (done || t >= stop_us) {
+                if (!done) failed = 1;
                 double secs = (t - start_us) / 1e6;
                 uint64_t linger = t + 2000000u;
                 while (now_us() < linger) {                 /* answer the last ACKs */
@@ -719,10 +828,23 @@ int main(int argc, char **argv)
             break;
         }
         if (t >= stop_us) {
+            failed = 1;
             printf("TIMEOUT %s started=%d got_any=%d\n", proto_name[g_proto], started, got_any);
             if (!is_sender()) report_receiver();
             break;
         }
     }
-    return 0;
+    if (is_anl()) {
+        int state = anl_state(g_anl), queued = ep_waitsnd(3);
+        printf("HEALTH state=%d input_errors=%llu output_errors=%llu payload_errors=%llu checked_bytes=%llu queued=%d sent_bytes=%llu received_bytes=%llu\n",
+               state, (unsigned long long)g_input_errors, (unsigned long long)g_output_errors,
+               (unsigned long long)g_payload_errors, (unsigned long long)g_checked_bytes, queued,
+               (unsigned long long)g_bulk_sent, (unsigned long long)g_bulk_rcvd);
+        if (state || g_input_errors || g_output_errors || g_payload_errors) failed = 1;
+        if (is_sender() && g_test && queued) failed = 1;
+        anl_release(g_anl);
+    } else for (i = 1; i < NFLOW; i++) if (g_kcp[i]) ikcp_release(g_kcp[i]);
+    for (i = 1; i < NFLOW; i++) { free(g_fl[i].owd); free(g_fl[i].owdk); }
+    close(g_fd);
+    return failed;
 }

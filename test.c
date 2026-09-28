@@ -1487,6 +1487,136 @@ static void test_fec_auto(void)
     CHECK(got >= frames * 99 / 100, "frames delivered (%d of %d)", got, frames);
 }
 
+/* Replay a completed measurement interval. Its transition round has already
+ * been excluded. Byte-valued inflight counts reproduce the diagnostic log's
+ * estimates exactly without constructing unrelated packet queues. */
+static void policer_interval(anl_t *w, uint32_t dur, uint32_t sent,
+                             uint32_t infl0, uint32_t infl1, uint64_t delivered, uint64_t lost)
+{
+    w->lt_ts = 1;
+    w->current = dur + 1;
+    w->lt_rounds = BBR_LT_ROUNDS - 1;
+    w->lt_skip = w->lt_bad = 0;
+    w->lt_rd = w->lt_lost = 0;
+    w->lt_sent0 = w->sent_wire;
+    w->sent_wire += sent;
+    w->lt_infl0 = infl0;
+    w->avg_seg = 1;
+    w->inflight_segs = infl1;
+    bbr_policer(w, delivered, lost, 0);
+}
+
+static void test_bbr_policer_probes(void)
+{
+    anl_t w;
+    int wrap;
+    printf("[bbr: underfed tails, real capacity loss and exhausted probe bursts]\n");
+    for (wrap = 0; wrap < 2; wrap++) {
+        memset(&w, 0, sizeof(w));
+        w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_tail = 1;
+        w.lt_rate = 6006981; w.lt_res = 4; w.lt_span = 16;
+        if (wrap) w.sent_wire = 0xfffffc17u;
+        /* J1, tr16d_hz2zjg: only 4.46 MB/s sent at a 7.51 MB/s target,
+           26 per mille lost; old code lowered the rate to 5256104. */
+        policer_interval(&w, 678, 3021818, 770286, 1258346, 2466360, 62186);
+        CHECK(w.lt_state == 2 && w.lt_rate == 6006981, "underfed tail keeps the known rate (wrap=%d)", wrap);
+        CHECK(w.lt_left == 16 && w.lt_span == 16, "inconclusive tail does not extend the probe wait");
+    }
+    /* Same offered load, but a severe real delivery loss must still reduce
+       the estimate. A blanket send-rate guard would discard this evidence. */
+    w.lt_state = 3; w.lt_tail = 1;
+    policer_interval(&w, 678, 3021818, 770286, 1258346, 800000, 2000000);
+    CHECK(w.lt_state == 2 && w.lt_rate < 6006981, "lossy capacity drop still lowers the rate");
+
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 1; w.lt_k = 1; w.lt_tail = 1;
+    w.lt_rate = 6006981; w.lt_res = 4; w.lt_span = 16;
+    policer_interval(&w, 678, 3021818, 770286, 1258346, 2466360, 62186);
+    CHECK(w.lt_state == 0, "underfed first confirmation does not establish a ceiling");
+
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 3;
+    w.lt_rate = 5256104; w.lt_res = 4; w.lt_span = 32;
+    /* J4: k=3 still delivers the burst; at k=4 sending grows, delivery
+       falls and loss rises to 192 per mille. Do not accelerate to k=5. */
+    policer_interval(&w, 682, 6098444, 1550121, 1568158, 6080526, 0);
+    CHECK(w.lt_state == 3 && w.lt_k == 4 && !w.lt_tail, "delivery follows the probe before the bucket empties");
+    policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
+    CHECK(w.lt_state == 3 && w.lt_k == 4 && w.lt_tail, "probe measures the ceiling before further acceleration");
+
+    w.lt_state = 3; w.lt_k = 4; w.lt_tail = 0; w.lt_prev_rate = 8915727;
+    w.lt_res = 200;
+    policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
+    CHECK(w.lt_k == 5 && !w.lt_tail, "delivery dip with residual random loss alone is inconclusive");
+    w.lt_k = 4; w.lt_tail = 0; w.lt_prev_rate = 8915727; w.lt_res = 4;
+    policer_interval(&w, 682, 1800000, 0, 0, 1500000, 300000);
+    CHECK(w.lt_k == 5 && !w.lt_tail, "reduced offered load does not prove a new ceiling");
+    w.min_rtt = 100; w.prev_round_min_rtt = 200;
+    policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
+    CHECK(w.lt_state == 0 && w.lt_hold == 48, "a queued probe still yields to congestion control");
+
+    /* J8, ab17b_zjg2lsj_v16d: an underfed k=2 tail still loses 152 per
+       mille. The low-loss guard must not widen with the nominal probe. */
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 2; w.lt_tail = 1;
+    w.lt_rate = 3537950; w.lt_res = 1; w.lt_span = 16;
+    policer_interval(&w, 321, 623968, 0, 0, 529108, 84320);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3095701, "moderate loss must still allow a rate reduction at k=2");
+
+    /* J4, ab17_hz2zjg_v17: delivery falls 5.2% while loss rises to 149
+       per mille. A 1/16 decline threshold continued accelerating here. */
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1;
+    w.lt_rate = 6225626; w.lt_res = 0; w.lt_span = 16;
+    policer_interval(&w, 745, 5717950, 1442960, 1434472, 5726382, 0);
+    CHECK(w.lt_k == 2 && !w.lt_tail, "probe still advances while delivery follows");
+    policer_interval(&w, 759, 6472614, 1629696, 1604232, 5528230, 837930);
+    CHECK(w.lt_state == 3 && w.lt_k == 2 && w.lt_tail, "5.2 percent fall with rising loss stops further acceleration");
+}
+
+/* Frequent ACKs must not evict the history needed to smooth short-RTT
+ * samples, including with the default interval and across clock wrap. */
+static void test_bbr_delivery_window(void)
+{
+    static const int intervals[] = { 1, 10, 20, 100, 5000 };
+    static const uint32_t starts[] = { 1000, 0xfffffff0u, 0xffffdff0u };
+    size_t i, j;
+    printf("[bbr: delivery window survives frequent updates and clock wrap]\n");
+    for (i = 0; i < sizeof(intervals) / sizeof(intervals[0]); i++) {
+        for (j = 0; j < sizeof(starts) / sizeof(starts[0]); j++) {
+            anl_t w;
+            uint32_t t, span = umax32((uint32_t)intervals[i], 10);
+            memset(&w, 0, sizeof(w));
+            w.interval = intervals[i];
+            for (t = 0; t <= 3 * span; t++) {
+                w.current = starts[j] + t;
+                w.delivered = (uint64_t)t * 1000;
+                bbr_dw_checkpoint(&w);
+                bbr_dw_checkpoint(&w);    /* another ACK in the same tick */
+            }
+            CHECK(bbr_window_bw(&w, span) == 1000000,
+                  "interval %d, start %u: window rate %u", w.interval, starts[j], bbr_window_bw(&w, span));
+            if (w.interval == 1) {
+                bbr_sample rs;
+                memset(&rs, 0, sizeof(rs));
+                w.min_rtt = 1; w.avg_seg = w.mss = 1000;
+                w.next_round_delivered = w.delivered + 1;
+                w.delivered_ts = w.current;
+                w.delivered += 5000;      /* a compressed ACK at this tick */
+                rs.prior_delivered = w.delivered - 5000;
+                rs.prior_ts = w.current - 1;
+                rs.send_ts = w.current;
+                rs.first_sent = w.current - 1;
+                bbr_on_ack(&w, &rs);
+                CHECK(w.btl_bw <= 2000000, "1 ms updates still smooth compressed ACKs: %u", w.btl_bw);
+                rs.app_limited = 1;
+                bbr_on_ack(&w, &rs);
+                CHECK(w.btl_bw == 5000000, "app-limited bursts retain their rate sample: %u", w.btl_bw);
+            }
+        }
+    }
+}
+
 /* a path of about 1 ms (loopback, LAN): min_rtt / 2 is 0, a rate sample's
  * send interval may be 0 too (divided by it once, found on a real network) */
 static void test_tiny_rtt(void)
@@ -1754,6 +1884,8 @@ int main(void)
     RUN(test_fec_repair());
     RUN(test_fec_auto());
     RUN(test_fec_auto_shared());
+    RUN(test_bbr_delivery_window());
+    RUN(test_bbr_policer_probes());
     RUN(test_tiny_rtt());
     RUN(test_target_rate());
     RUN(test_delay_report());

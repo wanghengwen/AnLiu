@@ -253,11 +253,17 @@ void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
 
 /* Feed a raw UDP datagram; on ANL_EAUTH the caller must not respond.
  * It may send an ACK at once: the output callback may be invoked synchronously.
- * RTT samples are taken against the time of the last anl_update: calling
- * anl_update(now) before anl_input keeps them exact (the model tolerates up
- * to one interval of staleness, DESIGN 6.8). */
+ * RTT samples use the timestamp most recently passed to anl_update; the library
+ * has no system clock and cannot detect a stale caller-supplied timestamp.
+ * Before input, call anl_update with the current monotonic millisecond whenever
+ * it differs from that timestamp, even if anl_check's next timer is not due.
+ * Recheck between datagrams in a receive batch, and bound batch work so timers
+ * and application work also run. An update/output callback can itself take time;
+ * avoid blocking it. Up to one interval of staleness is tolerated (DESIGN 6.8),
+ * but larger gaps can underestimate RTT and corrupt the path model. */
 int      anl_input(anl_t *w, const char *data, long size);
-/* feed plaintext already verified by anl_peek_conv (skips crypto) */
+/* Feed plaintext already verified by anl_peek_conv (skips crypto).
+ * The same clock-refresh requirements as anl_input apply. */
 int      anl_input_plain(anl_t *w, const char *plain, long size);
 
 /* Drive timers; current is a monotonic millisecond clock. anl_check also
