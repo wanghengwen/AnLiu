@@ -12,7 +12,7 @@ anl_bench: bench.c ../anliu.c ../anliu.h ikcp.c ikcp.h
 realnet: realnet.c ../anliu.c ../anliu.h ikcp.c ikcp.h
 	$(CC) -std=gnu99 -O2 -I. -I.. realnet.c ../anliu.c ikcp.c -o $@ -lm
 
-realnet_trace: realnet.c ../anliu.c ../anliu.h ikcp.c ikcp.h
+realnet_trace: realnet.c ../anliu.c ../anliu.h ikcp.c ikcp.h tx_diag.h fec_diag.h
 	$(CC) -std=gnu99 -O2 -DREALNET_INTERNAL -I. -I.. realnet.c ikcp.c -o $@ -lm
 
 clean:

@@ -1312,6 +1312,221 @@ static void test_key_sender_purge(void)
     net_stop(&n);
 }
 
+/* A full receiver drains, but its window-opening ACK is lost. With no data
+   in flight there is no retransmission to rescue the sender: WASK must do it. */
+static void test_window_reopen_loss(void)
+{
+    int lose_probe;
+    printf("[window: lost reopen ACK recovers on the measured RTO]\n");
+    for (lose_probe = 0; lose_probe <= 1; lose_probe++) {
+        net n; anl_config ca, cb; anl_stream_opt opt; anl_stream_t *a, *b;
+        char data[16000]; int i, size, got = ANL_EAGAIN; uint32_t start, rto;
+        net_init(&n, &ca, &cb);
+        n.min_delay = n.max_delay = 10;
+        ca.interval = cb.interval = 10;
+        ca.pad_max = cb.pad_max = 0;
+        ca.keepalive_ms = cb.keepalive_ms = 0;
+        net_start(&n, &ca, &cb);
+        anl_stream_opt_default(&opt, ANL_RELIABLE);
+        opt.snd_wnd = opt.rcv_wnd = 8;
+        a = open_pair(&n, 0, &opt, &opt, &b);
+        if (!b) { net_stop(&n); continue; }
+        for (i = 0; i < 200; i++) net_tick(&n);
+        size = (int)a->mss * 8;
+        CHECK(size <= (int)sizeof(data), "test message fits");
+        fill_pattern(data, size, 7);
+        CHECK(anl_stream_send(a, data, size) == 0, "fill peer window");
+        for (i = 0; i < 2000 && (a->rmt_wnd != 0 || a->nsnd_buf != 0); i++) net_tick(&n);
+        CHECK(a->rmt_wnd == 0 && a->nsnd_buf == 0 && b->nrcv_que == 8,
+              "peer full, every sent fragment acknowledged");
+        CHECK(anl_stream_recv(b, data, sizeof(data)) == size && check_pattern(data, size, 7),
+              "application drains receiver");
+        n.loss_pct = 100;
+        for (i = 0; i < 100 && b->probe_tell; i++) net_tick(&n);
+        n.loss_pct = 0;
+        CHECK(!b->probe_tell && a->rmt_wnd == 0 && wnd_unused(n.ep[1], b) == 8,
+              "opening ACK was sent and lost, sender retains stale zero window");
+        rto = (uint32_t)n.ep[0]->rx_rto; start = n.now;
+        CHECK(anl_stream_send(a, "resume", 7) == 0, "queue data behind stale window");
+        for (i = 0; i <= ca.interval && a->probe_wait == 0; i++) net_tick(&n);
+        CHECK(a->probe_wait == rto, "first probe follows the measured RTO (%u vs %u)", a->probe_wait, rto);
+        if (lose_probe) n.drop_at[0] = (uint32_t)n.sent + 1;
+        for (i = 0; i < (int)(4 * rto + 8 * ca.interval); i++) {
+            net_tick(&n);
+            got = anl_stream_recv(b, data, sizeof(data));
+            if (got >= 0) break;
+        }
+        CHECK(got == 7 && memcmp(data, "resume", 7) == 0,
+              "resume after lost opening ACK%s within RTT-aware bound (elapsed=%u rto=%u)",
+              lose_probe ? " and first probe" : "", n.now - start, rto);
+        CHECK(a->rmt_wnd > 0 && a->probe_wait == 0, "positive window cancels persistence backoff");
+        if (!lose_probe) {
+            uint32_t next; long sent0;
+            for (i = 0; i < 100; i++) net_tick(&n);
+            fill_pattern(data, size, 9);
+            CHECK(anl_stream_send(a, data, size) == 0, "fill window a second time");
+            for (i = 0; i < 2000 && (a->rmt_wnd != 0 || a->nsnd_buf != 0); i++) net_tick(&n);
+            CHECK(a->rmt_wnd == 0 && b->nrcv_que == 8, "application keeps the peer window full");
+            next = a->snd_nxt; sent0 = n.sent; rto = (uint32_t)n.ep[0]->rx_rto;
+            CHECK(anl_stream_send(a, "waiting", 8) == 0, "queue while receiver deliberately holds data");
+            for (i = 0; i < (int)(20 * rto); i++) net_tick(&n);
+            CHECK(a->snd_nxt == next && a->nsnd_que == 1, "probes never override a genuinely closed window");
+            CHECK(a->probe_wait > rto && a->probe_wait <= PROBE_LIMIT && n.sent - sent0 <= 20,
+                  "persistent zero window still backs off, without busy probing (%ld packets)", n.sent - sent0);
+        }
+        net_stop(&n);
+    }
+}
+
+static void test_receiver_deadline_default(void)
+{
+    int policy;
+    printf("[semi: receiver default deadline advances without sender FWD]\n");
+    for (policy = -1; policy <= 3; policy++) {
+        net n; anl_config ca, cb; anl_stream_opt o, op; anl_frame_info fi;
+        anl_stream_t *a, *b;
+        char buf[100];
+        int i, r = ANL_EAGAIN, dropped_ack = 0;
+        uint32_t start, received_at = 0;
+        net_init(&n, &ca, &cb);
+        n.min_delay = n.max_delay = 10;
+        ca.pad_max = cb.pad_max = 0;
+        net_start(&n, &ca, &cb);
+        anl_stream_opt_default(&o, ANL_SEMI);
+        CHECK(o.rcv_deadline_ms == -1, "semi defaults to the local frame lifetime");
+        o.fec = 0; o.max_age_ms = 10000;
+        op = o; op.max_age_ms = 40;
+        if (policy >= 0) op.rcv_deadline_ms = policy ? 20 : 0;
+        a = open_pair(&n, 0, &o, &op, &b);
+        if (!b) { net_stop(&n); continue; }
+        for (i = 0; i < 200; i++) net_tick(&n);
+        n.loss_pct = 100;
+        fill_pattern(buf, sizeof(buf), 0);
+        CHECK(anl_stream_send_frame(a, 0, buf, sizeof(buf), NULL) == 0, "send missing frame");
+        n.loss_pct = 0;
+        fill_pattern(buf, sizeof(buf), 1);
+        CHECK(anl_stream_send_frame(a, 0, buf, sizeof(buf), NULL) == 0, "send subsequent frame");
+        CHECK(a->snd_nxt == 2, "both frames left the sender before it stopped");
+        start = n.now;
+        /* Keep delivering ACKs, but stop the sender timer: the receiver must
+           advance without retransmission/FWD and report skips as retirement. */
+        for (i = 0; i < 150; i++) {
+            pkt **pp = &n.queue;
+            n.now++;
+            n.ep[0]->current = n.now; /* timestamp only: no sender retransmission timer */
+            while (*pp) {
+                pkt *p = *pp;
+                if (tdiff(n.now, p->deliver_at) < 0) { pp = &p->next; continue; }
+                *pp = p->next;
+                if (p->to == 0 && ((policy == 2 && b->frames_skipped && !dropped_ack) ||
+                                  (policy == 3 && !b->frames_skipped))) dropped_ack++;
+                else anl_input(n.ep[p->to], p->data, p->len);
+                free(p);
+            }
+            if (i == 100) { b->probe_tell = 1; ctl_mark(b); } /* repeat a lost window ACK */
+            anl_update(n.ep[1], n.now);
+            if (r < 0) {
+                r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi);
+                if (r >= 0) received_at = n.now;
+            }
+        }
+        if (policy == 0) CHECK(r == ANL_EAGAIN, "explicit zero keeps waiting");
+        else {
+            int deadline = policy == -1 ? 40 : 20;
+            CHECK(r == (int)sizeof(buf) && fi.frame_no == 1 && fi.lost_before == 1 &&
+                  check_pattern(buf, sizeof(buf), 1), "skip missing frame, preserve next frame and loss count");
+            CHECK(received_at - start >= (uint32_t)(10 + deadline) &&
+                  received_at - start <= (uint32_t)(10 + deadline + 2 * cb.interval),
+                  "local timer bounds gap wait (elapsed=%u)", received_at - start);
+            handle_fwd(n.ep[1], b, 1);
+            CHECK(anl_stream_recv_frame(b, buf, sizeof(buf), &fi) == ANL_EAGAIN,
+                  "late FWD cannot redeliver or rewind");
+        }
+        CHECK(n.ep[0]->delivered == sizeof(buf) + SEG_WIRE_OVH,
+              "only the actually received frame gets congestion-control credit (%llu)",
+              (unsigned long long)n.ep[0]->delivered);
+        if (policy >= 2) CHECK(dropped_ack > 0, "exercise loss of a skip ACK or its earlier SACK");
+        if (policy != 0) CHECK(a->nsnd_buf == 0, "skipped prefix retires even after ACK loss");
+        CHECK(!a->fwd_pending && a->frames_dropped == 0, "sender did not abandon the frame");
+        net_stop(&n);
+    }
+}
+
+static int g_skip_packets, g_skip_acks, g_skip_want;
+static uint32_t g_skip_watermark;
+
+static int skip_ack_output(const char *wire, int len, anl_t *w, void *user)
+{
+    uint8_t plain[2048];
+    const char *p, *end;
+    int size = siv_open(&w->keys, w->role, (const uint8_t *)wire, (size_t)len, plain);
+    int marker = 0;
+    (void)user;
+    CHECK(len <= (int)w->mtu && size >= ANL_HDR_SIZE, "valid bounded ACK datagram");
+    if (size < ANL_HDR_SIZE) return 0;
+    p = (const char *)plain + ANL_HDR_SIZE; end = (const char *)plain + size;
+    g_skip_packets++;
+    while (p < end) {
+        int type = dec8(&p) >> 6;
+        (void)dec8(&p);
+        if (type == SEG_CTRL) {
+            uint8_t sub = dec8(&p); uint32_t n = 0;
+            CHECK(dec_varint(&p, end, &n) == 0 && n == 4 && sub == CTRL_RCV_SKIP,
+                  "only the retirement marker precedes these ACKs");
+            if (end - p < 4) break;
+            CHECK(dec32(&p) == g_skip_watermark, "full 32-bit skip watermark survives wrap");
+            marker = 1;
+        } else if (type == SEG_ACK) {
+            uint32_t n = 0, i, v;
+            CHECK(marker == g_skip_want, "each split ACK shares a datagram with its retirement marker");
+            if (end - p < 9) break;
+            p += 9;
+            CHECK(dec_varint(&p, end, &n) == 0, "SACK count");
+            for (i = 0; i < 2 * n; i++) CHECK(dec_varint(&p, end, &v) == 0, "SACK range");
+            g_skip_acks++;
+        } else { CHECK(0, "unexpected segment type in ACK test"); break; }
+    }
+    return 0;
+}
+
+static void test_receiver_skip_ack_fragments(void)
+{
+    anl_config cfg; anl_stream_opt opt; anl_t *w; anl_stream *st; int i;
+    printf("[semi: atomic skip marker with split SACKs and sequence wrap]\n");
+    anl_config_default(&cfg, ANL_ROLE_CLIENT);
+    cfg.mtu = 128; cfg.pad_max = 0; cfg.rng = det_rng;
+    w = anl_create(7, &cfg, NULL);
+    CHECK(w != NULL, "create small-MTU connection");
+    if (!w) return;
+    anl_update(w, 1000);
+    anl_stream_opt_default(&opt, ANL_SEMI); opt.fec = 0;
+    st = stream_create(w, 2, &opt);
+    CHECK(st != NULL, "create receiver stream");
+    if (!st) { anl_release(w); return; }
+    st->peer_opened = 1; st->rcv_nxt = 100;
+    st->rcv_skip_valid = 1; st->rcv_skip_una = 50;
+    for (i = 0; i < 200; i++) {
+        anl_seg *s = seg_new(0);
+        CHECK(s != NULL, "allocate received segment");
+        if (!s) break;
+        s->sn = 101u + (uint32_t)i * 2;
+        qadd_tail(&s->node, &st->rcv_buf); st->nrcv_buf++;
+    }
+    g_skip_packets = g_skip_acks = 0; g_skip_want = 1; g_skip_watermark = 50;
+    anl_setoutput(w, skip_ack_output);
+    write_ack_segs(w, st); dg_seal(w);
+    CHECK(g_skip_acks > 1 && g_skip_packets > 1, "small MTU forced several ACK datagrams");
+    free_rcv_list(w, &st->rcv_buf, &st->nrcv_buf);
+    g_skip_watermark = st->rcv_skip_una = 0xfffffff0u;
+    st->rcv_nxt = st->rcv_skip_una + ANL_MAX_WND - 1;
+    write_ack_segs(w, st); dg_seal(w);
+    CHECK(st->rcv_skip_valid, "still repeat the marker before the sending window has passed it");
+    g_skip_want = 0; st->rcv_nxt++;
+    write_ack_segs(w, st); dg_seal(w);
+    CHECK(!st->rcv_skip_valid, "stop the marker once the bounded sending window proves retirement");
+    anl_release(w);
+}
+
 /* one frame (#10) is lost; the receiver skips it by rcv_deadline */
 static void run_key_receiver(int rcv_drop, uint32_t *delivered, uint32_t *discarded, int *bad)
 {
@@ -1372,6 +1587,62 @@ static void test_key_receiver_discard(void)
     CHECK(b0 == 0 && b1 == 0, "content / accounting / decodability (%d, %d)", b0, b1);
     CHECK(d0 == 59 && x0 == 0, "off: every frame but #10 delivered (%u, %u)", d0, x0);
     CHECK(d1 == 40 && x1 == 19, "on: frames 11..29 discarded, 0..9 and 30..59 delivered (%u, %u)", d1, x1);
+}
+
+static void test_fec_rtt_default(void)
+{
+    int mode, delay;
+    printf("[semi: default FEC protects deadlines shorter than RTT]\n");
+    for (mode = 0; mode < 2; mode++) for (delay = 30; delay <= 140; delay += 110) {
+        net n; anl_config ca, cb; anl_stream_opt o; anl_stream_stats ss;
+        anl_stream_t *a, *b;
+        anl_frame_info fi;
+        char buf[100];
+        int i, r, received = 0;
+        net_init(&n, &ca, &cb);
+        n.min_delay = n.max_delay = delay;
+        ca.pad_max = cb.pad_max = 0;
+        net_start(&n, &ca, &cb);
+        anl_stream_opt_default(&o, ANL_SEMI);
+        CHECK(o.fec == ANL_FEC_RTT_AUTO, "semi default is conditional adaptive FEC");
+        o.max_age_ms = 200;
+        if (!mode) o.fec = 0;
+        a = open_pair(&n, 0, &o, &o, &b);
+        if (!b) { net_stop(&n); continue; }
+        CHECK(anl_send(n.ep[0], "rtt", 3) == 0, "prime the shared connection RTT with reliable data");
+        for (i = 0; i < 1000; i++) net_tick(&n);
+        anl_stream_get_stats(a, &ss);
+        CHECK((ss.fec_ratio != 0) == (mode && delay == 140), "parity follows measured RTT");
+        if (mode) {
+            int32_t saved = n.ep[0]->rx_srtt;
+            n.ep[0]->rx_srtt = 0;
+            CHECK(!fec_active(n.ep[0], a), "unknown RTT waits for a sample");
+            n.ep[0]->rx_srtt = 200;
+            CHECK(!fec_active(n.ep[0], a), "equal lifetime and RTT does not enable parity");
+            n.ep[0]->rx_srtt = 201;
+            CHECK(fec_active(n.ep[0], a), "crossing the lifetime enables parity without changing MSS");
+            n.ep[0]->rx_srtt = saved;
+        }
+        n.drop_at[0] = (uint32_t)n.sent + 1;
+        for (i = 0; i < 8; i++) {
+            fill_pattern(buf, sizeof(buf), (uint32_t)i);
+            CHECK(anl_stream_send_frame(a, 0, buf, sizeof(buf), NULL) == 0, "queue protected data");
+        }
+        for (i = 0; i < 1500; i++) {
+            net_tick(&n);
+            while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) >= 0) {
+                CHECK(r == (int)sizeof(buf) && check_pattern(buf, r, fi.frame_no), "repaired frame content");
+                received++;
+            }
+        }
+        anl_stream_get_stats(b, &ss);
+        if (mode && delay == 140) {
+            CHECK(ss.fec_recovered > 0 && received == 8,
+                  "default long-RTT parity repairs the missing frame (%u repairs, %d frames)", ss.fec_recovered, received);
+        } else CHECK(ss.fec_recovered == 0, "short RTT or explicit off does not repair with parity");
+        CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
+        net_stop(&n);
+    }
 }
 
 /* FEC (DESIGN 8): Reed-Solomon over blocks of up to 100 ms. With rtt 400 ms a
@@ -1465,6 +1736,66 @@ static void run_fec_auto(int deadline, int *ratio, int *got, int *frames)
     net_stop(&n);
 }
 
+static int input_test_report(anl_t *w, anl_stream_t *st, uint32_t ts, uint16_t recovered)
+{
+    char buf[128], *p = buf;
+    int i;
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, ts);
+    p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
+    for (i = 0; i < 7; i++) p = enc16(p, 0);
+    p = enc16(p, recovered);
+    return anl_input_plain(w, buf, (long)(p - buf));
+}
+
+static int ordered_report_callbacks;
+static void ordered_report_cb(anl_t *w, anl_stream_t *st, const anl_delay_report *r, void *user)
+{
+    (void)w; (void)st; (void)r; (void)user;
+    ordered_report_callbacks++;
+}
+
+static void test_fec_report_order(void)
+{
+    anl_config c;
+    anl_stream_opt o;
+    anl_t *w;
+    anl_stream_t *a, *b;
+    anl_stream_stats ss;
+    int err;
+    printf("[fec reports: reordered counters, duplicate age, lost reports and clock/counter wrap]\n");
+    anl_config_default(&c, ANL_ROLE_CLIENT);
+    w = anl_create(1, &c, NULL);
+    CHECK(w != NULL, "create connection");
+    if (!w) return;
+    anl_update(w, 1000);
+    anl_stream_opt_default(&o, ANL_SEMI); o.fec = 1; o.fec_ratio = 0;
+    a = anl_stream_open(w, &o, &err); b = anl_stream_open(w, &o, &err);
+    CHECK(a && b, "open report streams");
+    if (!a || !b) { anl_release(w); return; }
+    ordered_report_callbacks = 0;
+    anl_set_report_callback(w, ordered_report_cb);
+    CHECK(input_test_report(w, a, 100, 100) == 0, "first report");
+    anl_update(w, 1010);
+    CHECK(input_test_report(w, a, 200, 101) == 0, "one more recovered loss");
+    anl_update(w, 1020);
+    CHECK(input_test_report(w, a, 100, 100) == 0, "old datagram remains valid");
+    CHECK(a->peer_rp.fec_recovered == 101 && w->fl_lost == 1, "old report cannot invent a counter wrap");
+    CHECK(input_test_report(w, a, 200, 101) == 0, "duplicate datagram remains valid");
+    anl_stream_get_stats(a, &ss);
+    CHECK(ss.peer.age_ms == 10 && ordered_report_callbacks == 2, "old/duplicate reports do not refresh stats or callbacks");
+    CHECK(input_test_report(w, a, 400, 104) == 0, "new report after a missing interval");
+    CHECK(w->fl_lost == 4, "cumulative report covers the missed interval");
+    /* Each stream has its own ordering. Both 32-bit peer time and the 16-bit
+       recovered count wrap, while this connection has seen later times on a. */
+    CHECK(input_test_report(w, b, 0xffffff00u, 65534) == 0, "other stream's first report");
+    CHECK(input_test_report(w, b, 0x20u, 1) == 0, "new report across both wraps");
+    CHECK(input_test_report(w, b, 0xffffff50u, 65535) == 0, "late report from before the wrap");
+    CHECK(b->peer_rp.fec_recovered == 1 && w->fl_lost == 7 && ordered_report_callbacks == 5, "wrap adds three real recoveries only");
+    fec_loss_add(w, 200, 0);
+    CHECK(w->fec_loss == (7u * 65536u / 200u) / 4u, "loss estimate uses seven recoveries, not 65536");
+    anl_release(w);
+}
+
 /* adaptive redundancy (fec_ratio 0, DESIGN 8.5): down to the floor on a
  * clean link, up where FEC alone would miss the deadline, down again when the
  * loss ends; not up where a retransmission makes the deadline anyway */
@@ -1553,7 +1884,7 @@ static void test_bbr_policer_probes(void)
     CHECK(w.lt_k == 5 && !w.lt_tail, "reduced offered load does not prove a new ceiling");
     w.min_rtt = 100; w.prev_round_min_rtt = 200;
     policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
-    CHECK(w.lt_state == 0 && w.lt_hold == 48, "a queued probe still yields to congestion control");
+    CHECK(w.lt_state == 0 && w.lt_hold == 48, "long-RTT queued probe still yields immediately to congestion control");
 
     /* J8, ab17b_zjg2lsj_v16d: an underfed k=2 tail still loses 152 per
        mille. The low-loss guard must not widen with the nominal probe. */
@@ -1572,6 +1903,252 @@ static void test_bbr_policer_probes(void)
     CHECK(w.lt_k == 2 && !w.lt_tail, "probe still advances while delivery follows");
     policer_interval(&w, 759, 6472614, 1629696, 1604232, 5528230, 837930);
     CHECK(w.lt_state == 3 && w.lt_k == 2 && w.lt_tail, "5.2 percent fall with rising loss stops further acceleration");
+}
+
+/* J8: a recovering ceiling can flatten gradually rather than falling by
+ * more than 1/32 in any one interval. Do not exhaust the probe at 5x an old
+ * low base while its actual delivery has already stopped following it. */
+static void test_bbr_policer_plateau(void)
+{
+    anl_t w;
+    int wrap, run, k;
+    const uint32_t raw[2][2][6] = {
+        { {301, 985490, 4244, 5305, 925412, 59024},
+          {300, 1056108, 7427, 1061, 896954, 163370} },
+        { {300, 982328, 5305, 8488, 919088, 61132},
+          {300, 1052946, 11671, 6366, 893792, 160208} }
+    };
+    printf("[bbr: recovering ceiling plateaus, residual loss and insufficient probe load]\n");
+    for (wrap = 0; wrap < 2; wrap++) for (run = 0; run < 2; run++) {
+        const uint32_t (*a)[6] = raw[run];
+        memset(&w, 0, sizeof(w));
+        w.lt_state = 3; w.lt_from = 2; w.lt_k = 10; w.lt_span = 8;
+        w.lt_rate = run ? 948950 : 948600;
+        if (wrap) w.sent_wire = 0xfffffc17u;
+        policer_interval(&w, a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], a[0][5]);
+        CHECK(w.lt_k == 11 && !w.lt_tail, "initial slight excess still permits the next step");
+        policer_interval(&w, a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], a[1][5]);
+        CHECK(w.lt_state == 3 && w.lt_k == 11 && w.lt_tail,
+              "J8 raw run %d stops on flattened delivery (wrap=%d)", run + 1, wrap);
+    }
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_rate = 948600; w.lt_span = 8;
+    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt_state == 3 && !w.lt_tail; k++) {
+        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        uint32_t delivered = umin32(sent, 900000);  /* 3 MB/s, no bucket overshoot */
+        policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
+    }
+    CHECK(w.lt_state == 3 && w.lt_tail, "a flat ceiling is measured without a delivery dip");
+    if (w.lt_state == 3 && w.lt_tail) {
+        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        policer_interval(&w, 300, sent, 0, 0, 900000, sent - 900000);
+        CHECK(w.lt_state == 2 && w.lt_rate == 3000000, "tail confirms the newly available capacity");
+    }
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 11; w.lt_rate = 948600;
+    w.lt_prev_rate = 2000000;
+    /* Only 2.2 MB/s offered at a 3.56 MB/s target. About 10% loss and a
+       near-flat delivery rate cannot establish the path's ceiling. */
+    policer_interval(&w, 300, 660000, 0, 0, 594000, 66000);
+    CHECK(w.lt_k == 12 && !w.lt_tail, "an underfed plateau does not establish a ceiling");
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 11; w.lt_rate = 750000;
+    w.lt_prev_rate = 2300000;
+    policer_interval(&w, 300, 840000, 0, 0, 726000, 114000);
+    CHECK(w.lt_k == 12 && !w.lt_tail, "delivery still grows with the offered probe");
+    memset(&w, 0, sizeof(w));
+    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_rate = 948600; w.lt_res = 200;
+    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt_state == 3; k++) {
+        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        uint32_t delivered = sent * 4 / 5;
+        policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
+        CHECK(!w.lt_tail, "unchanged residual random loss does not set a ceiling (step %d)", k);
+    }
+    CHECK(w.lt_state == 0, "probe budget can still end without a measured ceiling");
+}
+
+static void policer_confirmed(anl_t *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->lt_state = 2;
+    w->lt_rate = 3541495;
+    w->lt_res = 2;
+    w->lt_left = 32;
+    w->lt_span = 64;
+}
+
+static void test_bbr_policer_pacing(void)
+{
+    anl_t w;
+    int i;
+    static const uint32_t intervals[] = {1, 10, 20};
+    printf("[bbr: execute low-rate policer trials below the ordinary pacing floor]\n");
+    for (i = 0; i < 3; i++) {
+        memset(&w, 0, sizeof(w));
+        w.mss = 1368; w.interval = intervals[i]; w.rx_srtt = 1;
+        w.pacing_gain = BBR_UNIT; w.btl_bw = 527000;
+        /* J12 tcv_v5_f19: the old floor forced 547200 instead of 358360. */
+        w.lt_state = 1; w.lt_from = 2; w.lt_rate = 358360;
+        CHECK(compute_pace_rate(&w) == 358360, "execute the requested trial (interval=%u)", w.interval);
+        w.lt_state = 2;
+        CHECK(compute_pace_rate(&w) == 358360, "keep a confirmed low ceiling");
+        w.lt_state = 3; w.lt_k = 1;
+        CHECK(compute_pace_rate(&w) == 447950, "allow the explicit quarter-rate probe");
+        w.lt_k = 4;
+        CHECK(compute_pace_rate(&w) == 716720, "probe can discover recovered capacity");
+        w.pace_rate_cfg = 100000;
+        CHECK(compute_pace_rate(&w) == 100000, "configured rate cap still wins");
+    }
+    w.pace_rate_cfg = 0; w.lt_state = 0; w.interval = 10;
+    CHECK(compute_pace_rate(&w) == 547200, "ordinary BBR keeps its pacing floor");
+}
+
+static void test_bbr_policer_capacity_change(void)
+{
+    anl_t w;
+    uint32_t trial, left;
+    printf("[bbr: verify a lower ceiling, reject random loss, recover the old rate]\n");
+    policer_confirmed(&w);
+    /* ab20: two stable low-rate intervals after the first mixed interval. */
+    policer_interval(&w, 327, 459544, 0, 0, 363630, 95914);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "one low interval is inconclusive");
+    policer_interval(&w, 329, 462706, 0, 0, 363630, 99076);
+    CHECK(w.lt_state == 1 && w.lt_from == 2 && w.lt_rate < 1200000,
+          "stable excess loss starts a lower-rate trial");
+    CHECK(w.lt_save_btl == 3541495 && w.lt_skip, "trial preserves the confirmed rate and excludes transition");
+    trial = w.lt_rate;
+    policer_interval(&w, 400, 445600, 0, 0, 445600, 0);
+    CHECK(w.lt_state == 3 && w.lt_from == 2 && w.lt_rate == trial && w.lt_span == BBR_LT_SPAN,
+          "loss falls at the executed trial rate: verify its ceiling");
+    CHECK(w.lt_recover_rate == 3541495, "remember the capacity that may return");
+    policer_interval(&w, 400, 556000, 0, 0, 444000, 112000);
+    CHECK(w.lt_tail, "excess probe loss starts tail measurement");
+    policer_interval(&w, 400, 556000, 0, 0, 444000, 112000);
+    CHECK(w.lt_state == 2 && w.lt_rate == 1110000 && w.lt_span == BBR_LT_SPAN,
+          "confirmed lower ceiling bypasses the old ceiling's 7/8 floor and long backoff");
+    w.lt_state = 3; w.lt_k = 8; w.lt_tail = 1;
+    policer_interval(&w, 400, 1332000, 0, 0, 1300000, 32000);
+    CHECK(w.lt_state == 2 && w.lt_recover_rate == 0 && w.lt_span == 2 * BBR_LT_SPAN,
+          "capacity recovered: resume ordinary probe backoff");
+
+    policer_confirmed(&w);
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    CHECK(w.lt_state == 1, "new 30 percent random loss is suspicious but not yet a lower ceiling");
+    left = w.lt_left;
+    policer_interval(&w, 400, 992800, 0, 0, 694960, 297840);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495 && w.lt_recover_rate == 0,
+          "loss persists after slowing: restore the confirmed ceiling");
+    CHECK(w.lt_left == left && w.lt_hold == left && w.lt_span == 64,
+          "failed trial preserves the previous probe schedule");
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "cooldown prevents repeated trials of unchanged random loss");
+
+    policer_confirmed(&w);
+    policer_interval(&w, 327, 459544, 0, 0, 363630, 95914);
+    policer_interval(&w, 329, 462706, 0, 0, 363630, 99076);
+    policer_interval(&w, 400, 200000, 0, 0, 200000, 0);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495 && w.lt_recover_rate == 0,
+          "loss-free but underfed trial does not confirm a capacity fall");
+
+    policer_confirmed(&w);
+    policer_interval(&w, 400, 1400000, 0, 0, 900000, 500000);
+    policer_interval(&w, 400, 650000, 0, 0, 440000, 210000);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "mixed transition and low interval do not form a stable pair");
+    policer_interval(&w, 400, 650000, 0, 0, 440000, 210000);
+    CHECK(w.lt_state == 1, "two subsequent low intervals can start a trial");
+
+    policer_confirmed(&w);
+    w.lt_res = 300;
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
+    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "known residual loss is not evidence of a capacity fall");
+}
+
+static void test_bbr_policer_residual_refresh(void)
+{
+    anl_t w;
+    uint32_t old_rate, trial_bytes, corrected;
+    int scenario, wrap;
+    printf("[bbr: remeasure stale residual below the ceiling, preserve real random loss]\n");
+    for (wrap = 0; wrap < 2; wrap++) for (scenario = 0; scenario < 4; scenario++) {
+        policer_confirmed(&w);
+        w.lt_rate = 1040000; w.lt_res = 84; w.lt_left = 1; w.lt_span = 8;
+        if (wrap) w.sent_wire = 0xfffffc17u;
+        old_rate = w.lt_rate;
+        corrected = old_rate * 916 / 1000;
+        /* About 7% steady loss no longer exceeds residual+100, so the
+           capacity-fall detector cannot repair the old 84-per-mille value. */
+        policer_interval(&w, 300, 312000, 0, 0, 290160, 21840);
+        CHECK(w.lt_state == 1 && w.lt_from == 3 && w.lt_rate < corrected,
+              "periodic probe measures below old delivery, scenario=%d wrap=%d", scenario, wrap);
+        trial_bytes = w.lt_rate * 3 / 10;
+        if (scenario == 1) {
+            /* Real 8.4% random loss persists even below the ceiling. */
+            policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes * 916 / 1000, trial_bytes * 84 / 1000);
+        } else if (scenario == 2) {
+            /* A receive-window/app stall is not a loss-free capacity test. */
+            policer_interval(&w, 300, trial_bytes / 2, 0, 0, trial_bytes / 2, 0);
+        } else {
+            policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes, 0);
+            CHECK(w.lt_state == 1 && w.lt_res == 84, "one quiet interval cannot erase the residual");
+            if (scenario == 3) {
+                /* A second interval contradicts the first: retain the old value. */
+                policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes * 9 / 10, trial_bytes / 10);
+            } else {
+                policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes, 0);
+            }
+        }
+        CHECK(w.lt_state == 3 && w.lt_from == 2 && w.lt_k == 1 && w.lt_skip,
+              "recheck returns to a bounded capacity probe");
+        if (scenario == 0) {
+            CHECK(w.lt_res == 0 && w.lt_rate == corrected, "remove stale compensation after two clean intervals");
+            policer_interval(&w, 300, 357240, 0, 0, 285000, 72240);
+            policer_interval(&w, 300, 357240, 0, 0, 285000, 72240);
+            CHECK(w.lt_state == 2 && w.lt_rate == 950000, "probe reconfirms the actual ceiling");
+        } else CHECK(w.lt_res == 84 && w.lt_rate == old_rate, "inconclusive recheck preserves residual and ceiling");
+        if (scenario == 2) CHECK(!w.lt_res_checked, "underfed check remains eligible for a later retry");
+    }
+    policer_confirmed(&w);
+    w.lt_rate = 1040000; w.lt_res = 84; w.lt_left = 1; w.lt_res_checked = 1;
+    policer_interval(&w, 300, 312000, 0, 0, 285792, 26208);
+    CHECK(w.lt_state == 3 && w.lt_from == 2, "already checked random loss does not delay every capacity probe");
+    w.lt_state = 2; w.lt_left = 2;
+    policer_interval(&w, 300, 312000, 0, 0, 293280, 18720);
+    CHECK(w.lt_state == 2, "one newly lower-loss interval is inconclusive");
+    policer_interval(&w, 300, 312000, 0, 0, 293280, 18720);
+    CHECK(w.lt_state == 1 && w.lt_from == 3, "persistent lower loss permits another residual check");
+}
+
+static void test_bbr_policer_queue_recheck(void)
+{
+    anl_t w;
+    int initial;
+    printf("[bbr: transient queued interval must not erase an established policer]\n");
+    for (initial = 0; initial < 2; initial++) {
+        policer_confirmed(&w);
+        w.lt_state = 3; w.lt_from = initial ? 1 : 2;
+        w.lt_k = 1; w.lt_rate = 951805; w.lt_res = 3;
+        w.min_rtt = 1; w.prev_round_min_rtt = 20;
+        /* j8d pn r5: at k=1 a queue-tainted interval delivered all 344658
+           bytes, but old code discarded the ceiling and waited 48 intervals. */
+        policer_interval(&w, 301, 344658, 0, 0, 344658, 0);
+        if (initial) {
+            CHECK(w.lt_state == 0, "initial detection still rejects a queued path");
+            continue;
+        }
+        CHECK(w.lt_state == 3 && w.lt_k == 1 && w.lt_rate == 951805 && !w.lt_hold,
+              "repeat the same bounded step after a transient queue signal");
+        w.prev_round_min_rtt = 1;
+        policer_interval(&w, 301, 344658, 0, 0, 344658, 0);
+        CHECK(w.lt_state == 3 && w.lt_k == 2, "clean next interval resumes capacity discovery");
+        w.prev_round_min_rtt = 20;
+        policer_interval(&w, 301, 420000, 0, 0, 344658, 75342);
+        CHECK(w.lt_state == 3 && w.lt_k == 2, "nonconsecutive queue events do not count as persistent");
+        policer_interval(&w, 301, 420000, 0, 0, 344658, 75342);
+        CHECK(w.lt_state == 0 && w.lt_hold == 48, "consecutive queue evidence still releases the ceiling");
+    }
 }
 
 /* Frequent ACKs must not evict the history needed to smooth short-RTT
@@ -1701,6 +2278,46 @@ static void test_fec_auto_shared(void)
 static uint32_t g_rate;
 static int g_rate_calls;
 static void rate_cb(anl_t *w, uint32_t target, void *user) { (void)w; (void)user; g_rate = target; g_rate_calls++; }
+
+/* The same traffic must give the same recommendation on either side of the
+ * wrapping wire counter. Payload and delivery totals are 64-bit counters. */
+static void test_target_rate_wrap(void)
+{
+    anl_t plain, wrapped;
+    uint32_t targets[2];
+    int i;
+    memset(&plain, 0, sizeof(plain));
+    plain.mss = 1200;
+    plain.current = 1000;
+    plain.rate_ts = 800;
+    plain.rate_share = 230;
+    plain.btl_bw = 250000;
+    plain.rx_srtt = 100;
+    plain.sent_wire = 100000;
+    plain.rate_wire0 = plain.sent_wire;
+    plain.rate_cb = rate_cb;
+    wrapped = plain;
+    wrapped.sent_wire = UINT32_MAX - 29999;
+    wrapped.rate_wire0 = wrapped.sent_wire;
+    g_rate_calls = 0;
+    for (i = 0; i < 3; i++) {
+        plain.current += 200;
+        wrapped.current += 200;
+        plain.sent_wire += 60000;
+        wrapped.sent_wire += 60000;
+        plain.tx_payload += 40000;
+        wrapped.tx_payload += 40000;
+        rate_update(&plain);
+        targets[0] = g_rate;
+        rate_update(&wrapped);
+        targets[1] = g_rate;
+        CHECK(plain.rate_share == wrapped.rate_share,
+              "wire counter wrap preserves payload share (%u / %u)", plain.rate_share, wrapped.rate_share);
+        CHECK(plain.rate_target == wrapped.rate_target && targets[0] == targets[1],
+              "wire counter wrap preserves rate and callback (%u / %u)", plain.rate_target, wrapped.rate_target);
+    }
+    CHECK(g_rate_calls >= 2, "rate callbacks exercised across wire counter wrap");
+}
 
 static void test_target_rate(void)
 {
@@ -1881,12 +2498,23 @@ int main(void)
     RUN(test_priority());
     RUN(test_key_sender_purge());
     RUN(test_key_receiver_discard());
+    RUN(test_window_reopen_loss());
+    RUN(test_receiver_deadline_default());
+    RUN(test_receiver_skip_ack_fragments());
+    RUN(test_fec_rtt_default());
     RUN(test_fec_repair());
+    RUN(test_fec_report_order());
     RUN(test_fec_auto());
     RUN(test_fec_auto_shared());
     RUN(test_bbr_delivery_window());
     RUN(test_bbr_policer_probes());
+    RUN(test_bbr_policer_plateau());
+    RUN(test_bbr_policer_pacing());
+    RUN(test_bbr_policer_capacity_change());
+    RUN(test_bbr_policer_residual_refresh());
+    RUN(test_bbr_policer_queue_recheck());
     RUN(test_tiny_rtt());
+    RUN(test_target_rate_wrap());
     RUN(test_target_rate());
     RUN(test_delay_report());
     RUN(test_outage());

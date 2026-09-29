@@ -54,9 +54,18 @@ if(BUILD_TESTING)
         target_link_libraries(anl_test PRIVATE m)
     endif()
     add_test(NAME anliu.unit COMMAND anl_test)
+
+    add_executable(test_fec_diag bench/test_fec_diag.c)
+    anliu_configure_test(test_fec_diag)
+    set_target_properties(test_fec_diag PROPERTIES C_EXTENSIONS OFF)
+    if(UNIX)
+        target_link_libraries(test_fec_diag PRIVATE m)
+    endif()
+    add_test(NAME anliu.fec_accounting COMMAND test_fec_diag)
 endif()
 
-if(UNIX AND ANLIU_BUILD_BENCHMARKS)
+if(UNIX AND (ANLIU_BUILD_BENCHMARKS OR
+    (BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")))
     # KCP is only a comparison-tool dependency; the AnLiu library is standalone.
     add_library(anliu_bench_kcp STATIC bench/ikcp.c)
     target_include_directories(anliu_bench_kcp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench)
@@ -83,6 +92,14 @@ if(ANLIU_BUILD_BENCHMARKS)
         anliu_configure_tool(anl_bench)
         target_link_libraries(anl_bench PRIVATE anliu)
 
+        add_executable(anl_media_startup bench/media_startup.c)
+        anliu_configure_tool(anl_media_startup)
+        target_link_libraries(anl_media_startup PRIVATE anliu)
+
+        # capacity_step.c includes anliu.c itself for internal diagnostics.
+        add_executable(anl_capacity_step bench/capacity_step.c)
+        anliu_configure_tool(anl_capacity_step)
+
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(realnet bench/realnet.c)
             anliu_configure_tool(realnet)
@@ -99,8 +116,25 @@ if(ANLIU_BUILD_BENCHMARKS)
     endif()
 endif()
 
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_tx_diag bench/test_tx_diag.c)
+    anliu_configure_tool(test_tx_diag)
+    anliu_configure_test(test_tx_diag)
+    target_compile_definitions(test_tx_diag PRIVATE REALNET_INTERNAL)
+    add_test(NAME anliu.tx_accounting COMMAND test_tx_diag)
+
+    add_executable(test_media_workload bench/test_media_workload.c)
+    anliu_configure_tool(test_media_workload)
+    anliu_configure_test(test_media_workload)
+    target_link_libraries(test_media_workload PRIVATE anliu)
+    add_test(NAME anliu.media_workload COMMAND test_media_workload)
+endif()
+
 if(BUILD_TESTING)
-    set_tests_properties(anliu.unit PROPERTIES TIMEOUT 180)
+    set_tests_properties(anliu.unit anliu.fec_accounting PROPERTIES TIMEOUT 180)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set_tests_properties(anliu.tx_accounting anliu.media_workload PROPERTIES TIMEOUT 30)
+    endif()
 endif()
 
 install(TARGETS anliu EXPORT AnLiuTargets

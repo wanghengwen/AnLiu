@@ -10,6 +10,7 @@
  *           kernel's TCP on the same port number, for comparison)
  *   --test  media (audio 160 B / 20 ms + video 30 fps ~940 kbps) | bulk (--bulk MB, timed)
  *           | stream (a reliable stream kept full for --dur seconds: goodput per second)
+ *           | mixed (media and a full reliable stream at the same time; use --wnd 128 as anl_bench s5)
  *   --dir   up (client sends) | down (server sends)
  *   --dur S       media: seconds of traffic (default 60)
  *   --bulk MB     bulk: megabytes (default 16)
@@ -17,8 +18,15 @@
  *                 about 1 MB, 30 Mbps at 280 ms RTT)
  *   --loss P      extra random loss in % on every datagram sent (both ends)
  *   --interval MS AnLiu cfg.interval (default 10)
+ *   --init-cwnd N AnLiu initial congestion window in segments (default from library)
  *   --seed N
  *
+ *   REALNET_TIMEBASE=1  wall/monotonic anchors at traffic start and first delivered byte
+ *   REALNET_SECS=1  stream: rounded SECS plus exact SECS_BYTES per-second payload bytes
+ *   REALNET_TXDIAG=1  INTERNAL build: cumulative pacing budgets and sampled blocking times
+ *   REALNET_FECCOST=1 INTERNAL build: exact protocol byte categories before emulated loss/sendto
+ *   REALNET_RATE=1  record target-rate callbacks and their timestamps (all AnLiu builds)
+ *   REALNET_MDIAG=1  media: per-frame send / receive records and 100 ms stream samples (MDIAG lines)
  * One UDP port carries everything: every datagram starts with one byte,
  * 'A' AnLiu, 'K' ikcp, 'H' hello (the client tells the server where it is),
  * 'P' / 'Q' ping / pong. Frames carry the sender's clock; the receiver
@@ -44,15 +52,54 @@
 #ifdef REALNET_INTERNAL
 #include "anliu.h"
 static void trace_lt_interval(const anl_t *, uint32_t, uint32_t, uint32_t, uint32_t, int);
+static void trace_dead(const anl_t *, const char *, int, uint32_t, uint32_t, uint32_t, uint32_t);
+static void trace_pace_refill(const anl_t *, uint32_t, uint64_t, uint64_t);
+static void trace_tx_output(const anl_t *, uint32_t, int);
+static void trace_media_tx_output(const anl_t *, uint32_t, int);
+static void trace_seg_commit(const anl_t *, uint32_t, int);
+static void trace_data_seg(const anl_t *, const anl_stream_t *, uint32_t, int);
+static void trace_parity_seg(const anl_t *, int, uint32_t);
+static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t);
+static void trace_flush(const anl_t *, int64_t, int64_t, int);
+static void trace_lt_begin(const anl_t *);
+#define ANL_PACE_REFILL_TRACE trace_pace_refill
+#define ANL_TX_OUTPUT_TRACE trace_media_tx_output
+#define ANL_SEG_COMMIT_TRACE trace_seg_commit
+#define ANL_DATA_SEG_TRACE trace_data_seg
+#define ANL_PARITY_SEG_TRACE trace_parity_seg
+#define ANL_FEC_BLOCK_TRACE trace_fec_block
+#define ANL_FLUSH_TRACE trace_flush
+#define ANL_POLICER_BEGIN_TRACE trace_lt_begin
 #define ANL_POLICER_TRACE trace_lt_interval
+#define ANL_DEAD_TRACE trace_dead
 #include "../anliu.c"       /* build without ../anliu.c: REALNET_TRACE shows BBR internals */
 #undef ANL_POLICER_TRACE
+#undef ANL_DEAD_TRACE
+#undef ANL_PACE_REFILL_TRACE
+#undef ANL_TX_OUTPUT_TRACE
+#undef ANL_SEG_COMMIT_TRACE
+#undef ANL_DATA_SEG_TRACE
+#undef ANL_PARITY_SEG_TRACE
+#undef ANL_FEC_BLOCK_TRACE
+#undef ANL_FLUSH_TRACE
+#undef ANL_POLICER_BEGIN_TRACE
+#include "tx_diag.h"
+#include "fec_diag.h"
+static void trace_media_tx_output(const anl_t *w, uint32_t bytes, int paced)
+{
+    trace_tx_output(w, bytes, paced);
+    fec_diag_output(w, bytes);
+}
+#define TX_OBSERVE(w) tx_diag_observe(&g_tx_diag, (w))
 #elif defined(ANL_V2)
 #include "anliuv2.h"
 #else
 #include "anliu.h"
 #endif
 #include "ikcp.h"
+#ifndef TX_OBSERVE
+#define TX_OBSERVE(w) ((void)0)
+#endif
 
 #define MTU         1400
 #define KCP_CONV0   0x1000
@@ -78,12 +125,13 @@ typedef struct flow {
 } flow;
 
 static flow g_fl[NFLOW];
-static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk, 2 stream */, g_up = 1, g_server = 0;
+static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk, 2 stream, 3 mixed */, g_up = 1, g_server = 0;
 static int g_dur = 60, g_bulk_mb = 16, g_port = 0, g_wnd = 1024, g_interval = 10;      /* 0: anl 9836, kcp 9837 */
 static double g_loss = 0;
 static int g_verify;
 static uint64_t g_input_errors, g_output_errors, g_payload_errors, g_checked_bytes;
 static uint64_t g_rng = 88172645463325252ull;
+static uint64_t g_media_seed; /* workload is independent of loss, role and timer batching */
 static const char *g_host = NULL;
 
 static int g_fd = -1;
@@ -95,9 +143,46 @@ static uint64_t g_tx_bytes, g_tx_pkts, g_rx_bytes, g_rx_pkts, g_tx_dropped;
    (otherwise it runs while datagrams keep coming); batch size / duration and the
    protocol clock's lag behind the real clock at input are reported (CLOCK line) */
 static int g_clock_refresh;
+static int g_timebase; /* explicit wall/monotonic anchors for TC phase alignment */
 static uint32_t g_protocol_ms;  /* timestamp actually supplied to ep_update */
 static uint64_t g_clk_batches, g_clk_refreshes;
 static uint32_t g_clk_max_pkts, g_clk_max_us, g_clk_max_lag;
+static uint32_t g_clk_int_max_us;          /* largest receive batch since the last MDIAG sample */
+static uint64_t g_t0_us;                   /* test start on this host (MDIAG receiver times) */
+
+/* Buffer callback observations until the test ends; no terminal/file I/O in
+   the callback. This observes the recommended payload rate, not a traffic
+   generator control or a notification of every change in actual throughput. */
+typedef struct {
+    uint64_t mono_us, wire_bytes;
+    uint32_t protocol_ms, previous;
+    anl_stats stats;
+} rate_event;
+#define RATE_EVENT_MAX 65536u
+static int g_rate_diag;
+static rate_event *g_rate_events;
+static size_t g_nrate, g_caprate;
+static uint64_t g_rate_calls, g_rate_dropped;
+static uint32_t g_rate_previous;
+
+/* REALNET_MDIAG=1 (media test): per-frame sender / receiver records and 100 ms
+   stream samples, kept in memory and printed at the end (MDIAG_S / MDIAG_R /
+   MDIAG_T lines), so the diagnosis does not disturb the timing it looks at */
+typedef struct { uint32_t t_ms, seq, frame_no, len; int8_t id, key; int16_t rc; } mdiag_s;
+typedef struct { uint32_t seq, frame_no, lost_before, len; int64_t owd_us; uint64_t mono_us; int8_t id, key; } mdiag_r;
+typedef struct { uint32_t t_ms; int id; anl_stream_stats ss; anl_stats cs; uint32_t batch_us; } mdiag_t;
+static int g_mdiag;
+static int g_init_cwnd;                    /* 0 keeps the library default */
+static int g_pace_rate, g_pace_burst;      /* anl_config.pace_rate (B/s) / pace_burst (B); 0 keeps the library default */
+static int g_rcv_deadline = -2, g_fec_rtt_auto, g_fec_ratio = -1; /* explicit policy A/B controls */
+static int g_fec_ratio_flow[3] = { -1, -1, -1 };   /* --fec-ratio-audio / --fec-ratio-video: per-flow override, [1] audio, [2] video */
+static mdiag_s *g_mds; static size_t g_nmds, g_capmds;
+static mdiag_r *g_mdr; static size_t g_nmdr, g_capmdr;
+static mdiag_t *g_mdt; static size_t g_nmdt, g_capmdt;
+static int g_last_rc; static uint32_t g_last_fno;       /* of the last ep_send / ep_recv */
+static anl_frame_info g_last_fi;
+#define MDIAG_PUSH(a, n, cap, v) do { if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 4096; \
+        (a) = realloc((a), (cap) * sizeof(*(a))); } (a)[(n)++] = (v); } while (0)
 
 static anl_t *g_anl;
 static anl_stream_t *g_h[NFLOW];
@@ -105,6 +190,8 @@ static ikcpcb *g_kcp[NFLOW];
 
 /* bulk */
 static uint64_t g_bulk_sent, g_bulk_rcvd, g_bulk_first_us, g_bulk_done_us;
+static uint64_t g_bulk_last_us, g_gap_max_us, g_gap_max_at_us;   /* stream receive gaps inside --dur */
+static unsigned g_gap_n1, g_gap_n2, g_gap_n5;
 #define MAXSEC 3600
 static uint64_t g_sec_bytes[MAXSEC];      /* stream: bytes received in each second after the first byte */
 
@@ -116,17 +203,78 @@ static uint64_t now_us(void)
 }
 static uint32_t now_ms(void) { return (uint32_t)(now_us() / 1000); }
 
+static void rate_changed(anl_t *w, uint32_t target, void *user)
+{
+    uint64_t event_us = now_us();
+    uint32_t previous = g_rate_previous;
+    rate_event *e;
+    (void)user;
+    g_rate_calls++;
+    g_rate_previous = target;
+    if (g_nrate == g_caprate) {
+        size_t cap = g_caprate ? g_caprate * 2 : 256;
+        rate_event *p;
+        if (cap > RATE_EVENT_MAX) { g_rate_dropped++; return; }
+        p = realloc(g_rate_events, cap * sizeof(*p));
+        if (!p) { g_rate_dropped++; return; }
+        g_rate_events = p; g_caprate = cap;
+    }
+    e = &g_rate_events[g_nrate++];
+    e->mono_us = event_us; e->protocol_ms = g_protocol_ms;
+    e->wire_bytes = g_tx_bytes; e->previous = previous;
+    anl_get_stats(w, &e->stats); /* explicitly permitted inside the rate callback */
+}
+
+/* Bracket the wall-clock sample with monotonic reads. This only aligns clocks
+   on this host; cross-host offset/drift must be measured by the test operator. */
+static void report_timebase(const char *event, uint64_t event_us)
+{
+    struct timespec wall;
+    uint64_t before, after, wall_us;
+    if (!g_timebase) return;
+    before = now_us();
+    clock_gettime(CLOCK_REALTIME, &wall);
+    after = now_us();
+    wall_us = (uint64_t)wall.tv_sec * 1000000ull + (uint64_t)wall.tv_nsec / 1000;
+    printf("TIMEBASE event=%s event_mono_us=%llu anchor_mono_lo_us=%llu anchor_mono_hi_us=%llu wall_us=%llu\n",
+           event, (unsigned long long)event_us, (unsigned long long)before,
+           (unsigned long long)after, (unsigned long long)wall_us);
+}
+
 static uint32_t rnd(void)
 {
     g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
     return (uint32_t)(g_rng >> 16);
 }
-static int rnd_range(int a, int b) { return a >= b ? a : a + (int)(rnd() % (uint32_t)(b - a + 1)); }
+/* frame_v1: a stable size for each (seed, flow, sequence). A shared RNG makes
+   equal --seed runs generate different frames when FEC changes packet counts. */
+static int media_frame_size(const flow *f, int key)
+{
+    int a = key ? f->key_min : f->size_min;
+    int b = key ? f->key_max : f->size_max;
+    uint64_t x;
+    if (a >= b) return a;
+    x = g_media_seed + ((uint64_t)f->seq + 1) * 0x9e3779b97f4a7c15ull
+        + (uint64_t)f->id * 0xd1b54a32d192ed03ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return a + (int)(x % (uint32_t)(b - a + 1));
+}
 
 static int is_anl(void) { return g_proto <= P_ANLAUTO; }
 static int is_sender(void) { return g_server ? !g_up : g_up; }
 
 #ifdef REALNET_INTERNAL
+static void trace_dead(const anl_t *w, const char *reason, int sid, uint32_t sn,
+                       uint32_t xmit, uint32_t enqueued, uint32_t last_sent)
+{
+    fprintf(stderr, "DEAD now=%u reason=%s sid=%d sn=%u xmit=%u enqueued=%u last_sent=%u"
+            " last_rx=%u srtt=%d rto=%d lt=%d rate=%u pace=%u hold=%u\n",
+            w->current, reason, sid, sn, xmit, enqueued, last_sent, w->last_rx,
+            w->rx_srtt, w->rx_rto, w->lt_state, w->lt_rate, w->pace_rate, w->lt_hold);
+}
+
 /* Completed intervals, including local measurements lost when the detector
    resets its counters. "after" still has that interval's byte counters. */
 static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
@@ -134,6 +282,7 @@ static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
 {
     uint32_t sent = w->sent_wire - w->lt_sent0;
     const anl_stream_t *bulk = g_h[3];
+    if (!after) tx_diag_print(w, "lt_end");
     if (!is_sender() || !getenv("REALNET_TRACE")) return;
     fprintf(stderr, "LTINT now=%u stage=%s st=%d ph=%d lt=%d k=%u from=%u tail=%u bad=%d hold=%u left=%u span=%u rounds=%u dur=%u"
             " sent=%u infl0=%llu infl1=%llu delivered=%llu lost=%llu loss=%u counted=%u"
@@ -199,7 +348,26 @@ static void flows_init(void)
     b->name = "bulk"; b->id = 3; b->semi = 0; b->prio = 3; b->wnd = g_wnd; b->budget_ms = 1000000;
 }
 
-static int flow_active(int id) { return g_test == 0 ? (id == 1 || id == 2) : id == 3; }
+#ifdef REALNET_INTERNAL
+/* ZWND: spans in which the sender's bulk stream holds new data but the peer's
+   last advertised window is 0 (window-probe recovery, suggestion.md 14:13). */
+static uint64_t g_zw_start_us, g_zw_total_us, g_zw_max_us, g_zw_max_at_us;
+static unsigned g_zw_n, g_zw_n1;
+static void zwnd_sample(uint64_t t, uint64_t start_us)
+{
+    const anl_stream_t *b = g_h[3];
+    int zero = b && b->rmt_wnd == 0 && b->nsnd_que > 0;
+    if (zero && !g_zw_start_us) { g_zw_start_us = t; g_zw_n++; }
+    if (!zero && g_zw_start_us) {
+        uint64_t d = t - g_zw_start_us;
+        g_zw_total_us += d; g_zw_n1 += d >= 1000000u;
+        if (d > g_zw_max_us) { g_zw_max_us = d; g_zw_max_at_us = g_zw_start_us - start_us; }
+        g_zw_start_us = 0;
+    }
+}
+#endif
+
+static int flow_active(int id) { return g_test == 3 || (g_test == 0 ? (id == 1 || id == 2) : id == 3); }
 
 static void flow_opt(const flow *f, anl_stream_opt *o)
 {
@@ -210,8 +378,15 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
     if (f->semi) {
         o->max_age_ms = f->max_age;
         o->drop_until_key = f->until_key;
+        o->fec = 0; /* the named anl protocol remains an explicit no-FEC control */
         if (g_proto == P_ANLFEC) { o->fec = 1; o->fec_ratio = 25; }
         if (g_proto == P_ANLAUTO) { o->fec = 1; o->fec_ratio = 0; }
+#ifdef ANL_FEC_RTT_AUTO
+        if (g_fec_rtt_auto) { o->fec = ANL_FEC_RTT_AUTO; o->fec_ratio = 0; }
+#endif
+        if (g_fec_ratio >= 0) { o->fec = 1; o->fec_ratio = g_fec_ratio; }   /* --fec-ratio: fixed, 0 adaptive */
+        if (f->id >= 1 && f->id <= 2 && g_fec_ratio_flow[f->id] >= 0) { o->fec = 1; o->fec_ratio = g_fec_ratio_flow[f->id]; }
+        if (g_rcv_deadline >= -1) o->rcv_deadline_ms = g_rcv_deadline;
     }
 }
 
@@ -234,10 +409,17 @@ static void ep_create(void)
         memset(cfg.psk, 0x5a, sizeof(cfg.psk));
         cfg.mtu = MTU;
         cfg.interval = g_interval;
+        if (g_init_cwnd) cfg.init_cwnd = g_init_cwnd;
+        g_init_cwnd = cfg.init_cwnd;
+        if (g_pace_rate) cfg.pace_rate = g_pace_rate;
+        if (g_pace_burst) cfg.pace_burst = g_pace_burst;
+        printf("PACECFG init_cwnd=%d pace_rate=%d pace_burst=%d (0 = library default)\n", cfg.init_cwnd, cfg.pace_rate, cfg.pace_burst);
         g_anl = anl_create(0x5a5a0001, &cfg, NULL);
         anl_setoutput(g_anl, anl_out);
         anl_set_accept(g_anl, accept_cb);
-        anl_update(g_anl, now_ms());
+        if (g_rate_diag) anl_set_rate_callback(g_anl, rate_changed);
+        g_protocol_ms = now_ms();
+        anl_update(g_anl, g_protocol_ms);
         return;
     }
     for (i = 1; i < NFLOW; i++) {
@@ -269,7 +451,7 @@ static void ep_update(uint32_t now)
 {
     int i;
     g_protocol_ms = now;
-    if (is_anl()) { anl_update(g_anl, now); return; }
+    if (is_anl()) { anl_update(g_anl, now); TX_OBSERVE(g_anl); return; }
     for (i = 1; i < NFLOW; i++) if (g_kcp[i]) ikcp_update(g_kcp[i], now);
 }
 
@@ -288,7 +470,7 @@ static void ep_input(const char *d, int len)
         if (lag > 0 && (uint32_t)lag > g_clk_max_lag) g_clk_max_lag = (uint32_t)lag;
     }
 #endif
-    if (is_anl()) { if (anl_input(g_anl, d, len) < 0) g_input_errors++; return; }
+    if (is_anl()) { if (anl_input(g_anl, d, len) < 0) g_input_errors++; TX_OBSERVE(g_anl); return; }
     if (len >= 24) {
         IUINT32 conv = ikcp_getconv(d);
         uint32_t id = conv - KCP_CONV0;
@@ -301,8 +483,15 @@ static int ep_send(flow *f, const char *buf, int len, int key)
 {
     int r;
     if (is_anl()) {
-        if (!f->semi) return anl_stream_send(g_h[f->id], buf, len) < 0;
-        r = anl_stream_send_frame(g_h[f->id], key ? ANL_FRAME_KEY : 0, buf, len, NULL);
+        if (!f->semi) {
+            r = anl_stream_send(g_h[f->id], buf, len);
+            TX_OBSERVE(g_anl);
+            return r < 0;
+        }
+        g_last_fno = 0;
+        r = anl_stream_send_frame(g_h[f->id], key ? ANL_FRAME_KEY : 0, buf, len, &g_last_fno);
+        g_last_rc = r;
+        TX_OBSERVE(g_anl);
         return r != 0;
     }
     if (g_proto == P_KCPDROP && f->semi) {
@@ -310,10 +499,12 @@ static int ep_send(flow *f, const char *buf, int len, int key)
         if (key) f->dropping = 0;
         if (!key && (f->dropping || w > f->kcp_thr)) {
             if (f->until_key) f->dropping = 1;
+            g_last_rc = 1; g_last_fno = f->seq;
             return 1;
         }
     }
     r = ikcp_send(g_kcp[f->id], buf, len);
+    g_last_rc = r; g_last_fno = f->seq;
     return r < 0;
 }
 
@@ -328,7 +519,11 @@ static int ep_recv(int id, char *buf, int cap)
     if (is_anl()) {
         anl_frame_info fi;
         if (g_h[id] == NULL) return -1;
-        if (g_fl[id].semi) return anl_stream_recv_frame(g_h[id], buf, cap, &fi);
+        if (g_fl[id].semi) {
+            int r = anl_stream_recv_frame(g_h[id], buf, cap, &fi);
+            if (r >= 0) g_last_fi = fi;  /* info is unwritten on EAGAIN / other errors */
+            return r;
+        }
         return anl_stream_recv(g_h[id], buf, cap);
     }
     return g_kcp[id] ? ikcp_recv(g_kcp[id], buf, cap) : -1;
@@ -353,10 +548,16 @@ static void gen_media(uint64_t t, uint64_t end_us)
         flow *f = &g_fl[i];
         while (t >= f->next_us && f->next_us < end_us) {
             int key = f->gop && (f->seq % (uint32_t)f->gop) == 0;
-            int len = key ? rnd_range(f->key_min, f->key_max) : rnd_range(f->size_min, f->size_max);
+            int len = media_frame_size(f, key);
             put_hdr(g_buf, f, key, f->seq, now_us());
             memset(g_buf + HDR, (int)(f->seq & 0xff), (size_t)(len - HDR));
             if (ep_send(f, g_buf, len, key) != 0) f->app_drop++;
+            if (g_mdiag) {
+                mdiag_s e;
+                e.t_ms = (uint32_t)((now_us() - f->start_us) / 1000u); e.seq = f->seq; e.frame_no = g_last_fno;
+                e.len = (uint32_t)len; e.id = (int8_t)i; e.key = (int8_t)key; e.rc = (int16_t)g_last_rc;
+                MDIAG_PUSH(g_mds, g_nmds, g_capmds, e);
+            }
             f->seq++;
             f->sent++;
             f->next_us = f->start_us + (uint64_t)f->seq * (uint64_t)f->period_ms * 1000u;
@@ -368,7 +569,7 @@ static void gen_media(uint64_t t, uint64_t end_us)
 static void gen_bulk(uint64_t t, uint64_t end_us)
 {
     flow *f = &g_fl[3];
-    uint64_t total = g_test == 2 ? (t < end_us ? ~0ull : g_bulk_sent) : (uint64_t)g_bulk_mb << 20;
+    uint64_t total = g_test >= 2 ? (t < end_us ? ~0ull : g_bulk_sent) : (uint64_t)g_bulk_mb << 20;
     while (g_bulk_sent < total && ep_waitsnd(3) < 2 * f->wnd) {
         int len = 1024;
         if (g_bulk_sent + (uint64_t)len > total) len = (int)(total - g_bulk_sent);
@@ -401,11 +602,17 @@ static void rx_frames(void)
                         if ((uint8_t)g_buf[j] != (uint8_t)((g_bulk_rcvd + (uint64_t)j) * 31u + 7u)) g_payload_errors++;
                     g_checked_bytes += (uint64_t)r;
                 }
-                if (g_bulk_first_us == 0) g_bulk_first_us = t;
+                if (g_bulk_first_us == 0) { g_bulk_first_us = t; report_timebase("rx_first", t); }
                 g_bulk_rcvd += (uint64_t)r;
                 sec = (t - g_bulk_first_us) / 1000000u;
                 if (sec < MAXSEC) g_sec_bytes[sec] += (uint64_t)r;
-                if (g_test == 2) continue;
+                if (g_bulk_last_us && sec < (uint64_t)g_dur) {
+                    uint64_t gap = t - g_bulk_last_us;
+                    if (gap > g_gap_max_us) { g_gap_max_us = gap; g_gap_max_at_us = g_bulk_last_us - g_bulk_first_us; }
+                    g_gap_n1 += gap >= 1000000u; g_gap_n2 += gap >= 2000000u; g_gap_n5 += gap >= 5000000u;
+                }
+                g_bulk_last_us = t;
+                if (g_test >= 2) continue;
                 if (g_bulk_rcvd >= ((uint64_t)g_bulk_mb << 20) && g_bulk_done_us == 0) g_bulk_done_us = t;
                 continue;
             }
@@ -424,6 +631,15 @@ static void rx_frames(void)
                         f->owdk = (int64_t *)realloc(f->owdk, f->capowdk * sizeof(int64_t));
                     }
                     f->owdk[f->nowdk++] = (int64_t)(t - st);
+                }
+                if (g_mdiag) {
+                    mdiag_r e;
+                    /* Downlink frames can precede the client's traffic_start.
+                       Convert to a signed offset only after that anchor exists. */
+                    e.mono_us = t; e.seq = seq; e.len = (uint32_t)r; e.owd_us = (int64_t)(t - st);
+                    e.frame_no = is_anl() ? g_last_fi.frame_no : seq; e.lost_before = is_anl() ? g_last_fi.lost_before : 0;
+                    e.id = (int8_t)i; e.key = g_buf[1];
+                    MDIAG_PUSH(g_mdr, g_nmdr, g_capmdr, e);
                 }
                 f->dlv++;
                 if (!f->have || seq > f->max_seq) f->max_seq = seq;
@@ -471,11 +687,14 @@ static void report_receiver(void)
                proto_name[g_proto], f->name, f->dlv, f->max_seq + 1, ontime, p50, p95, p99, pmax,
                f->bytes * 8.0 / 1000.0 / g_dur);
     }
-    if (g_test == 2) {
+    if (g_test >= 2) {
         int n = g_dur < MAXSEC ? g_dur : MAXSEC, k;
         static double v[MAXSEC];
         double sum = 0;
-        for (k = 0; k < n; k++) { v[k] = g_sec_bytes[k] * 8.0 / 1e6; sum += v[k]; }
+        uint64_t window_bytes = 0;
+        for (k = 0; k < n; k++) {
+            v[k] = g_sec_bytes[k] * 8.0 / 1e6; sum += v[k]; window_bytes += g_sec_bytes[k];
+        }
         for (k = 1; k < n; k++) {                       /* insertion sort, n <= 3600 */
             double x = v[k]; int j = k - 1;
             while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
@@ -485,14 +704,70 @@ static void report_receiver(void)
             printf("SECS");
             for (k = 0; k < n; k++) printf(" %.0f", g_sec_bytes[k] * 8.0 / 1e6);
             printf("\n");
+            printf("SECS_BYTES base_mono_us=%llu step_us=1000000 n=%d window_bytes=%llu outside_bytes=%llu values=",
+                   (unsigned long long)g_bulk_first_us, n, (unsigned long long)window_bytes,
+                   (unsigned long long)(g_bulk_rcvd - window_bytes));
+            for (k = 0; k < n; k++) printf("%s%llu", k ? " " : "", (unsigned long long)g_sec_bytes[k]);
+            printf("\n");
         }
         printf("RESULT %s stream secs=%d bytes=%llu avg_Mbps=%.2f min_Mbps=%.2f p10_Mbps=%.2f p50_Mbps=%.2f max_Mbps=%.2f\n",
                proto_name[g_proto], n, (unsigned long long)g_bulk_rcvd, sum / n, v[0], v[n / 10], v[n / 2], v[n - 1]);
+        if (g_proto != P_TCP)
+            printf("BULKGAP max_ms=%.1f at_s=%.1f n_1s=%u n_2s=%u n_5s=%u (receive gaps within --dur after the first byte)\n",
+                   g_gap_max_us / 1000.0, g_gap_max_at_us / 1e6, g_gap_n1, g_gap_n2, g_gap_n5);
     }
     if (g_test == 1) {
         double s = g_bulk_done_us ? (g_bulk_done_us - g_bulk_first_us) / 1e6 : -1;
         printf("RESULT %s bulk bytes=%llu done_s=%.2f goodput_KBps=%.0f\n", proto_name[g_proto],
                (unsigned long long)g_bulk_rcvd, s, s > 0 ? g_bulk_rcvd / 1024.0 / s : 0);
+    }
+}
+
+static void report_mdiag(void)
+{
+    size_t k;
+    if (!g_mdiag) return;
+    printf("MDIAG proto=%s frames_sent=%zu frames_rcvd=%zu samples=%zu init_cwnd=%d rx_time=signed_start_ms\n", proto_name[g_proto], g_nmds, g_nmdr, g_nmdt, g_init_cwnd);
+    /* sender: flow seq key len t_ms rc frame_no */
+    for (k = 0; k < g_nmds; k++)
+        printf("MDIAG_S %d %u %d %u %u %d %u\n", g_mds[k].id, g_mds[k].seq, g_mds[k].key, g_mds[k].len, g_mds[k].t_ms, g_mds[k].rc, g_mds[k].frame_no);
+    /* receiver: flow seq key len t_ms owd_us frame_no lost_before;
+       t_ms may be negative for data received before this host's traffic_start. */
+    for (k = 0; k < g_nmdr; k++)
+        printf("MDIAG_R %d %u %d %u %lld %lld %u %u\n", g_mdr[k].id, g_mdr[k].seq, g_mdr[k].key, g_mdr[k].len,
+               g_t0_us ? ((long long)g_mdr[k].mono_us - (long long)g_t0_us) / 1000 : -1,
+               (long long)g_mdr[k].owd_us, g_mdr[k].frame_no, g_mdr[k].lost_before);
+    /* sampler: t_ms flow wait_snd backlog retrans dropped skipped fec_rec fec_ratio discarded
+       rx_frame_delay_max peer_frame_delay_max | conn retrans srtt rto cwnd inflight pace batch_max_ms */
+    for (k = 0; k < g_nmdt; k++) {
+        const mdiag_t *e = &g_mdt[k];
+        printf("MDIAG_T %u %d %u %u %u %u %u %u %u %u %u %u | %u %u %u %u %u %u %.1f\n", e->t_ms, e->id,
+               e->ss.wait_snd, e->ss.backlog_bytes, e->ss.retrans, e->ss.frames_dropped, e->ss.frames_skipped,
+               e->ss.fec_recovered, e->ss.fec_ratio, e->ss.frames_discarded,
+               e->ss.rx.valid ? e->ss.rx.frame_delay_max_ms : 0, e->ss.peer.valid ? e->ss.peer.frame_delay_max_ms : 0,
+               e->cs.retrans, e->cs.srtt, e->cs.rto, e->cs.cwnd, e->cs.inflight, e->cs.pace_rate, e->batch_us / 1000.0);
+    }
+}
+
+static void report_rate(void)
+{
+    size_t i;
+    if (!g_rate_diag || !is_anl()) return;
+    printf("RATE proto=%s side=%s metric=target_payload_Bps callbacks=%llu recorded=%zu dropped=%llu start_mono_us=%llu\n",
+           proto_name[g_proto], is_sender() ? "sender" : "receiver",
+           (unsigned long long)g_rate_calls, g_nrate, (unsigned long long)g_rate_dropped,
+           (unsigned long long)g_t0_us);
+    for (i = 0; i < g_nrate; i++) {
+        const rate_event *e = &g_rate_events[i];
+        const anl_stats *s = &e->stats;
+        long long elapsed = g_t0_us ? ((long long)e->mono_us - (long long)g_t0_us) / 1000 : -1;
+        printf("RATE_CHANGE mono_us=%llu t_ms=%lld protocol_ms=%u previous_Bps=%u target_Bps=%u"
+               " bw_Bps=%u pace_Bps=%u srtt_ms=%u min_rtt_ms=%u cwnd=%u inflight=%u"
+               " app_limited=%d bw_age_ms=%u retrans=%u wire_bytes=%llu\n",
+               (unsigned long long)e->mono_us, elapsed, e->protocol_ms, e->previous, s->target_rate,
+               s->bw_estimate, s->pace_rate, s->srtt, s->min_rtt, s->cwnd, s->inflight,
+               s->bw_app_limited, s->bw_estimate_age_ms, s->retrans,
+               (unsigned long long)e->wire_bytes);
     }
 }
 
@@ -601,7 +876,7 @@ static int tcp_run(void)
             if (n <= 0) break;
             {
                 uint64_t t = now_us(), sec;
-                if (g_bulk_first_us == 0) g_bulk_first_us = t;
+                if (g_bulk_first_us == 0) { g_bulk_first_us = t; report_timebase("rx_first", t); }
                 g_bulk_rcvd += (uint64_t)n;
                 sec = (t - g_bulk_first_us) / 1000000u;
                 if (sec < MAXSEC) g_sec_bytes[sec] += (uint64_t)n;
@@ -616,14 +891,17 @@ static int tcp_run(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop|tcp]\n"
-                    "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N]\n");
+                    "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N] [--init-cwnd N]\n"
+                    "       [--pace-rate BYTES_PER_S] [--pace-burst BYTES]\n"
+                    "       [--rcv-deadline MS (-1 lifetime, 0 off)] [--fec-rtt-auto 0|1] [--fec-ratio 0..100 (0 adaptive)]\n"
+                    "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n");
     exit(2);
 }
 
 int main(int argc, char **argv)
 {
     int i;
-    uint64_t t0, start_us = 0, end_us = 0, last_rx_us = 0, last_hello_us = 0, stop_us, last_trace_us = 0;
+    uint64_t t0, start_us = 0, end_us = 0, last_rx_us = 0, last_hello_us = 0, stop_us, last_trace_us = 0, last_mdiag_us = 0;
     int started = 0, got_any = 0, pinged = 0, failed = 0;
     uint64_t ping_sent_us[20] = { 0 };
     double rtt_min = 1e9, rtt_sum = 0; int rtt_n = 0;
@@ -638,25 +916,69 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--proto")) {
             int p;
             for (p = 0; p < 6; p++) if (!strcmp(nx, proto_name[p])) g_proto = p;
-        } else if (!strcmp(a, "--test")) g_test = !strcmp(nx, "bulk") ? 1 : !strcmp(nx, "stream") ? 2 : 0;
+        } else if (!strcmp(a, "--test")) g_test = !strcmp(nx, "bulk") ? 1 : !strcmp(nx, "stream") ? 2 : !strcmp(nx, "mixed") ? 3 : 0;
         else if (!strcmp(a, "--dir")) g_up = strcmp(nx, "down") != 0;
         else if (!strcmp(a, "--dur")) g_dur = atoi(nx);
         else if (!strcmp(a, "--bulk")) g_bulk_mb = atoi(nx);
         else if (!strcmp(a, "--wnd")) g_wnd = atoi(nx);
         else if (!strcmp(a, "--interval")) g_interval = atoi(nx);
+        else if (!strcmp(a, "--init-cwnd")) {
+            g_init_cwnd = atoi(nx);
+            if (g_init_cwnd < 1 || g_init_cwnd > ANL_MAX_WND) usage();
+        }
+        else if (!strcmp(a, "--pace-rate")) {
+            g_pace_rate = atoi(nx);
+            if (g_pace_rate < 0) usage();
+        }
+        else if (!strcmp(a, "--pace-burst")) {
+            g_pace_burst = atoi(nx);
+            if (g_pace_burst < 0) usage();
+        }
         else if (!strcmp(a, "--loss")) g_loss = atof(nx);
+        else if (!strcmp(a, "--rcv-deadline")) {
+            g_rcv_deadline = atoi(nx);
+            if (g_rcv_deadline < -1) usage();
+        }
+        else if (!strcmp(a, "--fec-ratio-audio") || !strcmp(a, "--fec-ratio-video")) {
+            int v = atoi(nx);
+            if (v < 0 || v > 100) usage();
+            g_fec_ratio_flow[a[12] == 'a' ? 1 : 2] = v;
+        }
+        else if (!strcmp(a, "--fec-ratio")) {
+            g_fec_ratio = atoi(nx);
+            if (g_fec_ratio < 0 || g_fec_ratio > 100) usage();
+        }
+        else if (!strcmp(a, "--fec-rtt-auto")) {
+            g_fec_rtt_auto = atoi(nx);
+            if (g_fec_rtt_auto < 0 || g_fec_rtt_auto > 1) usage();
+#ifndef ANL_FEC_RTT_AUTO
+            if (g_fec_rtt_auto) { fprintf(stderr, "this protocol build has no RTT-conditional FEC\n"); return 2; }
+#endif
+        }
         else if (!strcmp(a, "--verify")) g_verify = atoi(nx) != 0;
-        else if (!strcmp(a, "--seed")) g_rng ^= (uint64_t)atoll(nx) * 0x9E3779B97F4A7C15ull + (g_server ? 7 : 3);
+        else if (!strcmp(a, "--seed")) {
+            g_media_seed = (uint64_t)atoll(nx);
+            g_rng ^= g_media_seed * 0x9E3779B97F4A7C15ull + (g_server ? 7 : 3);
+        }
         else usage();
         i++;
     }
     if (!g_server && !g_host) usage();
     if (g_port == 0) g_port = is_anl() ? 9836 : 9837;
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if ((g_fec_ratio >= 0 || g_fec_ratio_flow[1] >= 0 || g_fec_ratio_flow[2] >= 0) && g_fec_rtt_auto) usage();   /* one FEC policy at a time */
+    if (is_anl() && (g_test == 0 || g_test == 3))
+        printf("POLICY proto=%s rcv_deadline=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d (-2=library_default, -1=proto default)\n",
+               proto_name[g_proto], g_rcv_deadline, g_fec_rtt_auto, g_fec_ratio, g_fec_ratio_flow[1], g_fec_ratio_flow[2]);
+    g_timebase = getenv("REALNET_TIMEBASE") && atoi(getenv("REALNET_TIMEBASE")) != 0;
     if (g_proto == P_TCP) return tcp_run();
+    if (g_test == 0 || g_test == 3)
+        printf("WORKLOAD media=frame_v1 seed=%llu\n", (unsigned long long)g_media_seed);
     {
         const char *clock_mode = getenv("REALNET_CLOCK");
         g_clock_refresh = clock_mode && atoi(clock_mode) > 0;
+        g_mdiag = getenv("REALNET_MDIAG") && atoi(getenv("REALNET_MDIAG")) > 0;
+        g_rate_diag = getenv("REALNET_RATE") && atoi(getenv("REALNET_RATE")) > 0;
     }
     flows_init();
 
@@ -686,6 +1008,10 @@ int main(int argc, char **argv)
         g_peerlen = res->ai_addrlen;
         freeaddrinfo(res);
     }
+#ifdef REALNET_INTERNAL
+    g_tx_diag.enabled = getenv("REALNET_TXDIAG") && atoi(getenv("REALNET_TXDIAG")) != 0;
+    g_fec_diag.enabled = getenv("REALNET_FECCOST") && atoi(getenv("REALNET_FECCOST")) != 0;
+#endif
     ep_create();
     t0 = now_us();
     /* the client pings first (20 x 50 ms) to learn the path, then the test runs;
@@ -737,6 +1063,7 @@ int main(int argc, char **argv)
             g_clk_batches++;
             if (bn > g_clk_max_pkts) g_clk_max_pkts = bn;
             if (now_us() - b0 > g_clk_max_us) g_clk_max_us = (uint32_t)(now_us() - b0);
+            if (now_us() - b0 > g_clk_int_max_us) g_clk_int_max_us = (uint32_t)(now_us() - b0);
         }
         t = now_us();
         /* client: ping, then hello until the test starts, keep the NAT open */
@@ -752,6 +1079,8 @@ int main(int argc, char **argv)
         if (!started && ((!g_server && t >= t0 + 1200000u) || (g_server && g_peerlen > 0))) {
             started = 1;
             start_us = t;
+            report_timebase("traffic_start", t);
+            g_t0_us = t;
             end_us = start_us + (uint64_t)g_dur * 1000000u;
             if (is_sender()) {
                 ep_open_streams();
@@ -760,11 +1089,28 @@ int main(int argc, char **argv)
             if (!g_server) printf("PATH ping rtt_min=%.1f rtt_avg=%.1f replies=%d/20\n", rtt_min, rtt_n ? rtt_sum / rtt_n : 0, rtt_n);
         }
         if (started && is_sender()) {
-            if (g_test == 0) gen_media(t, end_us);
-            else gen_bulk(t, end_us);
+            if (g_test == 0 || g_test == 3) gen_media(t, end_us);
+            if (g_test != 0) gen_bulk(t, end_us);
         }
         ep_update(now_ms());
         rx_frames();
+#ifdef REALNET_INTERNAL
+        if (started && is_sender() && is_anl() && g_test >= 2) zwnd_sample(t, start_us);
+#endif
+        if (g_mdiag && started && (g_test == 0 || g_test == 3) && is_anl() && t - last_mdiag_us >= 100000u) {
+            int j;
+            last_mdiag_us = t;
+            for (j = 1; j <= 2; j++) {
+                mdiag_t e;
+                if (g_h[j] == NULL) continue;
+                memset(&e, 0, sizeof(e));
+                e.t_ms = (uint32_t)((t - start_us) / 1000u); e.id = j; e.batch_us = g_clk_int_max_us;
+                anl_stream_get_stats(g_h[j], &e.ss);
+                anl_get_stats(g_anl, &e.cs);
+                MDIAG_PUSH(g_mdt, g_nmdt, g_capmdt, e);
+            }
+            g_clk_int_max_us = 0;
+        }
         if (started && is_sender() && is_anl() && getenv("REALNET_TRACE") && t - last_trace_us >= (uint64_t)atoi(getenv("REALNET_TRACE")) * 1000u) {
             anl_stats st;
             last_trace_us = t;
@@ -801,11 +1147,14 @@ int main(int argc, char **argv)
             }
         }
 #endif
-        /* end: the sender after the traffic plus 3 s of drain (bulk: once
-           delivered and drained); the receiver 5 s after the last datagram */
+        /* End: media gets 3 s to drain; reliable bulk / stream wait for their
+           send queues to empty, bounded by stop_us. Keep the normal receive
+           loop while draining; the final linger only answers late ACKs.
+           The receiver stops 5 s after the last datagram. */
         if (started && is_sender()) {
             int done = g_test == 0 ? t >= end_us + 3000000u
-                     : g_test == 2 ? t >= end_us + 1000000u
+                     : g_test == 2 ? (t >= end_us && ep_waitsnd(3) == 0)
+                     : g_test == 3 ? (t >= end_us + 3000000u && ep_waitsnd(3) == 0)
                                    : (g_bulk_sent >= ((uint64_t)g_bulk_mb << 20) && ep_waitsnd(3) == 0 && t >= start_us + 1000000u);
             if (done || t >= stop_us) {
                 if (!done) failed = 1;
@@ -818,6 +1167,17 @@ int main(int argc, char **argv)
                     usleep(1000);
                 }
                 report_sender(g_test == 1 ? secs : g_dur);
+#ifdef REALNET_INTERNAL
+                if (is_anl() && g_test >= 2) {
+                    if (g_zw_start_us) {            /* a span still open at the end is closed here */
+                        uint64_t d = t - g_zw_start_us;
+                        g_zw_total_us += d; g_zw_n1 += d >= 1000000u;
+                        if (d > g_zw_max_us) { g_zw_max_us = d; g_zw_max_at_us = g_zw_start_us - start_us; }
+                    }
+                    printf("ZWND spans=%u spans_1s=%u total_ms=%.1f max_ms=%.1f max_at_s=%.1f (bulk new data queued, peer window 0)\n",
+                           g_zw_n, g_zw_n1, g_zw_total_us / 1000.0, g_zw_max_us / 1000.0, g_zw_max_at_us / 1e6);
+                }
+#endif
                 break;
             }
         }
@@ -834,6 +1194,8 @@ int main(int argc, char **argv)
             break;
         }
     }
+    report_mdiag();
+    report_rate();
     if (is_anl()) {
         int state = anl_state(g_anl), queued = ep_waitsnd(3);
         printf("HEALTH state=%d input_errors=%llu output_errors=%llu payload_errors=%llu checked_bytes=%llu queued=%d sent_bytes=%llu received_bytes=%llu\n",
@@ -842,9 +1204,16 @@ int main(int argc, char **argv)
                (unsigned long long)g_bulk_sent, (unsigned long long)g_bulk_rcvd);
         if (state || g_input_errors || g_output_errors || g_payload_errors) failed = 1;
         if (is_sender() && g_test && queued) failed = 1;
+#ifdef REALNET_INTERNAL
+        tx_diag_print(g_anl, "final");
+        fec_diag_print(g_anl);
+        if (g_fec_diag.enabled && g_fec_diag.accounting_errors) failed = 1;
+#endif
         anl_release(g_anl);
     } else for (i = 1; i < NFLOW; i++) if (g_kcp[i]) ikcp_release(g_kcp[i]);
     for (i = 1; i < NFLOW; i++) { free(g_fl[i].owd); free(g_fl[i].owdk); }
+    free(g_mds); free(g_mdr); free(g_mdt);
+    free(g_rate_events);
     close(g_fd);
     return failed;
 }

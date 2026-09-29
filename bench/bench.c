@@ -311,6 +311,7 @@ static void dir_free(dir *d)
  * endpoint abstraction
  *-------------------------------------------------------------------*/
 static int g_fast = 1;
+static int g_init_cwnd;         /* --init-cwnd; 0 keeps the library default */
 
 static int anl_out(const char *buf, int len, anl_t *w, void *user)
 {
@@ -355,6 +356,7 @@ static void ep_create(sim *s, int side, int proto)
         cfg.rng = ep_rng;
         e->prng = g_seed * 0x2545F4914F6CDD1DULL + (uint64_t)side * 0x9E3779B97F4A7C15ULL + 1;
         if (g_fast) cfg.interval = 10;
+        if (g_init_cwnd) cfg.init_cwnd = g_init_cwnd;
         e->anl = anl_create(0x5a5a0001, &cfg, e);
         anl_setoutput(e->anl, anl_out);
         anl_set_accept(e->anl, anl_accept_flow);
@@ -365,6 +367,7 @@ static void ep_create(sim *s, int side, int proto)
 static int g_abr = 0;              /* bwstep without the bulk flow: 1 = --abr (video follows
                                       stats.target_rate), 2 = --nobulk (fixed video bitrate) */
 static int g_fec_ratio = -1;       /* --fec-ratio: FEC redundancy in %, 0 = adaptive (-1 = library default) */
+static int g_rcv_deadline = -2;    /* -2 = library default, -1 = inherit lifetime, 0 = off */
 
 static void flow_opt(const flow *f, anl_stream_opt *o)
 {
@@ -377,6 +380,7 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
         o->fec = f->fec;
         if (g_fec_ratio >= 0) o->fec_ratio = g_fec_ratio;
         o->max_age_ms = f->max_age;
+        if (g_rcv_deadline >= -1) o->rcv_deadline_ms = g_rcv_deadline;
         o->drop_until_key = f->until_key;
     }
 }
@@ -1427,7 +1431,9 @@ static void usage(void)
            "  --dur S         s2..s5 duration (default 60)\n"
            "  --bulk MB       s1 size (default 4)\n"
            "  --wnd N         s1 bulk snd/rcv window in segments (default 128)\n"
+           "  --init-cwnd N   AnLiu initial congestion window (default from library)\n"
            "  --fec-ratio N   FEC flows: redundancy in %%, 1..100, 0 = adaptive (default 25)\n"
+           "  --rcv-deadline MS  semi gap wait: -1 = local lifetime, 0 = off (default from library)\n"
            "  bwstep          bottleneck steps 8/2/5/1/8 Mbps: bandwidth estimate, utilisation, latency\n"
            "  --step S        bwstep: seconds per step (default 10); --step-loss P: loss %%\n"
            "  --qdelay MS     bottleneck buffer in ms of queueing (default 100; small = policer-like)\n"
@@ -1475,7 +1481,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--dur")) { g_dur = atoi(nx); i++; }
         else if (!strcmp(a, "--bulk")) { g_bulk_mb = atoi(nx); i++; }
         else if (!strcmp(a, "--wnd")) { g_bulk_wnd = atoi(nx); i++; }
+        else if (!strcmp(a, "--init-cwnd")) {
+            g_init_cwnd = atoi(nx); i++;
+            if (g_init_cwnd < 1 || g_init_cwnd > ANL_MAX_WND) { usage(); return 2; }
+        }
         else if (!strcmp(a, "--fec-ratio")) { g_fec_ratio = atoi(nx); i++; }
+        else if (!strcmp(a, "--rcv-deadline")) {
+            g_rcv_deadline = atoi(nx); i++;
+            if (g_rcv_deadline < -1) { usage(); return 2; }
+        }
         else if (!strcmp(a, "--soak")) { g_soak = atoi(nx); i++; }
         else if (!strcmp(a, "--phase")) { g_phase = atoi(nx); i++; }
         else if (!strcmp(a, "--sample")) { g_sample = atoi(nx); i++; }
@@ -1510,6 +1524,7 @@ int main(int argc, char **argv)
 
     printf("AnLiu vs ikcp  profile=%s  seed=%llu  bw=%d kbps (queue %d ms)  bandwidth includes %d B IP/UDP per packet\n",
            g_fast ? "fast (anl: interval=10; kcp: nodelay 1,10,2,1)" : "default", (unsigned long long)g_seed, g_bw, g_qdelay, IPUDP_HDR);
+    if (g_init_cwnd) printf("AnLiu init_cwnd=%d segments\n", g_init_cwnd);
     printf("columns: dlv%% delivered/sent  ontm%% delivered within budget  p50..max latency ms  up = A->B wire  "
            "dn = B->A wire  cost = wire bytes (both dirs) per delivered payload byte\n");
     printf("link: loss%%[b=burst]/rtt[j=jitter]\n");

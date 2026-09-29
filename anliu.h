@@ -72,6 +72,8 @@ extern "C" {
 #define ANL_RELIABLE        0       /* ikcp-like reliable stream */
 #define ANL_SEMI            1       /* semi-reliable frame stream */
 
+#define ANL_FEC_RTT_AUTO   -1       /* adaptive FEC when semi max_age_ms < measured RTT */
+
 #define ANL_FRAME_KEY       1       /* key frame */
 
 /* stream states as reported by anl_stream_get_stats */
@@ -92,7 +94,8 @@ typedef struct anl_config {
     int pad_max;                /* 32; 0 = no padding; <= ANL_MAX_PAD */
     anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG */
     int interval;               /* 20 ms (ikcp default is 100) */
-    int init_cwnd;              /* 16 segments: cwnd until the first bandwidth sample */
+    int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
+                                  also seeds pacing before the first bandwidth sample */
     int dead_link;              /* 20 retransmissions (data / FWD / CLOSE, not OPEN) */
     int ts_window_ms;           /* 1000, fixed; not tied to RTO */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
@@ -116,16 +119,25 @@ typedef struct anl_stream_opt {
     int rcv_wnd;                /* reliable 128, semi 512, max ANL_MAX_WND; same on both ends */
     int stream;                 /* reliable only: byte-stream mode */
     int flush_on_send;          /* semi default 1, reliable default 0 */
-    int fec;                    /* 0 = off */
+    int fec;                    /* 0 = off; >0 = on; ANL_FEC_RTT_AUTO = semi default:
+                                   adaptive parity only while 0 < max_age_ms < measured srtt.
+                                   Unknown RTT: no automatic parity yet; >0 protects startup.
+                                   Auto reserves FEC buffers/MSS from open, so it can switch
+                                   without resegmenting queued data. Enable at both ends. */
     int fec_ratio;              /* FEC redundancy, parities per 100 data packets 1..100, default 25:
                                    Reed-Solomon over blocks of up to 100 ms (DESIGN 8);
-                                   0 = adaptive 10..100, from the losses FEC did not repair (8.5) */
+                                   0 = adaptive 10..100, from the losses FEC did not repair (8.5).
+                                   ANL_FEC_RTT_AUTO always uses adaptive redundancy. */
     int fec_deadline_ms;        /* adaptive FEC: a loss whose retransmission arrives within this
                                    (from enqueue) needs no FEC; 0 = semi max_age_ms / 2, reliable none */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
     int drop_until_key;         /* semi only: 0 */
-    int rcv_deadline_ms;        /* semi only: 0 = off */
+    int rcv_deadline_ms;        /* semi only: -1 (default) = local max_age_ms, 0 = off,
+                                   >0 = max gap wait after later data reveals a missing segment.
+                                   Skips to a later frame without waiting for sender FWD;
+                                   checked on update/flush, not absolute sender frame age.
+                                   Set the receiver's local options in the accept callback. */
     int rcv_drop_until_key;     /* semi only: after a lost frame discard non-key frames until the
                                    next key frame (they cannot be decoded); 0 = off */
     int report;                 /* receiver: send delay reports to the peer (DESIGN 6.9);
@@ -174,7 +186,8 @@ typedef struct anl_delay_report {
     uint32_t frame_delay_avg_ms, frame_delay_max_ms;/* from the earliest fragment's send time to
                                                        the frame being complete */
     uint32_t frames;            /* frames (messages) completed in the last interval */
-    uint32_t frames_skipped;    /* receiver's total (mod 65536 in reports) */
+    uint32_t frames_skipped;    /* receiver skip operations, possibly spanning several frames;
+                                   cumulative, mod 65536 in reports; not an exact lost-frame count */
     uint32_t fec_recovered;     /* receiver's total (mod 65536 in reports) */
 } anl_delay_report;
 
@@ -185,9 +198,12 @@ typedef struct anl_stream_stats {
     uint32_t rmt_wnd;
     uint32_t retrans;
     uint32_t frames_dropped;    /* dropped by sender (age / bytes) */
-    uint32_t frames_skipped;    /* skipped by receiver (FWD / deadline) */
+    uint32_t frames_skipped;    /* receiver skip operations (FWD / deadline / broken frame);
+                                   one operation can skip several frames; see fi.lost_before */
     uint32_t fec_recovered;
-    uint32_t fec_ratio;         /* sender: current FEC redundancy (follows the loss with fec_ratio 0) */
+    uint32_t fec_ratio;         /* sender: nominal parity/data packet ratio; the adaptive loss
+                                   floor may raise actual parity; not a wire-byte ratio/cap.
+                                   0 while RTT auto is inactive */
     uint32_t frames_discarded;  /* receiver: undecodable frames discarded (rcv_drop_until_key) */
     anl_delay_report rx;        /* receiver: measured here, on what the peer sends */
     anl_delay_report peer;      /* sender: the peer's latest report on what we send */
