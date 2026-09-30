@@ -112,6 +112,8 @@ typedef struct linkcfg {
     int bw_kbps;        /* bottleneck, 0 = unlimited */
     int qdelay;         /* bottleneck buffer depth in ms of queueing */
     double dup;         /* duplicate probability */
+    int shift;          /* --rttshift: extra one-way delay the path switches on and off (route changes) */
+    int shift_ms;       /* ... mean stay in each state, ms */
 } linkcfg;
 
 typedef struct pkt {
@@ -131,6 +133,9 @@ typedef struct dir {
     uint64_t rng;
     uint64_t pkts, bytes, lost_rand, lost_queue, delivered;
     double tokens, tok_t;   /* --policer: token bucket (bytes), time of the last refill */
+    double tbf_tokens, tbf_t;   /* --tbf: the bottleneck as a token bucket shaper: bytes, last refill (ms) */
+    int shifted;            /* --rttshift: the extra delay is on */
+    uint64_t shift_until;   /* ... until */
 } dir;
 
 enum { P_ANL, P_KCP };
@@ -249,6 +254,10 @@ static int link_lost(dir *d, uint64_t now)
 }
 
 static int g_pol_kbps, g_pol_kb = 64;     /* --policer: token bucket rate, depth (0 = off) */
+static int g_step_rtt = 50;                /* --step-rtt: bwstep path RTT, ms */
+static int g_tbf_kb;                       /* --tbf: the bottleneck is a token bucket shaper (tc tbf) with this
+                                              burst in KB: a burst of that size passes at once after an idle
+                                              period, the rest waits for tokens (up to qdelay), 0 = plain FIFO */
 
 static void sim_send(sim *s, int from, const char *buf, int len)
 {
@@ -274,7 +283,25 @@ static void sim_send(sim *s, int from, const char *buf, int len)
         if (d->tokens < len + IPUDP_HDR) { d->lost_queue++; return; }
         d->tokens -= len + IPUDP_HDR;
     }
-    if (d->c.bw_kbps > 0) {
+    if (d->c.bw_kbps > 0 && g_tbf_kb > 0) {
+        /* tc tbf: tokens fill at the rate up to the burst; a packet leaves
+           when it has its tokens - a full bucket lets a burst out at line
+           rate, a delivery-rate sample over it reads far above the rate */
+        double cap = g_tbf_kb * 1024.0, size = len + IPUDP_HDR, rate = d->c.bw_kbps / 8.0;  /* bytes per ms */
+        double avail;
+        if (d->tbf_t == 0 && d->tbf_tokens == 0) { d->tbf_tokens = cap; d->tbf_t = t; }
+        /* tbf_t may lie ahead of t: the last packet took the tokens up to then */
+        avail = d->tbf_tokens + (t - d->tbf_t) * rate;
+        if (avail > cap) avail = cap;
+        if (avail >= size) { d->tbf_tokens = avail - size; d->tbf_t = t; extra = 0; }
+        else {
+            double wait = (size - avail) / rate;
+            if (wait > d->c.qdelay) { d->lost_queue++; return; }
+            d->tbf_tokens = 0;
+            d->tbf_t = t + wait;                /* tokens accumulate again after this departure */
+            extra = wait;
+        }
+    } else if (d->c.bw_kbps > 0) {
         double ser = (len + IPUDP_HDR) * 8.0 / d->c.bw_kbps;     /* ms */
         double start = d->free_at > t ? d->free_at : t;
         if (start - t > d->c.qdelay) { d->lost_queue++; return; }
@@ -283,6 +310,16 @@ static void sim_send(sim *s, int from, const char *buf, int len)
     }
     if (link_lost(d, s->t)) { d->lost_rand++; return; }
     delay = d->c.delay + extra;
+    /* the path's own RTT moves between two values for a second or so at a
+       time (a cross-border path over changing routes): every sample of a
+       round sits above min_rtt without any queue */
+    if (d->c.shift > 0 && d->c.shift_ms > 0) {
+        if (s->t >= d->shift_until) {
+            d->shifted = !d->shifted;
+            d->shift_until = s->t + (uint64_t)rnd_range(&d->rng, d->c.shift_ms / 2, d->c.shift_ms * 3 / 2);
+        }
+        if (d->shifted) delay += d->c.shift;
+    }
     if (d->c.jitter > 0) delay += rnd_range(&d->rng, -d->c.jitter, d->c.jitter);
     if (delay < 0) delay = 0;
     at = s->t + (uint64_t)ceil(delay);
@@ -368,6 +405,7 @@ static int g_abr = 0;              /* bwstep without the bulk flow: 1 = --abr (v
                                       stats.target_rate), 2 = --nobulk (fixed video bitrate) */
 static int g_fec_ratio = -1;       /* --fec-ratio: FEC redundancy in %, 0 = adaptive (-1 = library default) */
 static int g_rcv_deadline = -2;    /* -2 = library default, -1 = inherit lifetime, 0 = off */
+static int g_fec_auto = 0;         /* --fec-auto: the FEC variants use ANL_FEC_RTT_AUTO (the semi default) */
 
 static void flow_opt(const flow *f, anl_stream_opt *o)
 {
@@ -379,6 +417,9 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
     if (f->semi) {
         o->fec = f->fec;
         if (g_fec_ratio >= 0) o->fec_ratio = g_fec_ratio;
+#ifdef ANL_FEC_RTT_AUTO
+        if (g_fec_auto && f->fec) o->fec = ANL_FEC_RTT_AUTO;
+#endif
         o->max_age_ms = f->max_age;
         if (g_rcv_deadline >= -1) o->rcv_deadline_ms = g_rcv_deadline;
         o->drop_until_key = f->until_key;
@@ -920,6 +961,8 @@ static void sim_finish(sim *s, rres *r, double gen_s)
 typedef struct point { double loss; int rtt; double burst; int jitter; int bw; } point;
 
 static int g_dur = 60, g_bw = 20000, g_bw5 = 5000, g_qdelay = 100;
+static int g_shift, g_shift_ms = 1500;  /* --rttshift MS [--rttshift-ms MS]: s1..s5 links */
+static int g_av;                        /* --av: s3 is audio (prio 0) + video (prio 1), no bulk */
 static int g_bulk_wnd = 128;       /* s1: snd/rcv window of the bulk flow (--wnd) */
 static int g_bulk_mb = 4, g_bulk_cap = 300;
 static uint64_t g_seed = 1;
@@ -938,6 +981,8 @@ static linkcfg point_link(const point *p)
     c.jitter = p->jitter;
     c.bw_kbps = p->bw;
     c.qdelay = g_qdelay;
+    c.shift = g_shift;
+    c.shift_ms = g_shift_ms;
     return c;
 }
 
@@ -946,7 +991,9 @@ static int build_flows(int sc, const variant *v, flow *fl)
     switch (sc) {
     case S1: flow_bulk(&fl[0], 0, (uint64_t)g_bulk_mb << 20, 0); fl[0].snd_wnd = fl[0].rcv_wnd = g_bulk_wnd; return 1;
     case S2: flow_inter(&fl[0], 0); return 1;
-    case S3: flow_video(&fl[0], 0, v); return 1;
+    case S3:
+        if (g_av) { flow_audio(&fl[0], 0, v); flow_video(&fl[1], 1, v); return 2; }
+        flow_video(&fl[0], 0, v); return 1;
     case S4: flow_audio(&fl[0], 0, v); return 1;
     case S5:
         flow_audio(&fl[0], 0, v);
@@ -963,10 +1010,10 @@ static void cc_trace(sim *s)
 {
                 anl_stats st;
                 anl_get_stats(s->e[0].anl, &st);
-                fprintf(stderr, "t=%5.1f st=%u cwnd=%u infl=%u bw=%u app=%u minrtt=%u srtt=%u pace=%u retx=%llu\n", s->t / 1000.0,
+                fprintf(stderr, "t=%5.1f st=%u cwnd=%u infl=%u bw=%u app=%u minrtt=%u srtt=%u pace=%u retx=%llu short=%d target=%u\n", s->t / 1000.0,
                         (unsigned)st.cc_state, (unsigned)st.cwnd, (unsigned)st.inflight, (unsigned)st.bw_estimate,
                         (unsigned)st.bw_app_limited, (unsigned)st.min_rtt, (unsigned)st.srtt, (unsigned)st.pace_rate,
-                        (unsigned long long)st.retrans);
+                        (unsigned long long)st.retrans, st.capacity_short, (unsigned)st.target_rate);
             }
 static void run_point(int sc, const variant *v, const point *p, rres *r)
 {
@@ -1101,7 +1148,9 @@ static void run_scenario(int sc, const point *pts, int npts)
     switch (sc) {
     case S1: printf("(reliable, %d MB, msg 8 KB, wnd %d)", g_bulk_mb, g_bulk_wnd); break;
     case S2: printf("(reliable, 200 B every 20 ms, %d s, on-time = owd+jitter+150 ms)", g_dur); break;
-    case S3: printf("(semi, 30 fps GOP 30, I 25-35 KB, P 2.5-3.5 KB, max_age 500, %d s, on-time = owd+jitter+300 ms)", g_dur); break;
+    case S3: printf("(%ssemi, 30 fps GOP 30, I 25-35 KB, P 2.5-3.5 KB, max_age 500, %d s, on-time = owd+jitter+300 ms%s)",
+                    g_av ? "audio prio0 + video prio1; video: " : "", g_dur,
+                    g_shift ? " ; rtt shift on" : ""); break;
     case S4: printf("(semi, 160 B every 20 ms, max_age 200, %d s, on-time = owd+jitter+150 ms)", g_dur); break;
     case S5: printf("(audio prio0 + video prio1 + bulk prio3, %d kbps bottleneck, %d s)", g_bw5, g_dur); break;
     }
@@ -1148,13 +1197,13 @@ static int g_soak = 3600, g_phase = 60, g_sample = 60;
 typedef struct phase { const char *name; linkcfg c; int outage_ms; } phase;
 
 static const phase g_phases[] = {
-    { "good",    { 0.00, 0, 20,  0, 20000, 100, 0.00 }, 0 },
-    { "rand5",   { 0.05, 0, 50,  0, 20000, 100, 0.01 }, 0 },
-    { "burst5",  { 0.05, 4, 50,  0, 20000, 100, 0.00 }, 0 },
-    { "heavy20", { 0.20, 0, 100, 20, 20000, 100, 0.00 }, 0 },
-    { "bw2m",    { 0.005, 0, 30, 0, 2000,  200, 0.00 }, 0 },
-    { "outage",  { 0.00, 0, 30,  0, 20000, 100, 0.00 }, 5000 },
-    { "hirtt",   { 0.01, 0, 200, 40, 20000, 100, 0.00 }, 0 },
+    { "good",    { 0.00, 0, 20,  0, 20000, 100, 0.00 , 0, 0 }, 0 },
+    { "rand5",   { 0.05, 0, 50,  0, 20000, 100, 0.01 , 0, 0 }, 0 },
+    { "burst5",  { 0.05, 4, 50,  0, 20000, 100, 0.00 , 0, 0 }, 0 },
+    { "heavy20", { 0.20, 0, 100, 20, 20000, 100, 0.00 , 0, 0 }, 0 },
+    { "bw2m",    { 0.005, 0, 30, 0, 2000,  200, 0.00 , 0, 0 }, 0 },
+    { "outage",  { 0.00, 0, 30,  0, 20000, 100, 0.00 , 0, 0 }, 5000 },
+    { "hirtt",   { 0.01, 0, 200, 40, 20000, 100, 0.00 , 0, 0 }, 0 },
 };
 #define NPHASE ((int)(sizeof(g_phases) / sizeof(g_phases[0])))
 
@@ -1276,7 +1325,7 @@ static void bwstep_run(const variant *v)
     uint64_t snap_up = 0, snap_pkts = 0, next_est = 0;
     double est_sum = 0, util_sum = 0, ratio_sum = 0;
     int nratio = 0;
-    linkcfg lc = { g_step_loss, 0, 25, 0, g_steps_kbps[0], 100, 0.0 };
+    linkcfg lc = { g_step_loss, 0, g_step_rtt / 2, 0, g_steps_kbps[0], 100, 0.0, 0, 0 };
     rres r;
 
     snprintf(g_label, sizeof(g_label), "[bwstep %s]", v->name);
@@ -1290,7 +1339,8 @@ static void bwstep_run(const variant *v)
     sim_add_flows(&s, fl, nf);
     printf("\n==== bwstep%s %s: bottleneck %d", g_abr == 1 ? " (abr: video follows target_rate)" : g_abr ? " (no bulk)" : "", v->name, g_steps_kbps[0]);
     for (i = 1; i < NSTEP; i++) printf(" -> %d", g_steps_kbps[i]);
-    printf(" kbps, %d s each, rtt 50 ms, loss %.0f%%, queue 100 ms ====\n", g_step_s, g_step_loss * 100);
+    printf(" kbps, %d s each, rtt %d ms, loss %.0f%%, queue 100 ms%s ====\n", g_step_s, g_step_rtt, g_step_loss * 100,
+           g_tbf_kb ? " (tbf)" : "");
     printf("%-6s | %8s %8s %6s | %6s | %-15s | %-15s | %9s\n", "kbps", "est kbps", "est/bw", "util", "srtt",
            "audio dlv/p95", "video ontm/p95", g_abr ? "video kbps" : "bulk KB/s");
 
@@ -1426,6 +1476,9 @@ static void usage(void)
            "  --rtt R,..      rtt ms (default 20,100,300)\n"
            "  --burst N       extra rows: 5%% loss with mean burst N (default 4, 0 = off)\n"
            "  --jitter PCT    extra rows: 1%% loss, jitter = PCT%% of one-way delay, reorder (default 30, 0 = off)\n"
+           "  --rttshift MS   s1..s5: the path adds MS one-way delay for random stays (--rttshift-ms mean, 1500),\n"
+           "                  each direction on its own: RTT moves between rtt, rtt+MS, rtt+2*MS without a queue\n"
+           "  --av            s3: audio (prio 0) + video (prio 1) on one connection, no bulk\n"
            "  --bw KBPS       bottleneck for s1..s4 (default 20000, 0 = unlimited)\n"
            "  --bw5 KBPS      bottleneck for s5 (default 5000)\n"
            "  --dur S         s2..s5 duration (default 60)\n"
@@ -1433,11 +1486,13 @@ static void usage(void)
            "  --wnd N         s1 bulk snd/rcv window in segments (default 128)\n"
            "  --init-cwnd N   AnLiu initial congestion window (default from library)\n"
            "  --fec-ratio N   FEC flows: redundancy in %%, 1..100, 0 = adaptive (default 25)\n"
+           "  --fec-auto      FEC flows: ANL_FEC_RTT_AUTO, the semi-reliable default (overrides --fec-ratio)\n"
            "  --rcv-deadline MS  semi gap wait: -1 = local lifetime, 0 = off (default from library)\n"
            "  bwstep          bottleneck steps 8/2/5/1/8 Mbps: bandwidth estimate, utilisation, latency\n"
-           "  --step S        bwstep: seconds per step (default 10); --step-loss P: loss %%\n"
+           "  --step S        bwstep: seconds per step (default 10); --step-loss P: loss %%; --step-rtt MS: path RTT (50)\n"
            "  --qdelay MS     bottleneck buffer in ms of queueing (default 100; small = policer-like)\n"
            "  --policer KBPS  token-bucket policer in front of the bottleneck (drops, no queue); --pbucket KB depth (64)\n"
+           "  --tbf KB        the bottleneck is a token-bucket shaper (tc tbf) with this burst (0 = plain FIFO)\n"
            "  --abr           bwstep: no bulk flow, the video bitrate follows stats.target_rate\n"
            "  --nobulk        bwstep: no bulk flow, fixed video bitrate (the baseline for --abr)\n"
            "  --soak S        soak duration (default 3600), --phase S (60), --sample S (60)\n"
@@ -1466,6 +1521,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--qdelay")) { g_qdelay = atoi(nx); i++; }
         else if (!strcmp(a, "--policer")) { g_pol_kbps = atoi(nx); i++; }
         else if (!strcmp(a, "--pbucket")) { g_pol_kb = atoi(nx); i++; }
+        else if (!strcmp(a, "--tbf")) { g_tbf_kb = atoi(nx); i++; }
+        else if (!strcmp(a, "--step-rtt")) { g_step_rtt = atoi(nx); i++; }
         else if (!strcmp(a, "--abr")) g_abr = 1;
         else if (!strcmp(a, "--nobulk")) g_abr = 2;
         else if (!strcmp(a, "--step")) { g_step_s = atoi(nx); i++; }
@@ -1486,6 +1543,7 @@ int main(int argc, char **argv)
             if (g_init_cwnd < 1 || g_init_cwnd > ANL_MAX_WND) { usage(); return 2; }
         }
         else if (!strcmp(a, "--fec-ratio")) { g_fec_ratio = atoi(nx); i++; }
+        else if (!strcmp(a, "--fec-auto")) g_fec_auto = 1;
         else if (!strcmp(a, "--rcv-deadline")) {
             g_rcv_deadline = atoi(nx); i++;
             if (g_rcv_deadline < -1) { usage(); return 2; }
@@ -1494,6 +1552,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--phase")) { g_phase = atoi(nx); i++; }
         else if (!strcmp(a, "--sample")) { g_sample = atoi(nx); i++; }
         else if (!strcmp(a, "--seed")) { g_seed = strtoull(nx, NULL, 10); i++; }
+        else if (!strcmp(a, "--rttshift")) { g_shift = atoi(nx); i++; }
+        else if (!strcmp(a, "--rttshift-ms")) { g_shift_ms = atoi(nx); i++; }
+        else if (!strcmp(a, "--av")) g_av = 1;
         else if (!strcmp(a, "--profile")) { g_fast = strcmp(nx, "default") != 0; i++; }
         else if (!strcmp(a, "--csv")) { g_csv = fopen(nx, "w"); i++; }
         else if (!strcmp(a, "--quick")) {

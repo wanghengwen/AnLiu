@@ -9,3 +9,18 @@ anl_test
 # CMake build and local install directories
 /build*/
 /install/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/compile_commands.json
+
+# Local benchmark executables
+/bench/realnet
+/bench/realnet_trace
+/bench/anl_capacity_step
+/bench/anl_media_startup
+/test_fec_diag
+/test_tx_diag
+/test_media_workload

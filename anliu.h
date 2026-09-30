@@ -48,7 +48,9 @@ extern "C" {
 #define ANL_EAGAIN         -4       /* nothing to read */
 #define ANL_EBUFSIZE       -5       /* receive buffer too small */
 #define ANL_ETOOBIG        -6       /* too many fragments (> peer rcv_wnd) */
-#define ANL_EDROPPED       -7       /* frame dropped (drop_until_key) */
+#define ANL_EDROPPED       -7       /* frame dropped (drop_until_key): a key frame (or a frame
+                                       before it) was abandoned - send a key frame now rather than
+                                       at the end of the GOP; every non-key frame is refused until then */
 #define ANL_EAUTH          -8       /* auth failed: drop SILENTLY, never reply */
 #define ANL_ECONV          -9       /* conv mismatch */
 #define ANL_EFORMAT       -10       /* malformed packet */
@@ -72,7 +74,8 @@ extern "C" {
 #define ANL_RELIABLE        0       /* ikcp-like reliable stream */
 #define ANL_SEMI            1       /* semi-reliable frame stream */
 
-#define ANL_FEC_RTT_AUTO   -1       /* adaptive FEC when semi max_age_ms < measured RTT */
+#define ANL_FEC_RTT_AUTO   -1       /* adaptive FEC while one retransmission cannot make
+                                       fec_deadline_ms and the path loses packets (DESIGN 8.6) */
 
 #define ANL_FRAME_KEY       1       /* key frame */
 
@@ -86,6 +89,8 @@ extern "C" {
  * configuration
  *---------------------------------------------------------------------*/
 typedef void (*anl_rng_fn)(void *user, uint8_t *buf, size_t n);
+
+#define ANL_CONFIG_START_RATE 1  /* anl_config has start_rate (feature test) */
 
 typedef struct anl_config {
     uint8_t psk[ANL_PSK_SIZE];  /* pre-shared key */
@@ -107,6 +112,13 @@ typedef struct anl_config {
     int max_peer_streams;       /* streams the peer may have open at once; 1024, <= ANL_MAX_STREAMS */
     int default_snd_wnd;        /* default stream (sid 0) send window, 1200 */
     int default_rcv_wnd;        /* default stream (sid 0) receive window, 1200 */
+    int start_rate;             /* bytes/s; 0 (default) = off. The rate the path is expected to
+                                   carry (e.g. 1.5..2 x the media bitrate, at most a known
+                                   bottleneck): pacing starts at it instead of an initial-window
+                                   burst and stays below 9/8 of the fastest delivery measured
+                                   (it rises as the path proves more, never falls); the initial
+                                   window grows to 300 ms at this rate (a first key frame in one
+                                   flight) and pace_burst defaults to one datagram (DESIGN 6.8) */
 } anl_config;
 
 typedef struct anl_stream_opt {
@@ -119,17 +131,26 @@ typedef struct anl_stream_opt {
     int rcv_wnd;                /* reliable 128, semi 512, max ANL_MAX_WND; same on both ends */
     int stream;                 /* reliable only: byte-stream mode */
     int flush_on_send;          /* semi default 1, reliable default 0 */
-    int fec;                    /* 0 = off; >0 = on; ANL_FEC_RTT_AUTO = semi default:
-                                   adaptive parity only while 0 < max_age_ms < measured srtt.
-                                   Unknown RTT: no automatic parity yet; >0 protects startup.
+    int fec;                    /* 0 = off; >0 = on; ANL_FEC_RTT_AUTO = semi default: adaptive
+                                   parity while one retransmission of a typical frame (1.5 srtt +
+                                   RACK window + ACK delay + its send time at the current pace)
+                                   exceeds fec_deadline_ms and the measured loss is >= 1%; off below
+                                   3/4 of the deadline or 0.25% loss, at most one switch per 2 s.
+                                   Small frames (audio, cheap): on the repair time alone unless the
+                                   path never lost a packet; with drop_until_key key frames are
+                                   judged on their own send time and protected while the loss is
+                                   unknown (the first key frame).
                                    Auto reserves FEC buffers/MSS from open, so it can switch
                                    without resegmenting queued data. Enable at both ends. */
     int fec_ratio;              /* FEC redundancy, parities per 100 data packets 1..100, default 25:
-                                   Reed-Solomon over blocks of up to 100 ms (DESIGN 8);
-                                   0 = adaptive 10..100, from the losses FEC did not repair (8.5).
-                                   ANL_FEC_RTT_AUTO always uses adaptive redundancy. */
+                                   Reed-Solomon over blocks of up to 100 ms (DESIGN 8); exact on
+                                   average, the rounding remainder carries to the next block (a
+                                   block may get none); 0 = adaptive 10..100, from the losses the
+                                   peer reports FEC did not repair (8.5), with a loss floor within
+                                   a parity budget (8.6). ANL_FEC_RTT_AUTO always uses adaptive. */
     int fec_deadline_ms;        /* adaptive FEC: a loss whose retransmission arrives within this
-                                   (from enqueue) needs no FEC; 0 = semi max_age_ms / 2, reliable none */
+                                   (from enqueue) needs no FEC - also the RTT-auto gate's target;
+                                   0 = semi max_age_ms / 2, reliable none */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
     int drop_until_key;         /* semi only: 0 */
@@ -173,6 +194,9 @@ typedef struct anl_stats {
     uint32_t rcv_bytes;                 /* bytes held in all receive buffers */
     uint64_t tx_datagrams, rx_datagrams;
     uint64_t rx_auth_fail, rx_stale;    /* ANL_EAUTH / ANL_ESTALE drops */
+    int capacity_short;                 /* 1: the bottleneck is slower than the media - the path delivers
+                                           well under what is sent, or frames expire unsent; adaptive FEC
+                                           sends no parity meanwhile (DESIGN 8.6) */
 } anl_stats;
 
 /* delay seen by a stream's receiver (DESIGN 6.9). Delays are relative to the
@@ -203,7 +227,8 @@ typedef struct anl_stream_stats {
     uint32_t fec_recovered;
     uint32_t fec_ratio;         /* sender: nominal parity/data packet ratio; the adaptive loss
                                    floor may raise actual parity; not a wire-byte ratio/cap.
-                                   0 while RTT auto is inactive */
+                                   0 while the RTT-auto gate is closed (key frames may still get
+                                   parity) */
     uint32_t frames_discarded;  /* receiver: undecodable frames discarded (rcv_drop_until_key) */
     anl_delay_report rx;        /* receiver: measured here, on what the peer sends */
     anl_delay_report peer;      /* sender: the peer's latest report on what we send */

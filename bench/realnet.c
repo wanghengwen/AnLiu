@@ -20,6 +20,9 @@
  *   --interval MS AnLiu cfg.interval (default 10)
  *   --init-cwnd N AnLiu initial congestion window in segments (default from library)
  *   --seed N
+ *   --prio-audio N / --prio-video N  media stream priority 0..3, 0 highest (default audio 0, video 1)
+ *   --adapt 1     media sender: closed loop, video frame sizes follow the target_rate
+ *                 callback (an encoder model; ADAPT / ADAPTSUM lines)
  *
  *   REALNET_TIMEBASE=1  wall/monotonic anchors at traffic start and first delivered byte
  *   REALNET_SECS=1  stream: rounded SECS plus exact SECS_BYTES per-second payload bytes
@@ -174,8 +177,22 @@ typedef struct { uint32_t t_ms; int id; anl_stream_stats ss; anl_stats cs; uint3
 static int g_mdiag;
 static int g_init_cwnd;                    /* 0 keeps the library default */
 static int g_pace_rate, g_pace_burst;      /* anl_config.pace_rate (B/s) / pace_burst (B); 0 keeps the library default */
+static int g_start_rate;                    /* anl_config.start_rate (B/s), --start-rate; 0 = off (library default) */
+/* --adapt 1: closed loop - the sender's video frame sizes follow the library's
+   target_rate callback like an encoder (payload B/s for all streams, less the
+   8000 B/s of audio), scaled against the nominal 117500 B/s of frame_v1 video,
+   between ADAPT_MIN and 1 (the encoder's maximum is the nominal rate) */
+#define ADAPT_NOMINAL_VIDEO 117500
+#define ADAPT_AUDIO         8000
+#define ADAPT_MIN           100             /* per mille of the nominal video rate */
+static int g_adapt;
+static int g_adapt_scale = 1000;            /* per mille */
+static uint64_t g_adapt_calls, g_adapt_sum_ms, g_adapt_wsum;   /* time-weighted mean scale */
+static uint64_t g_adapt_last_us;
+static int g_adapt_min = 1000;
 static int g_rcv_deadline = -2, g_fec_rtt_auto, g_fec_ratio = -1; /* explicit policy A/B controls */
 static int g_fec_ratio_flow[3] = { -1, -1, -1 };   /* --fec-ratio-audio / --fec-ratio-video: per-flow override, [1] audio, [2] video */
+static int g_prio_flow[3] = { -1, -1, -1 };        /* --prio-audio / --prio-video: stream priority override (0..3, 0 highest), [1] audio, [2] video */
 static mdiag_s *g_mds; static size_t g_nmds, g_capmds;
 static mdiag_r *g_mdr; static size_t g_nmdr, g_capmdr;
 static mdiag_t *g_mdt; static size_t g_nmdt, g_capmdt;
@@ -202,6 +219,27 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000;
 }
 static uint32_t now_ms(void) { return (uint32_t)(now_us() / 1000); }
+
+static void rate_changed(anl_t *w, uint32_t target, void *user);
+/* closed-loop encoder model (--adapt 1): keep a time-weighted mean of the scale */
+static void adapt_rate(anl_t *w, uint32_t target, void *user)
+{
+    uint64_t t = now_us();
+    int64_t v = (int64_t)target - ADAPT_AUDIO;
+    int sc = v <= 0 ? ADAPT_MIN : (int)(v * 1000 / ADAPT_NOMINAL_VIDEO);
+    if (sc > 1000) sc = 1000;
+    if (sc < ADAPT_MIN) sc = ADAPT_MIN;
+    if (g_adapt_last_us && g_t0_us && t > g_adapt_last_us) {
+        uint64_t d = (t - g_adapt_last_us) / 1000;
+        g_adapt_sum_ms += d; g_adapt_wsum += d * (uint64_t)g_adapt_scale;
+    }
+    g_adapt_last_us = t;
+    g_adapt_calls++;
+    g_adapt_scale = sc;
+    if (g_t0_us && sc < g_adapt_min) g_adapt_min = sc;
+    printf("ADAPT t_ms=%lld target_Bps=%u scale=%d\n", g_t0_us ? ((long long)t - (long long)g_t0_us) / 1000 : -1LL, target, sc);
+    if (g_rate_diag) rate_changed(w, target, user);
+}
 
 static void rate_changed(anl_t *w, uint32_t target, void *user)
 {
@@ -248,7 +286,7 @@ static uint32_t rnd(void)
 }
 /* frame_v1: a stable size for each (seed, flow, sequence). A shared RNG makes
    equal --seed runs generate different frames when FEC changes packet counts. */
-static int media_frame_size(const flow *f, int key)
+static int media_frame_size_raw(const flow *f, int key)
 {
     int a = key ? f->key_min : f->size_min;
     int b = key ? f->key_max : f->size_max;
@@ -260,6 +298,15 @@ static int media_frame_size(const flow *f, int key)
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
     x ^= x >> 31;
     return a + (int)(x % (uint32_t)(b - a + 1));
+}
+static int media_frame_size(const flow *f, int key)
+{
+    int n = media_frame_size_raw(f, key);
+    if (g_adapt && f->id == 2 && g_adapt_scale < 1000) {
+        n = (int)((int64_t)n * g_adapt_scale / 1000);
+        if (n < 200) n = 200;               /* > HDR; a tiny P frame still carries headers */
+    }
+    return n;
 }
 
 static int is_anl(void) { return g_proto <= P_ANLAUTO; }
@@ -413,11 +460,19 @@ static void ep_create(void)
         g_init_cwnd = cfg.init_cwnd;
         if (g_pace_rate) cfg.pace_rate = g_pace_rate;
         if (g_pace_burst) cfg.pace_burst = g_pace_burst;
+#ifdef ANL_CONFIG_START_RATE
+        if (g_start_rate) cfg.start_rate = g_start_rate;
+        printf("PACECFG init_cwnd=%d pace_rate=%d pace_burst=%d start_rate=%d (0 = library default)\n",
+               cfg.init_cwnd, cfg.pace_rate, cfg.pace_burst, cfg.start_rate);
+#else
+        if (g_start_rate) { fprintf(stderr, "--start-rate: this protocol build has no anl_config.start_rate\n"); exit(2); }
         printf("PACECFG init_cwnd=%d pace_rate=%d pace_burst=%d (0 = library default)\n", cfg.init_cwnd, cfg.pace_rate, cfg.pace_burst);
+#endif
         g_anl = anl_create(0x5a5a0001, &cfg, NULL);
         anl_setoutput(g_anl, anl_out);
         anl_set_accept(g_anl, accept_cb);
-        if (g_rate_diag) anl_set_rate_callback(g_anl, rate_changed);
+        if (g_adapt && is_sender()) anl_set_rate_callback(g_anl, adapt_rate);
+        else if (g_rate_diag) anl_set_rate_callback(g_anl, rate_changed);
         g_protocol_ms = now_ms();
         anl_update(g_anl, g_protocol_ms);
         return;
@@ -752,6 +807,16 @@ static void report_mdiag(void)
 static void report_rate(void)
 {
     size_t i;
+    if (g_adapt && is_anl() && is_sender()) {
+        uint64_t t = now_us();
+        if (g_adapt_last_us && t > g_adapt_last_us) {
+            uint64_t d = (t - g_adapt_last_us) / 1000;
+            g_adapt_sum_ms += d; g_adapt_wsum += d * (uint64_t)g_adapt_scale;
+        }
+        printf("ADAPTSUM callbacks=%llu mean_scale=%llu min_scale=%d last_scale=%d (per mille of %d B/s video)\n",
+               (unsigned long long)g_adapt_calls, g_adapt_sum_ms ? (unsigned long long)(g_adapt_wsum / g_adapt_sum_ms) : 1000ull,
+               g_adapt_min, g_adapt_scale, ADAPT_NOMINAL_VIDEO);
+    }
     if (!g_rate_diag || !is_anl()) return;
     printf("RATE proto=%s side=%s metric=target_payload_Bps callbacks=%llu recorded=%zu dropped=%llu start_mono_us=%llu\n",
            proto_name[g_proto], is_sender() ? "sender" : "receiver",
@@ -892,9 +957,11 @@ static void usage(void)
 {
     fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop|tcp]\n"
                     "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N] [--init-cwnd N]\n"
-                    "       [--pace-rate BYTES_PER_S] [--pace-burst BYTES]\n"
+                    "       [--pace-rate BYTES_PER_S] [--pace-burst BYTES] [--start-rate BYTES_PER_S (0 off)]\n"
                     "       [--rcv-deadline MS (-1 lifetime, 0 off)] [--fec-rtt-auto 0|1] [--fec-ratio 0..100 (0 adaptive)]\n"
-                    "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n");
+                    "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n"
+                    "       [--prio-audio 0..3] [--prio-video 0..3] (stream priority, 0 highest; default audio 0, video 1)\n"
+                    "       [--adapt 0|1] (media sender: video frame sizes follow the target_rate callback)\n");
     exit(2);
 }
 
@@ -934,6 +1001,10 @@ int main(int argc, char **argv)
             g_pace_burst = atoi(nx);
             if (g_pace_burst < 0) usage();
         }
+        else if (!strcmp(a, "--start-rate")) {
+            g_start_rate = atoi(nx);
+            if (g_start_rate < 0) usage();
+        }
         else if (!strcmp(a, "--loss")) g_loss = atof(nx);
         else if (!strcmp(a, "--rcv-deadline")) {
             g_rcv_deadline = atoi(nx);
@@ -943,6 +1014,12 @@ int main(int argc, char **argv)
             int v = atoi(nx);
             if (v < 0 || v > 100) usage();
             g_fec_ratio_flow[a[12] == 'a' ? 1 : 2] = v;
+        }
+        else if (!strcmp(a, "--adapt")) g_adapt = atoi(nx) != 0;
+        else if (!strcmp(a, "--prio-audio") || !strcmp(a, "--prio-video")) {
+            int v = atoi(nx);
+            if (v < 0 || v > 3) usage();
+            g_prio_flow[a[7] == 'a' ? 1 : 2] = v;
         }
         else if (!strcmp(a, "--fec-ratio")) {
             g_fec_ratio = atoi(nx);
@@ -968,8 +1045,9 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     if ((g_fec_ratio >= 0 || g_fec_ratio_flow[1] >= 0 || g_fec_ratio_flow[2] >= 0) && g_fec_rtt_auto) usage();   /* one FEC policy at a time */
     if (is_anl() && (g_test == 0 || g_test == 3))
-        printf("POLICY proto=%s rcv_deadline=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d (-2=library_default, -1=proto default)\n",
-               proto_name[g_proto], g_rcv_deadline, g_fec_rtt_auto, g_fec_ratio, g_fec_ratio_flow[1], g_fec_ratio_flow[2]);
+        printf("POLICY proto=%s rcv_deadline=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d prio_audio=%d prio_video=%d (-2=library_default, -1=proto default)\n",
+               proto_name[g_proto], g_rcv_deadline, g_fec_rtt_auto, g_fec_ratio, g_fec_ratio_flow[1], g_fec_ratio_flow[2],
+               g_prio_flow[1] >= 0 ? g_prio_flow[1] : 0, g_prio_flow[2] >= 0 ? g_prio_flow[2] : 1);
     g_timebase = getenv("REALNET_TIMEBASE") && atoi(getenv("REALNET_TIMEBASE")) != 0;
     if (g_proto == P_TCP) return tcp_run();
     if (g_test == 0 || g_test == 3)
@@ -981,6 +1059,8 @@ int main(int argc, char **argv)
         g_rate_diag = getenv("REALNET_RATE") && atoi(getenv("REALNET_RATE")) > 0;
     }
     flows_init();
+    if (g_prio_flow[1] >= 0) g_fl[1].prio = g_prio_flow[1];
+    if (g_prio_flow[2] >= 0) g_fl[2].prio = g_prio_flow[2];
 
     g_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_fd < 0) { perror("socket"); return 1; }
@@ -1115,8 +1195,9 @@ int main(int argc, char **argv)
             anl_stats st;
             last_trace_us = t;
             anl_get_stats(g_anl, &st);
-            fprintf(stderr, "TRACE t=%.1f st=%d cwnd=%u infl=%u bw=%u pace=%u srtt=%u minrtt=%u rtx=%u",
-                    (t - start_us) / 1e6, st.cc_state, st.cwnd, st.inflight, st.bw_estimate, st.pace_rate, st.srtt, st.min_rtt, st.retrans);
+            fprintf(stderr, "TRACE t=%.1f st=%d cwnd=%u infl=%u bw=%u pace=%u srtt=%u minrtt=%u rtx=%u short=%d target=%u",
+                    (t - start_us) / 1e6, st.cc_state, st.cwnd, st.inflight, st.bw_estimate, st.pace_rate, st.srtt, st.min_rtt, st.retrans,
+                    st.capacity_short, st.target_rate);
 #ifdef REALNET_INTERNAL
             fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d lt_rate=%u lt_k=%u lt_span=%u rto=%d qflat=%u probed=%d",
                     g_anl->btl_bw, g_anl->bw_lo, (unsigned long long)g_anl->inflight_hi, g_anl->probe_phase, g_anl->loss_rate,
