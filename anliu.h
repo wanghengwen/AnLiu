@@ -24,11 +24,13 @@ extern "C" {
 /*---------------------------------------------------------------------
  * version / limits
  *---------------------------------------------------------------------*/
-#define ANL_VERSION         0       /* wire version, flg bit7-6 */
+#define ANL_VERSION         1       /* wire version, flg bit7-6 */
 
-#define ANL_MAX_STREAMS     8192    /* sid 0..8191, 13 bits on the wire (+1 reserved bit) */
+#define ANL_MAX_SID         ((1 << 29) - 1) /* 13 bits on the wire, 29 with the 2-byte extension;
+                                               never reused: about 2^28 opens per side */
+#define ANL_MAX_STREAMS     8192    /* upper bound of max_peer_streams (streams open at once) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
-#define ANL_MAX_WND         8192    /* 16-bit sn requires wnd << 32768 */
+#define ANL_MAX_WND         32768   /* 24-bit sn requires wnd << 2^23; window fields are 16 bits */
 #define ANL_MAX_PRIO        4       /* prio 0 (highest) .. 3 */
 #define ANL_FEC_GROUP       8       /* 8 data + 1 parity */
 #define ANL_PSK_SIZE        32
@@ -58,7 +60,8 @@ extern "C" {
 #define ANL_ECLOSED       -13       /* stream closed (by either side) or reset by the peer */
 #define ANL_ESTALE        -14       /* datagram ts outside time window, dropped */
 #define ANL_EDEAD         -15       /* connection is dead (dead_link / idle timeout) */
-#define ANL_EBUSY         -16       /* no free sid */
+#define ANL_EBUSY         -16       /* no free sid (ANL_MAX_SID reached), or SID_WIN (8192) sids
+                                       opened that the peer has not heard of yet: retry later */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -74,7 +77,7 @@ extern "C" {
 #define ANL_RELIABLE        0       /* ikcp-like reliable stream */
 #define ANL_SEMI            1       /* semi-reliable frame stream */
 
-#define ANL_FEC_RTT_AUTO   -1       /* adaptive FEC while one retransmission cannot make
+#define ANL_FEC_RTT_AUTO   -1       /* adaptive FEC while estimated recovery cannot make
                                        fec_deadline_ms and the path loses packets (DESIGN 8.6) */
 
 #define ANL_FRAME_KEY       1       /* key frame */
@@ -109,9 +112,9 @@ typedef struct anl_config {
                                    bound on the BBR rate (e.g. an uplink quota) */
     int pace_burst;             /* token bucket size in bytes; 0 = 4 * mtu */
     int rcv_limit_bytes;        /* connection-wide receive buffer cap; 16 MB, 0 = unlimited */
-    int max_peer_streams;       /* streams the peer may have open at once; 1024, <= ANL_MAX_STREAMS */
-    int default_snd_wnd;        /* default stream (sid 0) send window, 1200 */
-    int default_rcv_wnd;        /* default stream (sid 0) receive window, 1200 */
+    int max_peer_streams;       /* streams the peer may have open at once; 4096, <= ANL_MAX_STREAMS */
+    int default_snd_wnd;        /* default stream (sid 0) send window, 4096 */
+    int default_rcv_wnd;        /* default stream (sid 0) receive window, 4096 */
     int start_rate;             /* bytes/s; 0 (default) = off. The rate the path is expected to
                                    carry (e.g. 1.5..2 x the media bitrate, at most a known
                                    bottleneck): pacing starts at it instead of an initial-window
@@ -127,15 +130,19 @@ typedef struct anl_stream_opt {
     int mode;                   /* ANL_RELIABLE / ANL_SEMI */
     int tag;                    /* application-defined 0..65535 */
     int prio;                   /* 0..3, 0 highest, default 2; weights 8/4/2/1 */
-    int snd_wnd;                /* reliable 32, semi 512 */
-    int rcv_wnd;                /* reliable 128, semi 512, max ANL_MAX_WND; same on both ends */
+    int snd_wnd;                /* reliable 4096, semi 512 */
+    int rcv_wnd;                /* reliable 4096 (5.6 MB: 10 MB/s up to 500 ms RTT), semi 512,
+                                   max ANL_MAX_WND; same on both ends */
     int stream;                 /* reliable only: byte-stream mode */
     int flush_on_send;          /* semi default 1, reliable default 0 */
     int fec;                    /* 0 = off; >0 = on; ANL_FEC_RTT_AUTO = semi default: adaptive
-                                   parity while one retransmission of a typical frame (1.5 srtt +
-                                   RACK window + ACK delay + its send time at the current pace)
-                                   exceeds fec_deadline_ms and the measured loss is >= 1%; off below
-                                   3/4 of the deadline or 0.25% loss, at most one switch per 2 s.
+                                   parity while estimated recovery of a typical frame exceeds
+                                   fec_deadline_ms and the measured loss is >= 1%. One retry costs
+                                   1.5 srtt + RACK window + ACK delay + paced frame send time;
+                                   large frames reserve a second retry if measured loss makes
+                                   failure after the first retry exceed the parity failure target.
+                                   Off below 3/4 of the deadline or 0.25% loss,
+                                   at most one switch per 2 s.
                                    Small frames (audio, cheap): on the repair time alone unless the
                                    path never lost a packet; with drop_until_key key frames are
                                    judged on their own send time and protected while the loss is
@@ -148,7 +155,7 @@ typedef struct anl_stream_opt {
                                    block may get none); 0 = adaptive 10..100, from the losses the
                                    peer reports FEC did not repair (8.5), with a loss floor within
                                    a parity budget (8.6). ANL_FEC_RTT_AUTO always uses adaptive. */
-    int fec_deadline_ms;        /* adaptive FEC: a loss whose retransmission arrives within this
+    int fec_deadline_ms;        /* adaptive FEC: a loss whose estimated recovery arrives within this
                                    (from enqueue) needs no FEC - also the RTT-auto gate's target;
                                    0 = semi max_age_ms / 2, reliable none */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
@@ -347,10 +354,20 @@ anl_stream_t *anl_default_stream(anl_t *w);
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
 /* Close and release the handle. Reliable: orderly, unsent data is still
- * delivered. Semi-reliable: abort, frames in flight are dropped on both
- * sides. Unread received data is discarded. Afterwards the handle must not
- * be used. The default stream cannot be closed (ANL_EINVAL). */
+ * delivered; the peer's direction is closed too (its sends return
+ * ANL_ECLOSED, what it queued before is still delivered and discarded here).
+ * Semi-reliable: abort, frames in flight are dropped on both sides. Unread
+ * received data is discarded. Afterwards the handle must not be used. The
+ * default stream cannot be closed (ANL_EINVAL). */
 int      anl_stream_close(anl_stream_t *s);
+
+/* Reliable only: half-close (TCP shutdown(SHUT_WR)). No more sending (sends
+ * return ANL_ECLOSED), what was sent is still delivered and the peer reads
+ * end of stream after it; receiving goes on until the peer closes or shuts
+ * down its direction. The handle stays valid: release it with
+ * anl_stream_close. ANL_EMODE on a semi-reliable stream, ANL_EINVAL on the
+ * default stream. */
+int      anl_stream_shutdown(anl_stream_t *s);
 
 /* reliable stream: ikcp semantics. recv returns ANL_ECLOSED once the peer has
  * closed the stream and everything has been read (end of stream). */

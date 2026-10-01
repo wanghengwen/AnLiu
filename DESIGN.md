@@ -1,11 +1,10 @@
 # AnLiu（暗流）协议设计文档
 
 状态：当前 `anliu.h` / `anliu.c` 实现说明
-整理日期：2026-09-30
-代码基线：`91dc7855b6f7124eae411f76bdc29439203e6d27` 中的 `anliu.h` / `anliu.c`（整理时这两个文件无工作区改动）
-线上版本：`ANL_VERSION = 0`
+整理日期：2026-10-01
+线上版本：`ANL_VERSION = 1`
 
-本文件描述当前原版实现。性能测量见 [performance.md](performance.md)；旧草案、评审轮次与撤回的试验不作为当前协议规则。
+本文件描述当前实现。性能测量见 [performance.md](performance.md)；
 
 ---
 
@@ -23,8 +22,8 @@ AnLiu 是一个基于 UDP 的轻量传输协议，参考 [ikcp](https://github.c
 |---|---|---|
 | 1 | 加密与抗探测 | 数据报整体认证并加密（12 字节标签），按传输方向派生密钥；线上没有固定明文特征 |
 | 2 | 流级 FEC | GF(2⁸) Cauchy Reed-Solomon，最多 64 个数据分片与 16 个校验包；可靠流默认关闭，半可靠流默认按 RTT 与丢失证据开启 |
-| 3 | 精简头部 | 公共字段提到数据报级；基础 DATA 段头 6~7 字节，分片扩展、帧号与 OPEN 参数另计 |
-| 4 | 多流 | 最多 8192 个并发流（含随连接创建的默认流 sid 0），sid（13 位）与段类型、1 个保留位合用 2 字节；流以句柄操作，两端都可随时打开/关闭，对端打开的流经回调自动接收并带应用 tag；流参数随第一个段携带，无握手；一个 sid 在连接内只用一次；每流独立序号空间 |
+| 3 | 精简头部 | 公共字段提到数据报级；基础 DATA 段头 7~8 字节，分片扩展、帧号、sid 扩展与 OPEN 参数另计 |
+| 4 | 多流 | sid 低 13 位与段类型合用 2 字节，sid ≥ 8192 时再加 2 字节扩展到 29 位；一个 sid 在连接内只用一次，同时存在的对端流受 `max_peer_streams`（≤ 8192）限制；流以句柄操作，两端都可随时打开/关闭，可靠流支持半关闭；对端打开的流经回调自动接收并带应用 tag；流参数随第一个段携带，无握手；每流独立序号空间 |
 | 5 | 半可靠帧传输 | 按帧发送，积压或超时时整帧丢弃，用 FWD 通知接收方跳过 |
 | 6 | 平滑发送 | 连接级令牌桶配合 BBR 模型发送；共享带宽估计、RTT 与在途约束 |
 
@@ -174,7 +173,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 |---|---|---|
 | tag | 12 | SipHash-2-4-128 标签的前 12 字节，同时作为 nonce |
 | conv | 4 | 连接号，非零 |
-| flg | 1 | bit7-6：版本号（当前为 0）；bit0：PAD；其余位保留，必须为 0 |
+| flg | 1 | bit7-6：版本号（当前为 1）；bit0：PAD；其余位保留，必须为 0 |
 | ts | 4 | 发送方时钟（毫秒），供对端在 ACK 中回显，并用于时间窗检查 |
 
 **数据报级固定开销为 21 字节**，其中 12 字节用于认证和 nonce。
@@ -189,7 +188,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 
 ### 4.2 时间窗检查
 
-16 位 sn 每 65536 个分片回绕一次。1 Gbps、1400 字节时约 0.7 秒一圈；延迟超过半圈的自然重复包、或攻击者在若干回绕周期后重放的旧包，都会以合法 sn 落入接收窗口。为此接收端在连接级做一次基于 ts 的检查：
+24 位 sn 每 16777216 个分片回绕一次。1 Gbps、1400 字节时约 188 秒一圈；延迟超过半圈的自然重复包、或攻击者在若干回绕周期后重放的旧包，仍会以合法 sn 落入接收窗口。为此接收端在连接级做一次基于 ts 的检查：
 
 - 连接记录对端最近的 ts：`peer_ts`（用有符号 32 位差值比较，允许回绕）；
 - 认证通过后，若 `diff(ts, peer_ts) < -ts_window`，丢弃该数据报，`anl_input` 返回 `ANL_ESTALE`；否则 `peer_ts = max(peer_ts, ts)`；
@@ -198,7 +197,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 
 由此带来的约束（需要在使用文档中写明）：
 
-- **单个流的发送速率不得超过 32768 个分片 / ts_window**（默认约 32768 分片/秒，1400 字节时约 45 MB/s），否则时间窗内也可能出现 sn 歧义；
+- **单个流的发送速率不得超过 2²³ 个分片 / ts_window**（默认约 840 万分片/秒，1400 字节时约 11 GB/s），否则时间窗内也可能出现 sn 歧义；
 - 对端的 `current` 必须是单调时钟。若它向后跳超过 ts_window，其数据报会被丢弃直到时钟追上；
 - **对端进程重启后必须使用新的 conv**。重启后 `current` 通常从另一个基准重新计时，ts 大幅倒退，同 conv 的数据报会被永久判为 ESTALE。协议不做"连续多个 stale 则重置 peer_ts"之类的自愈：那会给重放攻击开后门。同 conv 重连在 ikcp 里同样是错误用法（sn 空间从 0 重置），这里只是让失败更早、更明确。
 
@@ -206,15 +205,16 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 
 ## 5. 段格式
 
-每个段的前 2 字节：
+每个段的前 2 字节（sid ≥ 8192 时 4 字节，下称 sid_hdr）：
 
 ```
- b0: bit 7 6 |  5  | 4 3 2 1 0     b1: bit 7..0
-       type  | rsv | sid[12:8]           sid[7:0]        sid = 0..8191
+ b0: bit 7 6 | 5 | 4 3 2 1 0     b1: bit 7..0     [sid_hi: u16，仅当 X = 1]
+       type  | X | sid[12:8]           sid[7:0]          sid[28:13]
 ```
 
-- sid 位置固定，解密后读取前 2 字节即可得到流 ID；
-- `rsv` 为保留位：发送方必须置 0；接收方收到非 0 时按 `ANL_EFORMAT` 丢弃整个数据报，与数据报头保留位的规则一致。留作将来扩展（例如更多 sid 或新的段类型）；
+- `sid = sid_hi << 13 | sid[12:0]`，范围 0..2²⁹−1（`ANL_MAX_SID`）。sid < 8192 时 X = 0，只有 2 字节；否则 X = 1，后接 2 字节高位；
+- **一个 sid 只有一种编码**：X = 1 而 sid_hi = 0 时按 `ANL_EFORMAT` 丢弃整个数据报；
+- 解密后最多读 4 字节即可得到流 ID，之后的字段按相对位置解析；
 
 | type | 名称 | 用途 |
 |---|---|---|
@@ -225,18 +225,18 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 
 ### 5.1 序号编码
 
-- 线上的 sn 和 una 都是 **16 位**，内部扩展为 32 位：`sn32 = ref32 + (int16_t)(sn16 - (uint16_t)ref32)`；
+- 线上的 sn 和 una（DATA、ACK、FWD、STREAM_CLOSE 的 final_sn / una、PARITY 的 base）都是 **24 位**，内部扩展为 32 位：`sn32 = ref32 + sext24(sn24 − ref32)`；
 - 接收方的参考值 ref 取 `rcv_nxt`，发送方取 `snd_una`；
-- 要求窗口远小于 32768，因此实现中限制 `snd_wnd` 和 `rcv_wnd` 不超过 8192；
+- 要求窗口远小于 2²³；`snd_wnd` 与 `rcv_wnd` 上限为 `ANL_MAX_WND` = 32768，这是 ACK 的 wnd 与流参数的 rcv_wnd（均为 u16）的限制，而不是序号空间的限制。32768 个约 1366 字节的分片约 45 MB，RTT 300 ms 时可支撑约 150 MB/s；
 - 窗口限制只保证在途数据不歧义，不保证旧包不被当作新包，后者由 4.2 的时间窗检查负责。
 
 ### 5.2 DATA
 
 ```
- sid_hdr : 2 字节，type=00 | rsv=0 | sid
+ sid_hdr : 2 或 4 字节，type=00
  flags   : OPEN(1) | HAS_FRAME(1) | KEY(1) | frg(5)
  [frg_ext]: varint，仅当 frg5 == 31 时出现，实际 frg = 31 + frg_ext
- sn      : u16
+ sn      : u24
  [frame] : u16，仅当 HAS_FRAME 时出现，为 frame_no 的低 16 位
  [open]  : 5 字节流参数，仅当 OPEN 时出现，见下
  len     : varint
@@ -251,7 +251,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
  tag     : u16    应用定义的流用途
 ```
 
-**分片大小**：连接 mss = MTU − 21 − 11（DATA 头部最大值，不含流参数）。对端尚未应答时切出的分片，载荷上限为 mss − 5，重传时仍可能携带流参数而不超过 MTU；收到对端任何段之后切出的分片使用完整 mss（peer_opened 只会从 0 变 1，之后切出的分片不会再带流参数）。只让少量早期分片承担这 5 字节，而不是整条连接一直少 5 字节 mss。
+**分片大小**：连接 mss = MTU − 21 − 13（DATA 头部最大值：sid 2、flags 1、frg_ext 3、sn 3、frame 2、len 2，不含流参数）；sid ≥ 8192 的流 mss 再少 2 字节。对端尚未应答时切出的分片，载荷上限为 mss − 5，重传时仍可能携带流参数而不超过 MTU；收到对端任何段之后切出的分片使用完整 mss（peer_opened 只会从 0 变 1，之后切出的分片不会再带流参数）。只让少量早期分片承担这 5 字节，而不是整条连接一直少 5 字节 mss。
 
 - **frg**：分片倒计数，最后一片为 0，第一片为 n-1；解析时要求 `frg < ANL_MAX_WND`，过大的扩展值返回 `ANL_EFORMAT`。
 - **len 总是存在**：payload 长度使用 varint，不能由数据报尾部位置推断。
@@ -259,19 +259,19 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 - **HAS_FRAME / KEY**：只出现在半可靠流中每一帧的**首个分片**上。HAS_FRAME 同时是帧起点标记，接收方靠它来跳帧。
 - **模式校验**：可靠流收到带 HAS_FRAME 的 DATA、或收到 FWD，说明对端把该 sid 当作半可靠流；本端向对端发 RST 并按"对端已释放"处理该流（见 6.1）。
 - **头部大小**：
-  - 可靠流（不含 frg_ext）：`2 + 1 + 2 + (1~2)` = **6~7 字节**；对端尚未应答时再加 5 字节；
+  - 可靠流（不含 frg_ext）：`2 + 1 + 3 + (1~2)` = **7~8 字节**；sid ≥ 8192 时再加 2 字节；对端尚未应答时再加 5 字节；
   - 半可靠流的帧首片：再加 2 字节。
 
 ### 5.3 ACK
 
 ```
- sid_hdr : 2 字节，type=01 | rsv=0 | sid
+ sid_hdr : 2 或 4 字节，type=01
  flags   : WASK(1) | FRESH(1) | 保留(6)
- una     : u16     接收方仍需要的第一个 sn（半可靠流可跳过缺口，见 7.5）
+ una     : u24     接收方仍需要的第一个 sn（半可靠流可跳过缺口，见 7.5）
  wnd     : u16     接收方剩余窗口
  ts_echo : u32     回显最近一个带有本流 DATA 的数据报的 ts
  n       : varint  后面的区间个数
- gap[i]  : varint  区间起点 - 上一个区间的终点（第一个区间相对 una），≥ 1
+ gap[i]  : varint  区间起点 - 上一个区间的终点（第一个区间相对 una）；第一个可以为 0，其余 ≥ 1
  len[i]  : varint  区间长度，≥ 1；区间 [起点, 起点 + len) 内的分片都已收到
 ```
 
@@ -281,7 +281,8 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 - 收到已有的分片（发送端重传了它，说明发送端可能不知道它已送达）时，把它的报告次数清零，重新报告；
 - 一个 ACK 段放不下时拆成多个 ACK 段，每段都带完整的 una / wnd / ts_echo；
 - 编码：连续收到的分片只占一个区间，连续区间只需一个 gap/len 对；从 una 开始的连续确认直接通过 una 表达；
-- 接收端检查：gap 与 len 为 0、区间总跨度超过 `ANL_MAX_WND` 的 ACK 视为格式错误；发送端忽略终点超过 snd_nxt 的区间。
+- 接收端检查：除第一个区间外 gap 为 0、len 为 0、区间总跨度超过 `ANL_MAX_WND` 的 ACK 视为格式错误；发送端忽略终点超过 snd_nxt 的区间；
+- 第一个区间的 gap 为 0 出现在接收队列满（`nrcv_que ≥ rcv_wnd`）时：rcv_nxt 处的分片已收到但不能移入队列，una 停在它上面，区间从 una 开始。
 
 **标志位**：
 
@@ -299,16 +300,16 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 ### 5.4 FWD（仅半可靠流）
 
 ```
- b0,b1   : type=10 | rsv=0 | sid（见本章的 2 字节公共段头）
- new_una : u16    所有小于 new_una 的 sn 都已被发送方放弃
+ sid_hdr : 2 或 4 字节，type=10
+ new_una : u24    所有小于 new_una 的 sn 都已被发送方放弃
 ```
 
-共 4 字节。new_una 由本次放弃的、已分配序号的分片确定：越过其中最大的 sn，但不越过后续未放弃的分片。它不要求落在帧首，也不等于发送缓存中第一个存活帧或分片的 sn；与 `snd_una` 是两个不同的量，详细规则见 7.3。
+共 5 字节（sid ≥ 8192 时 7 字节）。new_una 由本次放弃的、已分配序号的分片确定：越过其中最大的 sn，但不越过后续未放弃的分片。它不要求落在帧首，也不等于发送缓存中第一个存活帧或分片的 sn；与 `snd_una` 是两个不同的量，详细规则见 7.3。
 
 ### 5.5 CTRL
 
 ```
- sid_hdr : 2 字节，type=11 | rsv=0 | sid
+ sid_hdr : 2 或 4 字节，type=11
  subtype : u8
  len  : varint      body 的字节数
  body[len]
@@ -319,7 +320,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 | 0x00 | 保留 | — | — |
 | 0x01 | PARITY | 见 8.3 | FEC 校验段 |
 | 0x02 | STREAM_OPEN | 5 字节流参数（5.2） | 单向通告：打开方尚未收到对端任何段时，按退避周期发送，让对端在没有数据的情况下也能建流；对端回一个普通 ACK（n=0）即可，见 6.1 |
-| 0x03 | STREAM_CLOSE | `final_sn(u16) flags(u8) una(u16) [open(5)]` | 本端关闭该流，final_sn 为本端最后一个 sn 的下一个值；`flags` bit0 = **RST**（该 sid 在本端已经释放），bit1 = **OPEN**（后接 5 字节流参数，打开方尚未收到对端任何段时置位，使先于数据到达的 CLOSE 也能建流）；**una** 为本端该流的 rcv_nxt，非 RST 的 CLOSE 在对端按 ACK 的 una 处理（RST 中为 0，忽略），见 6.1 |
+| 0x03 | STREAM_CLOSE | `final_sn(u24) flags(u8) una(u24) [open(5)]` | 一个方向的结束（FIN）及其确认。final_sn 为本端最后一个 sn 的下一个值；`flags` bit0 = **RST**（该 sid 在本端已经释放），bit1 = **OPEN**（后接 5 字节流参数，打开方尚未收到对端任何段时置位，使先于数据到达的 CLOSE 也能建流），bit2 = **HALF**（这个 FIN 是半关闭：发送方还在读），bit3 = **ACKFIN**（发送方已收到对方的 FIN），bit4 = **NOFIN**（不带 FIN、只确认对方的 FIN，final_sn 为 0）；**una** 为本端该流的 rcv_nxt，非 RST 的 CLOSE 在对端按 ACK 的 una 处理（RST 中为 0，忽略），见 6.1 |
 | 0x04 | REPORT | 8 个 u16：`jitter qdelay_avg qdelay_max frame_delay_avg frame_delay_max frames frames_skipped fec_recovered` | 接收端的时延报告（6.9），毫秒；后两项是累计值（模 65536）。不确认、不重传，下一次报告会覆盖它 |
 | 0x05 | RCV_SKIP | `retired_una(u32)` | 接收端本地期限跳过的前缀终点。半可靠发送端回收该点之前仍未确认的分片，不计为实际交付；在相关 ACK 之前发送，见 7.5 |
 | 其他 | 保留 | — | 按 len 跳过 |
@@ -332,30 +333,35 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 
 ### 6.1 流管理与关闭
 
-**默认流 sid 0** 随连接创建，可靠字节流，不能关闭；`anl_send / anl_recv / anl_peeksize / anl_waitsnd` 作用于它。它的重传和新数据严格优先，发送即 flush；窗口由 `default_snd_wnd / default_rcv_wnd` 设置，两端默认均为 1200，不通过 OPEN 交换。
+**默认流 sid 0** 随连接创建，可靠字节流，不能关闭；`anl_send / anl_recv / anl_peeksize / anl_waitsnd` 作用于它。它的重传和新数据严格优先，发送即 flush；窗口由 `default_snd_wnd / default_rcv_wnd` 设置，两端默认均为 4096，不通过 OPEN 交换。
 
-**其他流** 由 `anl_stream_open` 分配句柄与 sid：客户端偶数，从 2 开始；服务端奇数，从 1 开始。sid 在连接内单调分配、不复用；客户端最多主动打开 4095 条非默认流，服务端最多 4096 条，耗尽返回 `ANL_EBUSY`。连接内 sid 范围为 0..8191。
+**其他流** 由 `anl_stream_open` 分配句柄与 sid：客户端偶数，从 2 开始；服务端奇数，从 1 开始。sid 在连接内单调分配、不复用，范围 0..2²⁹−1，每端约可打开 2.7 亿次；超过 `ANL_MAX_SID` 后返回 `ANL_EBUSY`，应用应换一个 conv 重建连接。另一种 `ANL_EBUSY` 是暂时的：本端已打开、但对端还没收到任何段的 sid 跨度达到 `SID_WIN`（8192）时，稍后重试即可（见下面的"已用 sid"）。
 
 打开方决定 `mode / stream / tag / rcv_wnd`，通过 5 字节 OPEN body 通告，两端采用相同值；其余选项是本端配置，可不同。尚未收到该流对端的非 RST 段时，每个 DATA 和 CLOSE 携带 OPEN body；另发 STREAM_OPEN，使无业务数据时对端也能建流。无需等待握手即可发送数据。STREAM_OPEN 首次重试无 RTT 时用 200 ms，之后 ×2，上限 5 s；不计入 dead_link。
 
-未知 sid 的 OPEN 数据由 `anl_set_accept` 注册的回调接收；未注册时按默认参数接收。回调的 opt 预填对端的四个公共参数，不能修改这四项，其余本端选项可改；返回负数拒绝并回 RST。`max_peer_streams` 限制对端同时打开的流数，默认 1024。应用用 `tag`、用户指针或 `anl_readable` 识别业务流。
+未知 sid 的 OPEN 数据由 `anl_set_accept` 注册的回调接收；未注册时按默认参数接收。回调的 opt 预填对端的四个公共参数，不能修改这四项，其余本端选项可改；返回负数拒绝并回 RST。`max_peer_streams` 限制对端同时打开的流数，默认 4096，上限 `ANL_MAX_STREAMS`（8192），超出时回 RST。应用用 `tag`、用户指针或 `anl_readable` 识别业务流。
 
 句柄从 open 或 accept 起有效，直到应用 close 或释放连接。对端 CLOSE/RST 后，句柄仍由应用持有；已交付的接收数据可读完，然后返回 `ANL_ECLOSED`，应用仍须 close。应用 close 后句柄立即失效、未读数据丢弃；可靠流的发送与关闭交换可继续在内部完成。`anl_readable` 返回可读数据、流末尾或错误的句柄，返回总数，即使 out 容量不足也报告完整数量。
 
 关闭规则：
 
-- CLOSE body 为 `final_sn(u16) flags(u8) una(u16) [open(5)]`，基础长度 5 字节。非 RST 的 una 同累计 ACK 处理；RST 的 una 忽略。
-- 可靠流 final_sn 包含已提交但未发送的分片；关闭后继续发送、重传。收到对端 CLOSE、本端发送队列与在途缓存均空、且 `rcv_nxt >= peer_final_sn` 时结束。不支持半关闭。
-- 半可靠流 close 是中止，丢弃待发与在途数据；交换 CLOSE 后不再等所有帧到齐。
-- 每个非 RST CLOSE 都回应一次；CLOSE 从 RTO 开始按 ×1.5 退避，重发计入 dead_link。已 closed 时也先发待发送的最后 ACK/CLOSE 应答，再从 sid 表摘除。
+- CLOSE body 为 `final_sn(u24) flags(u8) una(u24) [open(5)]`，基础长度 7 字节。非 RST 的 una 同累计 ACK 处理；RST 的 una 忽略。
+- 每个方向各自结束：本端发出的 STREAM_CLOSE 是本端方向的 **FIN**（带 final_sn），对方回带 **ACKFIN** 的 STREAM_CLOSE 确认。可靠流 final_sn 包含已提交但未发送的分片；`anl_stream_close` 与 `anl_stream_shutdown`（仅可靠流）都使本端进入 closing，拒绝新的发送，继续发送、重传已提交的数据。
+- **全关闭**：`anl_stream_close` 的 FIN 表示本端不再读；对端收到后自动关闭自己的方向（发送返回 `ANL_ECLOSED`，已提交的数据仍送达、本端丢弃），回应里带上自己的 FIN 与 ACKFIN。
+- **半关闭**：`anl_stream_shutdown` 的 FIN 带 **HALF**，语义同 TCP `shutdown(SHUT_WR)`：对端读到流末尾（`ANL_ECLOSED`），但流保持 open、可以继续发送，回一个只带 ACKFIN 的 STREAM_CLOSE（NOFIN）；本端在 closing 中继续接收。半关闭后应用再 close 时，若对端尚未结束它的方向，FIN 改为全关闭重发一次，对端随即停止发送。
+- 可靠流结束条件：本端已关闭、已收到对端的 FIN、本端发送队列与在途缓存均空、`rcv_nxt >= peer_final_sn`；对端的 FIN 是半关闭时，还要本端的 FIN 已被确认（ACKFIN）。
+- 半可靠流 close 是中止，丢弃待发与在途数据；交换 CLOSE 后不再等所有帧到齐；不支持 shutdown（`ANL_EMODE`）。
+- 对端每个 FIN 都回应一次；FIN 从 RTO 开始按 ×1.5 退避，直到收到 ACKFIN，重发计入 dead_link。已 closed 时也先发待发送的最后 ACK/CLOSE 应答，再从 sid 表摘除。
 - 未知 sid 的 ACK/FWD 静默丢弃；未知 sid 的不带 OPEN 的 DATA/CLOSE 回 RST。已用 sid 上再次带 OPEN 不重建流，回 RST。对 RST 不回应，防止循环。
 - 模式不一致、可靠流收到 FWD 或带帧号的 DATA 等违规，以 RST 终止该流。句柄仍按应用所有权释放。
 
-流表使用按需分配的两级页表（64 × 128）及流链表；已用 sid 位图为 8192 位。控制发送维护独立待发链表；定时 flush 仍遍历活跃流。sid 不复用，因此没有 TIME_WAIT 或流代际字段。
+流表是按 sid 的哈希链表（流多于链数时链数加倍）加一条所有流的链表。控制发送维护独立待发链表；定时 flush 仍遍历活跃流。sid 不复用，因此没有 TIME_WAIT 或流代际字段。
+
+**已用 sid：下限 + 窗口**。每端按自己的奇偶顺序递增地打开 sid，对端的第 i 个 sid 是 `first + 2i`。连接记录对端序列的下限（低于它的全部见过）和下限之上 `SID_WIN`（8192）个位置的环形位图（1 KB）；见过的置位，下限越过连续置位的前缀。收到对端奇偶的未知 sid 带流参数：低于下限或已置位视为用过，回 RST；在窗口内建新流；超出窗口则静默忽略，打开方会继续通告，下限推进后再接收。收到本端奇偶的未知 sid 回 RST。打开方对称地记录对端已收到过哪些本端 sid，新 sid 与其中最老的尚未被收到的相距达到 `SID_WIN` 时 `anl_stream_open` 返回 `ANL_EBUSY`。
 
 ### 6.2 每流状态
 
-各流独立保存 `snd_queue / snd_buf / rcv_buf / rcv_queue`、`snd_una / snd_nxt / rcv_nxt / rmt_wnd`，以及打开/关闭状态、ACK/FWD 计时、帧号与依赖状态、FEC 编解码缓存和时延测量。首次发送才分配 sn；内存中序号为 32 位，线上 sn/una 为 16 位。
+各流独立保存 `snd_queue / snd_buf / rcv_buf / rcv_queue`、`snd_una / snd_nxt / rcv_nxt / rmt_wnd`，以及打开/关闭状态、ACK/FWD 计时、帧号与依赖状态、FEC 编解码缓存和时延测量。首次发送才分配 sn；内存中序号为 32 位，线上 sn/una 为 24 位。
 
 分片保存最后发送时刻、RTO 与发送次数、RACK 标记及交付采样快照；接收乱序分片保存 SACK 重复次数。各流序号空间独立，连接共享 RTT、RTO、RACK 送达证据、BBR 与 pacing。
 
@@ -371,13 +377,15 @@ rto    = srtt + max(interval, 4 × rttval, srtt / 4)
 
 RTO 限制在 30..60000 ms；分片超时后按 ×1.5 退避。每个输入数据报最多取一个 RTT 样本，来自 FRESH ACK 中最新的 ts_echo；负值与超过 60 s 的样本忽略。
 
-新数据受连接 cwnd、每流 `min(snd_wnd, rmt_wnd)` 与 pacing 共同约束。cwnd 限制新分片进入 snd_buf，重传不受 cwnd 预算限制，仍受 pacing 限速。FEC 校验段不进入待确认 inflight，但占本次 flush 的新数据预算。cwnd 上限 8192，普通初始值 16，`start_rate` 可扩大初始窗口。
+新数据受连接 cwnd、每流 `min(snd_wnd, rmt_wnd)` 与 pacing 共同约束。cwnd 限制新分片进入 snd_buf，重传不受 cwnd 预算限制，仍受 pacing 限速。FEC 校验段不进入待确认 inflight，但占本次 flush 的新数据预算。cwnd 上限 `ANL_MAX_WND`（32768），普通初始值 16，`start_rate` 可扩大初始窗口。
 
 **RACK**：连接保存所有流 FRESH ACK 的最新发送时刻；每流另保存最新送达序号。比未确认分片晚发的数据已送达、且等待时间达到 `rack_rtt + reo_wnd` 时，标记丢失并重传。同一毫秒发送的分片用本流序号区分。`anl_check` 把 RACK 判定时刻纳入定时器。
 
 乱序窗口基准为 `min_rtt / 16`，至少 1 ms、至多 srtt。可靠流按 Eifel 检测到的伪 RACK 重传扩展系数，每个 RTT 最多一次，连续干净轮次后逐步缩小；半可靠流保持最小窗口。ACK 回显早于最后重传时刻说明确认来自原包，不能把这次重传当作已证实丢失。RTO 的伪重传不扩大乱序窗口。半可靠主动丢帧本身不等同于拥塞丢包。
 
-**接收缓冲上限**：`rcv_limit_bytes` 默认 16 MiB，统计各流 rcv_buf/rcv_queue 的载荷占用；到达上限时通告零窗口，降到 3/4 以下恢复。它不是包含流结构、FEC 缓存及分配器开销的进程内存硬上限。
+**大窗口的开销**：每个 ACK 的处理开销不随在途分片数增长。每个分片除 snd_buf（sn 顺序）外还挂在一条按最近发送时间排序的链表上，RACK 沿它遍历，遇到第一个发送时间晚于对端已收到的最新数据报的分片即停止；每流维护"已判丢失、尚未重传"的计数，在途量不必逐个统计；每流记录最早 RTO 到期时间的下界，无丢失也无到期时不遍历重传；接收端把 rcv_buf 另按连续区间组织，SACK 区间、重复报告计数与新分片的插入都在区间上完成，开销随空洞数增长。`bench/wndcost.c` 可测量不同窗口、BDP 与丢包下每个分片的 CPU 开销。
+
+**接收缓冲上限**：`rcv_limit_bytes` 默认 16 MiB，统计各流 rcv_buf/rcv_queue 的载荷占用；到达上限时，应用积压（rcv_queue）达到 64 个分片的流通告零窗口，被及时读取的流照常通告；降到 3/4 以下恢复。因此超限后内存仍可增长到"各被读取流的在途量 + 各积压流 64 个分片"，是软上限；它也不是包含流结构、FEC 缓存及分配器开销的进程内存硬上限，服务端应结合 `max_peer_streams` 与流窗口设置控制内存。
 
 ### 6.4 flush 调度顺序
 
@@ -549,8 +557,7 @@ target_rate 为全部流合计的可用载荷字节/秒，每 200 ms 更新。�
 - 跳过之后，ACK 中的 una 前移，含义为“接收方不再需要该 sn 之前的数据”，不能把整个前缀都作为成功交付来增加拥塞控制的 delivered。每次本地期限跳过记录目标帧首片的完整 32 位 sn，作为 `RCV_SKIP.retired_una`；该点之后真正收到的连续分片仍由普通 ACK 确认。
 - 有跳过记录时，每个 ACK 段之前附加 **8 字节** RCV_SKIP，标记与该 ACK 必须在同一数据报中，拆分 SACK 时每段都带。后续 ACK 重复这个标记，避免首次跳过 ACK 丢失后，后来的累计确认又把缺失分片算成交付。未发生本地跳过的 ACK 不增加此开销。
 - 发送端只接受半可靠流上 `snd_una < retired_una ≤ snd_nxt` 的标记（按 32 位序号差比较），先回收该前缀、减少在途与积压并释放发送窗口，不产生交付速率样本；随后处理同报文的 ACK。已经被 SACK 确认的数据不重复处理；重复、过旧或越过已发送范围的标记不再释放数据。前缀中可能有已收到但 SACK 丢失的分片，这部分未确认交付保守地不记账。
-- 当 `rcv_nxt - retired_una ≥ ANL_MAX_WND`（8192）时可停止重复：发送端若仍保留该前缀，就不能发送超过最大窗口的新序号；接收进展到这里证明前缀已被确认或由发送端自行放弃。用完整 32 位标记避免重复标记跨过 16 位半周时的展开歧义。FWD 引发的跳过不创建本地标记，因为发送方已经回收了它放弃的前缀。
-- CTRL 的长度编码允许旧端跳过未知的 0x05，不改变现有 DATA/ACK 格式或版本；旧发送端仍有原有的交付记账缺陷，**修复记账要求双方升级**。混用版本不能声称具备此修复。
+- 当 `rcv_nxt - retired_una ≥ ANL_MAX_WND`（32768）时可停止重复：发送端若仍保留该前缀，就不能发送超过最大窗口的新序号；接收进展到这里证明前缀已被确认或由发送端自行放弃。用完整 32 位标记避免重复标记跨过 24 位半周时的展开歧义。FWD 引发的跳过不创建本地标记，因为发送方已经回收了它放弃的前缀。
 - 本地期限从后续数据揭示缺口时计时，按 update/flush 周期检查；不是从发送端生成帧的绝对时间计时，也无法在没有后续帧时推断丢失帧的年龄。
 
 **`anl_stream_recv_frame` 返回的 `anl_frame_info`**：
@@ -615,10 +622,10 @@ flags/frg(u8) | [frg_ext(varint)] | [frame(u16)] | plen(u16) | payload
 不含 sid、sn 或 OPEN body；短数据补零至最长规范长度 Lmax。校验包 j 为各规范编码的有限域线性组合。
 
 ```
-sid_hdr : 2 字节，type=CTRL | rsv=0 | sid
+sid_hdr : 2 或 4 字节，type=CTRL
 subtype : u8 = 0x01
-len     : varint = 5 + Lmax
-base    : u16，块首 sn
+len     : varint = 6 + Lmax
+base    : u24，块首 sn
 k       : u8，1..64
 m       : u8，1..16
 j       : u8，0..m-1
@@ -645,7 +652,7 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 
 ### 8.6 RTT 条件、冗余预算与容量恢复
 
-预计修复时间为帧在当前 pacing 下的发送时间 +1.5×srtt +RACK 乱序窗口 +interval；普通帧大小以非关键帧平均长度估算。默认 fec_deadline_ms=0 时半可靠流采用 max_age_ms/2；无限寿命且未给独立期限时没有此目标。
+预计修复时间为帧在当前 pacing 下的发送时间 +1.5×srtt +RACK 乱序窗口 +interval；普通帧大小以非关键帧平均长度估算。RTT-auto 的大帧（> 256 字节）另估计重复丢失风险：设 `n = ceil(帧长度 / 流 MSS)`、`p` 为已测连接丢失率，`n × p²` 超过校验下限的失败目标（普通流 1%，drop_until_key 流 0.1%）时，再加 `srtt + RACK 乱序窗口 + interval`，为第二次重传留一轮时间。它只覆盖第一次重复丢失，不保证任意多次或相关突发丢失的尾部概率；音频小帧与显式 FEC 模式只算一次修复。默认 fec_deadline_ms=0 时半可靠流采用 max_age_ms/2；无限寿命且未给独立期限时没有此目标。
 
 **门槛**：大帧在 repair>deadline、连接已测丢失≥1%、最近 30 s 有硬丢失证据时开启；repair<3/4 deadline，或至少两个估计窗后丢失<0.25% 时关闭。小帧（平均≤256 字节）按修复时间与近期硬证据开启，不因丢失估计短暂下降而关闭。硬证据来自真实重传确认、RTO 丢失、带更高 sn 送达证据的过期放弃、对端净重建报告；单独 RACK 标记或晚确认不算。
 
@@ -655,7 +662,7 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 
 **伪重建**：接收端记录最近 16 次重建及所用校验时间。原始包随后到达且发送时刻不晚于校验包时，视为乱序造成的伪重建。REPORT 扣除此类重建并暂不计入最近 200 ms 的重建；发送端净计数回退按零增量处理。统计 fec_recovered 仍记录实际执行的重建次数，不等于真实丢包数。
 
-**冗余预算**：每 200 ms 估算 `0.9×有效带宽 − 其余发送速率`，按 1/8 平滑。桶容量为 max(半秒预算, 8×mss)。自适应大块超出约 10% 基础比例的校验包消耗预算；关键帧可透支一个桶，非关键帧大块另受约 30% 包比例限制（按整包向上取整）。小块不受该预算限制，但仍受连接 pacing。预算不足时大帧不继续提高名义比例。固定比例不受自适应门槛、此预算或容量不足的禁生成规则限制。
+**冗余预算**：每 200 ms 估算 `0.9×有效带宽 − 其余发送速率`，按 1/8 平滑。桶容量为 max(半秒预算, 8×mss)。自适应大块超出约 10% 基础比例的校验包消耗预算；关键帧可透支一个桶，非关键帧大块另受约 30% 包比例限制（按整包向上取整）。小块不受该预算限制，但仍受连接 pacing。RTT-auto 流在最近 15 s（`RATE_RTT_WIN`）内观察到排队（`srtt − rmin > max(rmin/4, 25 ms)`）时，每个大块的校验包另不超过 `预算速率 × 100 ms` 的量，避免把积累的预算集中成一个突发塞进链路队列、挡住后到的高优先级音频；约 10% 的基础比例不受此限制。预算不足时大帧不继续提高名义比例。固定比例不受自适应门槛、此预算或容量不足的禁生成规则限制。
 
 **容量不足 capacity_short**：平滑交付载荷低于发送载荷的一半，或反复出现发送前过期字节，连续 3 个控制步进入；前 1 s 不判断。未发送过期的进入条件还要求两次事件相隔至少 1 s、位于 6 s 内，且平滑过期量超过提供载荷的 1/16，避免一次积压清理被视为持续不足。
 
@@ -692,7 +699,7 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 | 收包与时钟 | anl_input、anl_input_plain、anl_update、anl_check、anl_flush |
 | 密钥与分发 | anl_keys_derive、anl_peek_conv |
 | 默认流 | anl_send、anl_recv、anl_peeksize、anl_waitsnd、anl_default_stream |
-| 流创建与释放 | anl_stream_open、anl_stream_close、anl_readable |
+| 流创建与释放 | anl_stream_open、anl_stream_close、anl_stream_shutdown、anl_readable |
 | 可靠消息/字节流 | anl_stream_send、anl_stream_recv |
 | 半可靠帧 | anl_stream_send_frame、anl_stream_recv_frame |
 | 流查询 | anl_stream_peeksize、anl_stream_waitsnd、anl_stream_id、anl_stream_tag、anl_stream_conn |
@@ -707,12 +714,12 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 | dead_link / ts_window_ms | 20 / 1000 ms |
 | keepalive_ms / idle_timeout_ms | 0 / 服务端 30000 ms，客户端 0 |
 | pace_rate / pace_burst / start_rate | 0 / 0（实际桶为 4×mtu）/ 0 |
-| rcv_limit_bytes / max_peer_streams | 16 MiB / 1024 |
-| default_snd_wnd / default_rcv_wnd | 1200 / 1200 |
+| rcv_limit_bytes / max_peer_streams | 16 MiB / 4096 |
+| default_snd_wnd / default_rcv_wnd | 4096 / 4096 |
 
 | 流配置 | 可靠流默认 | 半可靠流默认 |
 |---|---|---|
-| snd_wnd / rcv_wnd | 32 / 128 | 512 / 512 |
+| snd_wnd / rcv_wnd | 4096 / 4096 | 512 / 512 |
 | prio / tag / stream | 2 / 0 / 0（消息） | 2 / 0 / 0 |
 | flush_on_send | 0 | 1 |
 | fec / fec_ratio / fec_deadline_ms | 0 / 25 / 0 | ANL_FEC_RTT_AUTO / 25 / 0（采用 max_age/2） |

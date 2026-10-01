@@ -48,7 +48,7 @@ typedef struct net {
     int queue_limit;                /* max queued packets at the bottleneck */
     uint32_t link_free_at[2];
     int link_queued[2];
-    pkt *queue;
+    pkt *queue, *qtail;             /* by delivery time; most arrive at the tail */
     uint32_t now;
     long sent, lost, delivered;
     uint64_t wire_bytes[2];         /* datagram bytes plus IPv4/UDP overhead, by sender */
@@ -63,8 +63,10 @@ static void net_enqueue(net *n, int to, const char *data, int len, uint32_t at)
 {
     pkt *p = (pkt *)malloc(sizeof(pkt)), **pp;
     p->deliver_at = at; p->to = to; p->len = len; memcpy(p->data, data, (size_t)len);
+    if (n->queue && (int32_t)(n->qtail->deliver_at - at) <= 0) { p->next = NULL; n->qtail->next = p; n->qtail = p; return; }
     for (pp = &n->queue; *pp && (int32_t)((*pp)->deliver_at - at) <= 0; pp = &(*pp)->next) ;
     p->next = *pp; *pp = p;
+    if (p->next == NULL) n->qtail = p;
 }
 
 static int net_output(const char *buf, int len, anl_t *w, void *user)
@@ -108,6 +110,7 @@ static void net_deliver(net *n)
     while (n->queue && (int32_t)(n->queue->deliver_at - n->now) <= 0) {
         pkt *p = n->queue;
         n->queue = p->next;
+        if (n->queue == NULL) n->qtail = NULL;
         n->delivered++;
         anl_input(n->ep[p->to], p->data, p->len);
         free(p);
@@ -141,7 +144,8 @@ static void net_init(net *n, anl_config *ca, anl_config *cb)
 
 /* accept callback shared by all tests: records the handle per side and sid and
  * applies the local options the test wants on the accepting side */
-static anl_stream_t *g_peer[2][ANL_MAX_STREAMS];
+#define G_PEER_SIDS (1 << 15)              /* sids the tests index g_peer by */
+static anl_stream_t *g_peer[2][G_PEER_SIDS];
 static const anl_stream_opt *g_peer_opt[2];
 static int g_acc[2], g_acc_reject_mod, g_acc_rcv_wnd;
 
@@ -156,7 +160,7 @@ static int acc_cb(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user)
         opt->mode = keep.mode; opt->stream = keep.stream; opt->tag = keep.tag;
     }
     if (g_acc_rcv_wnd) opt->rcv_wnd = g_acc_rcv_wnd;
-    g_peer[side][sid] = s;
+    if (sid < G_PEER_SIDS) g_peer[side][sid] = s;
     g_acc[side]++;
     return 0;
 }
@@ -387,8 +391,8 @@ static void test_default_stream(void)
     anl_stream_get_stats(anl_default_stream(n.ep[0]), &ss);
     CHECK(ss.state == ANL_STREAM_OPEN && ss.rmt_wnd <= 700, "A heard B, B's window is 700 (%d, %u)", ss.state, ss.rmt_wnd);
     anl_stream_get_stats(anl_default_stream(n.ep[1]), &ss);
-    CHECK(ss.state == ANL_STREAM_OPEN && ss.rmt_wnd <= 1200 && ss.rmt_wnd > 700, "B heard A, A's window is 1200 (%d, %u)", ss.state, ss.rmt_wnd);
-    CHECK(n.ep[1]->dflt->rcv_wnd == 700 && n.ep[0]->dflt->rcv_wnd == 1200, "windows from config");
+    CHECK(ss.state == ANL_STREAM_OPEN && ss.rmt_wnd <= 4096 && ss.rmt_wnd > 700, "B heard A, A's window is the default 4096 (%d, %u)", ss.state, ss.rmt_wnd);
+    CHECK(n.ep[1]->dflt->rcv_wnd == 700 && n.ep[0]->dflt->rcv_wnd == 4096, "windows from config");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  %d bytes each way in %d ms with 5%% loss\n", total, i);
     net_stop(&n);
@@ -592,9 +596,9 @@ static void test_violation(void)
     anl_stream_opt_default(&o, ANL_RELIABLE);
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
-    q = enc32(q, 0x11223344); q = enc8(q, 0); q = enc32(q, n.now);
+    q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc32(q, n.now);
     q = enc_sid(q, SEG_FWD, anl_stream_id(b));
-    q = enc16(q, 5);
+    q = enc24(q, 5);
     r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
     CHECK(r == ANL_OK, "input (%d)", r);
     CHECK(stream_state(b) == ANL_STREAM_CLOSED, "B stream reset (%d)", stream_state(b));
@@ -1006,17 +1010,19 @@ static void test_sid_once(void)
     r = anl_input(n.ep[1], old, oldlen);
     CHECK(r == ANL_ESTALE, "old datagram now outside the ts window (%d)", r);
 
-    /* sid wire format: type(2) | reserved(1) | sid(13); a set reserved bit drops the datagram */
+    /* sid wire format: type(2) | X(1) | sid(13) [sid_hi(16)]; X with a zero extension is not
+       the one encoding of a small sid and drops the datagram */
     {
         char pl[32], *q = pl;
         q = enc32(q, 0x11223344);
-        q = enc8(q, 0);
+        q = enc8(q, ANL_VERSION << 6);
         q = enc32(q, n.now);
-        q = enc8(q, (uint8_t)((SEG_FWD << 6) | SID_RSV | ((sid >> 8) & SID_HI_MASK)));
+        q = enc8(q, (uint8_t)((SEG_FWD << 6) | SID_X | ((sid >> 8) & SID_HI_MASK)));
         q = enc8(q, (uint8_t)sid);
         q = enc16(q, 0);
+        q = enc24(q, 0);
         r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
-        CHECK(r == ANL_EFORMAT, "reserved sid bit rejected (%d)", r);
+        CHECK(r == ANL_EFORMAT, "non-canonical sid extension rejected (%d)", r);
     }
     net_stop(&n);
 }
@@ -1053,6 +1059,61 @@ static void test_handle_lifetime(void)
     }
     CHECK(stream_count(n.ep[0], NULL) == 2, "new stream next to the old handle (%d)", stream_count(n.ep[0], NULL));
     CHECK(anl_stream_close(g_peer[0][43]) == 0 && anl_stream_close(a) == 0 && stream_count(n.ep[0], NULL) <= 1, "close both");
+    net_stop(&n);
+}
+
+/* The wire-v1 sequence wrap must preserve real messages, parity recovery and
+ * FIN ordering, including on a sid that uses the two-byte extension. Seed the
+ * empty endpoints near the boundary instead of sending 16 million segments. */
+static void test_wire_v1_wrap(int semi)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    char buf[4000];
+    uint32_t start = 0xfffff8u;
+    int i, r, sent = 0, got = 0, eof = 0;
+    printf("[wire v1: extended sid, 24-bit sequence wrap, %s]\n", semi ? "FEC frames" : "reliable FIN");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 25;
+    net_start(&n, &ca, &cb);
+    n.ep[0]->next_sid = 8192;
+    anl_stream_opt_default(&o, semi ? ANL_SEMI : ANL_RELIABLE);
+    o.fec = semi; o.fec_ratio = 100;
+    if (semi) { o.max_age_ms = 5000; o.rcv_deadline_ms = 0; }
+    a = open_pair(&n, 0, &o, &o, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 200; i++) net_tick(&n);
+    a->snd_una = a->snd_nxt = b->rcv_nxt = start;
+    /* One known initial data loss exercises parity, then ordinary 10% loss
+       also exercises ACK/FIN retries without changing the loss ceiling. */
+    n.drop_at[0] = (uint32_t)n.sent + 1;
+    n.loss_pct = 10;
+    for (i = 0; i < 10000 && (got < 32 || (!semi && !eof)); i++) {
+        if (sent < 32 && i % 20 == 0) {
+            fill_pattern(buf, sizeof(buf), (uint32_t)sent);
+            r = semi ? anl_stream_send_frame(a, 0, buf, sizeof(buf), NULL) :
+                       anl_stream_send(a, buf, sizeof(buf));
+            CHECK(r == 0, "enqueue message %d (%d)", sent, r);
+            sent++;
+            if (!semi && sent == 32) CHECK(anl_stream_shutdown(a) == 0, "FIN after all messages");
+        }
+        net_tick(&n);
+        while ((r = semi ? anl_stream_recv_frame(b, buf, sizeof(buf), &fi) :
+                           anl_stream_recv(b, buf, sizeof(buf))) > 0) {
+            CHECK(r == (int)sizeof(buf) && check_pattern(buf, r, (uint32_t)got),
+                  "message %d intact and in order across the wrap (%d)", got, r);
+            if (semi) CHECK(fi.frame_no == (uint32_t)got && fi.lost_before == 0,
+                            "frame numbering across sequence wrap");
+            got++;
+        }
+        if (r == ANL_ECLOSED) eof = 1;
+    }
+    CHECK(sent == 32 && got == 32, "all messages delivered across wrap (%d/%d)", got, sent);
+    CHECK(a->snd_nxt > 0x1000000u && b->rcv_nxt > 0x1000000u, "both crossed 24-bit boundary");
+    if (semi) CHECK(b->fec_recovered > 0, "parity actually repaired lost data (%u)", b->fec_recovered);
+    else CHECK(eof && anl_stream_send(a, "x", 1) == ANL_ECLOSED, "FIN follows the payload");
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     net_stop(&n);
 }
 
@@ -1097,15 +1158,147 @@ static void test_accept_limits(void)
     net_stop(&n);
 }
 
+/* half-close (DESIGN 6.1): a proxy's request / response. The client shuts its
+ * direction down after the request; the server reads end of stream, still
+ * sends the response, then closes. Then: shut down, the peer keeps sending,
+ * and a full close of the handle stops it. */
+static void test_half_close(int loss)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    static char buf[70000], got[70000];
+    int i, r, ngot = 0, eof_b = 0, eof_a = 0, nsent = 0, err;
+    printf("[half-close: request, shutdown, response, %d%% loss]\n", loss);
+    net_init(&n, &ca, &cb);
+    n.loss_pct = loss;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.stream = 1;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    fill_pattern(buf, 3000, 5);
+    CHECK(anl_stream_send(a, buf, 3000) == 0, "request");
+    CHECK(anl_stream_shutdown(a) == 0, "shutdown");
+    CHECK(anl_stream_send(a, buf, 10) == ANL_ECLOSED, "no sending after shutdown");
+    CHECK(anl_stream_shutdown(anl_default_stream(n.ep[0])) == ANL_EINVAL, "not on the default stream");
+    for (i = 0; i < 20000 && !eof_b; i++) {
+        net_tick(&n);
+        while ((r = anl_stream_recv(b, got + ngot, (int)sizeof(got) - ngot)) > 0) ngot += r;
+        if (r == ANL_ECLOSED) eof_b = 1;
+    }
+    CHECK(eof_b && ngot == 3000 && check_pattern(got, ngot, 5), "server read the request, then end of stream (%d, %d)", ngot, eof_b);
+    CHECK(stream_state(b) == ANL_STREAM_OPEN && stream_state(a) == ANL_STREAM_CLOSING, "server still open, client closing (%d / %d)",
+          stream_state(b), stream_state(a));
+    fill_pattern(buf, 60000, 6);
+    CHECK(anl_stream_send(b, buf, 60000) == 0, "response after the peer's shutdown");
+    CHECK(anl_stream_close(b) == 0, "server closes");
+    ngot = 0;
+    for (i = 0; i < 30000 && !eof_a; i++) {
+        net_tick(&n);
+        while ((r = anl_stream_recv(a, got + ngot, (int)sizeof(got) - ngot)) > 0) ngot += r;
+        if (r == ANL_ECLOSED) eof_a = 1;
+    }
+    CHECK(eof_a && ngot == 60000 && check_pattern(got, ngot, 6), "client read the whole response, then end (%d, %d)", ngot, eof_a);
+    CHECK(anl_stream_close(a) == 0, "client releases");
+    for (i = 0; i < 20000 && (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)); i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both freed (%d / %d)",
+          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
+
+    /* shutdown, then the handle is closed while the peer still sends */
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    CHECK(anl_stream_shutdown(a) == 0, "shutdown");
+    for (i = 0; i < 2000; i++) {
+        net_tick(&n);
+        if (anl_stream_waitsnd(b) < 64 && anl_stream_send(b, buf, 4000) == 0) nsent++;
+        while (anl_stream_recv(a, got, sizeof(got)) > 0) ;
+    }
+    CHECK(stream_state(b) == ANL_STREAM_OPEN && nsent > 10, "the peer goes on sending after our shutdown (%d)", nsent);
+    CHECK(anl_stream_close(a) == 0, "close after shutdown");
+    for (i = 0, err = 0; i < 20000 && err != ANL_ECLOSED; i++) {
+        net_tick(&n);
+        err = anl_stream_send(b, buf, 100);
+    }
+    CHECK(err == ANL_ECLOSED, "the full close stops the peer's sending (%d after %d ms)", err, i);
+    CHECK(anl_stream_close(b) == 0, "server releases");
+    for (i = 0; i < 30000 && (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)); i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both freed (%d / %d)",
+          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+
+    /* both sides shut down at once, each after one message: both read it and end of stream */
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    CHECK(anl_stream_send(a, "ping", 4) == 0 && anl_stream_send(b, "pong", 4) == 0, "one message each way");
+    CHECK(anl_stream_shutdown(a) == 0 && anl_stream_shutdown(b) == 0, "simultaneous shutdown");
+    eof_a = eof_b = 0;
+    for (i = 0; i < 20000 && !(eof_a && eof_b); i++) {
+        net_tick(&n);
+        if (!eof_a && (r = anl_stream_recv(a, got, sizeof(got))) != ANL_EAGAIN) { if (r == 4) CHECK(memcmp(got, "pong", 4) == 0, "pong"); else eof_a = r == ANL_ECLOSED; }
+        if (!eof_b && (r = anl_stream_recv(b, got, sizeof(got))) != ANL_EAGAIN) { if (r == 4) CHECK(memcmp(got, "ping", 4) == 0, "ping"); else eof_b = r == ANL_ECLOSED; }
+    }
+    for (i = 0; i < 20000 && (stream_state(a) != ANL_STREAM_CLOSED || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    CHECK(eof_a && eof_b && stream_state(a) == ANL_STREAM_CLOSED && stream_state(b) == ANL_STREAM_CLOSED,
+          "both read end of stream, both closed (%d %d / %d %d)", eof_a, eof_b, stream_state(a), stream_state(b));
+    anl_stream_close(a);
+    anl_stream_close(b);
+    for (i = 0; i < 2000 && (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)); i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both freed");
+    {
+        anl_stream_opt so;
+        anl_stream_t *x;
+        anl_stream_opt_default(&so, ANL_SEMI);
+        x = anl_stream_open(n.ep[0], &so, NULL);
+        CHECK(x && anl_stream_shutdown(x) == ANL_EMODE, "no half-close on a semi-reliable stream");
+        if (x) anl_stream_close(x);
+    }
+    net_stop(&n);
+}
+
+/* connection receive cap (rcv_limit_bytes) with large windows: streams whose
+ * application does not read hold their whole window; a stream that is read
+ * must keep moving (DESIGN 6.1) */
+static void test_rcv_limit_fair(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *s[5], *r[5];
+    static char buf[65536];
+    uint64_t got_before = 0, got_after = 0;
+    int i, k, rr;
+    printf("[receive cap: 4 unread streams fill it, the read one keeps going]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 25;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.stream = 1;
+    for (k = 0; k < 5; k++) { s[k] = open_pair(&n, 0, &o, NULL, &r[k]); if (!r[k]) { net_stop(&n); return; } }
+    memset(buf, 7, sizeof(buf));
+    for (i = 0; i < 20000; i++) {
+        net_tick(&n);
+        for (k = 0; k < 5; k++)
+            while (anl_stream_waitsnd(s[k]) < 2000 && anl_stream_send(s[k], buf, 16384) == 0) ;
+        while ((rr = anl_stream_recv(r[4], buf, sizeof(buf))) > 0) {
+            if (i < 10000) got_before += (uint64_t)rr; else got_after += (uint64_t)rr;
+        }
+    }
+    printf("  read stream: %.1f MB in the first 10 s, %.1f MB in the next 10 s; held %u bytes (cap %d)\n",
+           got_before / 1e6, got_after / 1e6, n.ep[1]->rcv_bytes, cb.rcv_limit_bytes);
+    CHECK(got_after > 10000000, "the read stream is not stalled by the unread ones (%.1f MB)", got_after / 1e6);
+    CHECK(n.ep[1]->rcv_bytes <= 5u * r[0]->rcv_wnd * r[0]->mss, "memory bounded by the windows (%u)", n.ep[1]->rcv_bytes);
+    net_stop(&n);
+}
+
+/* SID_WIN: each side may run SID_WIN opens ahead of what the peer has heard of
+ * (DESIGN 6.1); max_peer_streams bounds what is open at once */
 static void test_max_streams(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
-    static anl_stream_t *list[ANL_MAX_STREAMS];
-    static anl_stream_t *mine[2][ANL_MAX_STREAMS / 2];
-    static unsigned char seen[ANL_MAX_STREAMS];
+    static anl_stream_t *list[2 * SID_WIN];
+    static anl_stream_t *mine[2][SID_WIN + 1];
+    static unsigned char seen[2 * SID_WIN + 8];
     char buf[64];
     int side, i, r, k, nread = 0, iter, err, nopen[2] = { 0, 0 };
-    printf("[max streams: %d incl. the default stream, both sides open]\n", ANL_MAX_STREAMS);
+    printf("[max streams: %d unheard opens per side, %d open at once]\n", SID_WIN, ANL_MAX_STREAMS);
     net_init(&n, &ca, &cb);
     ca.max_peer_streams = cb.max_peer_streams = ANL_MAX_STREAMS;
     net_start(&n, &ca, &cb);
@@ -1114,33 +1307,45 @@ static void test_max_streams(void)
     for (side = 0; side < 2; side++) {
         for (;;) {
             anl_stream_t *s = anl_stream_open(n.ep[side], &o, &err);
-            if (s == NULL) { CHECK(err == ANL_EBUSY, "no free sid left on side %d (%d)", side, err); break; }
+            if (s == NULL) { CHECK(err == ANL_EBUSY, "the peer has heard of none yet on side %d (%d)", side, err); break; }
             mine[side][nopen[side]++] = s;
             snprintf(buf, sizeof(buf), "s%d", anl_stream_id(s));
             anl_stream_send(s, buf, (int)strlen(buf) + 1);
         }
     }
-    CHECK(nopen[0] + nopen[1] + 1 == ANL_MAX_STREAMS, "client %d + server %d + default = %d", nopen[0], nopen[1], ANL_MAX_STREAMS);
+    CHECK(nopen[0] == SID_WIN && nopen[1] == SID_WIN, "client %d / server %d opens before EBUSY", nopen[0], nopen[1]);
     memset(seen, 0, sizeof(seen));
-    for (iter = 0; iter < 60000 && nread < ANL_MAX_STREAMS - 1; iter++) {
+    for (iter = 0; iter < 60000 && nread < 2 * SID_WIN; iter++) {
         net_tick(&n);
         for (side = 0; side < 2; side++) {
-            int cnt = anl_readable(n.ep[side], list, ANL_MAX_STREAMS);
+            int cnt = anl_readable(n.ep[side], list, 2 * SID_WIN);
             for (k = 0; k < cnt; k++) {
                 int sid = anl_stream_id(list[k]);
                 r = anl_stream_recv(list[k], buf, sizeof(buf));
                 snprintf(buf + 32, 32, "s%d", sid);
-                CHECK(r > 0 && strcmp(buf, buf + 32) == 0 && sid % 2 != side && !seen[sid], "message on sid %d", sid);
-                seen[sid] = 1;
+                CHECK(r > 0 && strcmp(buf, buf + 32) == 0 && sid % 2 != side && sid < (int)sizeof(seen) && !seen[sid],
+                      "message on sid %d", sid);
+                if (sid < (int)sizeof(seen)) seen[sid] = 1;
                 nread++;
             }
         }
     }
-    CHECK(nread == ANL_MAX_STREAMS - 1, "one message on each stream (%d)", nread);
+    CHECK(nread == 2 * SID_WIN, "one message on each stream (%d)", nread);
     printf("  all %d streams carried data after %d ms\n", nread, iter);
+    CHECK(n.ep[0]->own_floor == SID_WIN && n.ep[1]->own_floor == SID_WIN && n.ep[0]->peer_floor == SID_WIN,
+          "every sid heard of (%u / %u / %u)", n.ep[0]->own_floor, n.ep[1]->own_floor, n.ep[0]->peer_floor);
+    /* heard of: the next opens go through, but the peer holds ANL_MAX_STREAMS of ours already */
+    {
+        anl_stream_t *x = anl_stream_open(n.ep[0], &o, &err);
+        CHECK(x != NULL, "open after the peer heard of the others (%d)", err);
+        for (i = 0; i < 300; i++) net_tick(&n);
+        CHECK(x && stream_state(x) == ANL_STREAM_CLOSED, "refused at max_peer_streams (%d)", x ? stream_state(x) : -1);
+        if (x) anl_stream_close(x);
+    }
     for (side = 0; side < 2; side++)
         for (i = 0; i < nopen[side]; i++) {
-            anl_stream_close(g_peer[1 - side][anl_stream_id(mine[side][i])]);
+            int sid = anl_stream_id(mine[side][i]);
+            if (sid < G_PEER_SIDS) anl_stream_close(g_peer[1 - side][sid]);
             anl_stream_close(mine[side][i]);
         }
     for (iter = 0; iter < 20000 && (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)); iter++) net_tick(&n);
@@ -1148,6 +1353,94 @@ static void test_max_streams(void)
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  closed and freed after %d more ms\n", iter);
+    net_stop(&n);
+}
+
+/* a proxy's pattern (DESIGN 6.1): streams opened, used and closed for good,
+ * far more of them than 13-bit sids, with loss. Sids above 8191 take the
+ * 2-byte extension; a stale first datagram of a finished one gets RST */
+static void test_sid_churn(int loss, int TOTAL)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    enum { BATCH = 200 };
+    static anl_stream_t *a[BATCH];
+    char buf[3000], old[2048];
+    int i, j, r, done = 0, got = 0, big = 0, oldlen = 0, open_fail = 0;
+    printf("[sid churn: %d streams opened and closed, %d%% loss]\n", TOTAL, loss);
+    net_init(&n, &ca, &cb);
+    n.loss_pct = loss;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    while (done < TOTAL) {
+        int nb = TOTAL - done < BATCH ? TOTAL - done : BATCH;
+        for (j = 0; j < nb; j++) {
+            a[j] = anl_stream_open(n.ep[0], &o, NULL);
+            if (!a[j]) { open_fail++; continue; }
+            fill_pattern(buf, 2500, (uint32_t)anl_stream_id(a[j]));
+            anl_stream_send(a[j], buf, 2500);
+            anl_stream_close(a[j]);             /* orderly: the data is still delivered */
+            if (anl_stream_id(a[j]) >= 1 << SID_LO_BITS) big++;
+            if (anl_stream_id(a[j]) == 8200) { n.cap_len = 0; }
+        }
+        for (i = 0; i < 60000; i++) {
+            int left = 0;
+            net_tick(&n);
+            if (oldlen == 0 && n.cap_len > 0 && done + nb > 4100) { memcpy(old, n.cap, (size_t)n.cap_len); oldlen = n.cap_len; }
+            {
+                anl_stream_t *list[BATCH];
+                int k, cnt = anl_readable(n.ep[1], list, BATCH);
+                for (k = 0; k < cnt && k < BATCH; k++) {
+                    r = anl_stream_recv(list[k], buf, sizeof(buf));
+                    if (r == 2500) {
+                        CHECK(check_pattern(buf, r, (uint32_t)anl_stream_id(list[k])), "data on sid %d", anl_stream_id(list[k]));
+                        got++;
+                    } else if (r == ANL_ECLOSED) {
+                        anl_stream_close(list[k]);
+                    }
+                }
+            }
+            if (stream_count(n.ep[0], &left) == 0 && stream_count(n.ep[1], NULL) == 0) break;
+        }
+        done += nb;
+    }
+    if (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)) {
+        int shown = 0;
+        const anl_node *q;
+        for (q = n.ep[0]->slist.next; q != &n.ep[0]->slist && shown < 3; q = q->next)
+            if (!STREAM_OF(q)->strict) { shown++; dump_streams("A", n.ep[0]); break; }
+        printf("    state %d/%d cwnd %u inflight %u rmt_wnd %u pace %u\n", anl_state(n.ep[0]), anl_state(n.ep[1]),
+               n.ep[0]->cwnd, n.ep[0]->inflight_segs, STREAM_OF(n.ep[0]->slist.prev)->rmt_wnd, n.ep[0]->pace_rate);
+    }
+    printf("  done after %u ms of simulated time\n", n.now - 1000);
+    CHECK(open_fail == 0, "every open succeeded (%d failed)", open_fail);
+    CHECK(got == TOTAL, "every stream delivered its data (%d / %d)", got, TOTAL);
+    CHECK(big == (TOTAL > 4095 ? TOTAL - 4095 : 0), "%d sids took the 2-byte extension", big);
+    CHECK(n.ep[1]->peer_floor == (uint32_t)TOTAL && n.ep[0]->own_floor == (uint32_t)TOTAL, "floors at %u / %u", n.ep[1]->peer_floor, n.ep[0]->own_floor);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all freed (%d / %d)",
+          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    if (oldlen > 0 && loss == 0) {
+        int acc = g_acc[1];
+        r = anl_input(n.ep[1], old, oldlen);
+        CHECK(r == ANL_OK || r == ANL_ESTALE, "stale datagram of an extended sid (%d)", r);
+        CHECK(g_acc[1] == acc, "no stream created by it (%d -> %d)", acc, g_acc[1]);
+        for (i = 0; i < 300; i++) net_tick(&n);
+        CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "still nothing on either side");
+    }
+    /* a peer sid further than SID_WIN past the oldest one not seen is ignored
+       (no RST, no stream): its opener keeps announcing it */
+    {
+        anl_stream_t *x;
+        int acc = g_acc[1];
+        n.ep[0]->next_sid += 2u * (SID_WIN + 10);
+        n.ep[0]->own_floor += SID_WIN + 10;
+        x = anl_stream_open(n.ep[0], &o, NULL);
+        CHECK(x != NULL, "open far ahead");
+        if (x) anl_stream_send(x, "far", 3);
+        for (i = 0; i < 2000; i++) net_tick(&n);
+        CHECK(g_acc[1] == acc && x && stream_state(x) == ANL_STREAM_OPENING, "ignored by the peer, still announced (%d)",
+              x ? stream_state(x) : -1);
+    }
     net_stop(&n);
 }
 
@@ -1485,8 +1778,8 @@ static int skip_ack_output(const char *wire, int len, anl_t *w, void *user)
         } else if (type == SEG_ACK) {
             uint32_t n = 0, i, v;
             CHECK(marker == g_skip_want, "each split ACK shares a datagram with its retirement marker");
-            if (end - p < 9) break;
-            p += 9;
+            if (end - p < ACK_FIX) break;
+            p += ACK_FIX;
             CHECK(dec_varint(&p, end, &n) == 0, "SACK count");
             for (i = 0; i < 2 * n; i++) CHECK(dec_varint(&p, end, &v) == 0, "SACK range");
             g_skip_acks++;
@@ -1516,12 +1809,13 @@ static void test_receiver_skip_ack_fragments(void)
         CHECK(s != NULL, "allocate received segment");
         if (!s) break;
         s->sn = 101u + (uint32_t)i * 2;
-        qadd_tail(&s->node, &st->rcv_buf); st->nrcv_buf++;
+        CHECK(rcv_link(st, s, run_find(st, s->sn)), "link received segment");
     }
     g_skip_packets = g_skip_acks = 0; g_skip_want = 1; g_skip_watermark = 50;
     anl_setoutput(w, skip_ack_output);
     write_ack_segs(w, st); dg_seal(w);
     CHECK(g_skip_acks > 1 && g_skip_packets > 1, "small MTU forced several ACK datagrams");
+    free_runs(st);
     free_rcv_list(w, &st->rcv_buf, &st->nrcv_buf);
     g_skip_watermark = st->rcv_skip_una = 0xfffffff0u;
     st->rcv_nxt = st->rcv_skip_una + ANL_MAX_WND - 1;
@@ -3358,6 +3652,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (seed) g_seed = 0x9E3779B97F4A7C15ULL * (strtoull(seed, NULL, 10) + 1);
     printf("seed %s\n", seed ? seed : "default");
+    RUN(test_sid_churn(10, 4000));
     RUN(test_kat());
     RUN(test_demux());
     RUN(test_default_stream());
@@ -3382,8 +3677,15 @@ int main(void)
     RUN(test_stream_lifecycle(10));
     RUN(test_sid_once());
     RUN(test_handle_lifetime());
+    RUN(test_wire_v1_wrap(0));
+    RUN(test_wire_v1_wrap(1));
     RUN(test_accept_limits());
+    RUN(test_rcv_limit_fair());
+    RUN(test_half_close(0));
+    RUN(test_half_close(10));
     RUN(test_max_streams());
+    RUN(test_sid_churn(0, 9000));
+    RUN(test_sid_churn(10, 9000));
     RUN(test_priority());
     RUN(test_key_sender_purge());
     RUN(test_key_receiver_discard());

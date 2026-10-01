@@ -100,6 +100,11 @@ if(ANLIU_BUILD_BENCHMARKS)
         add_executable(anl_capacity_step bench/capacity_step.c)
         anliu_configure_tool(anl_capacity_step)
 
+        # CPU per segment against window / BDP / loss (DESIGN 5.1).
+        add_executable(anl_wndcost bench/wndcost.c)
+        anliu_configure_tool(anl_wndcost)
+        target_link_libraries(anl_wndcost PRIVATE anliu)
+
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(realnet bench/realnet.c)
             anliu_configure_tool(realnet)
@@ -128,6 +133,12 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     anliu_configure_test(test_media_workload)
     target_link_libraries(test_media_workload PRIVATE anliu)
     add_test(NAME anliu.media_workload COMMAND test_media_workload)
+
+    # media_loss.c includes anliu.c and bench.c for internal tracing. The
+    # end-to-end auto-FEC check is not part of ctest; run it on a sanitizer build:
+    #   python3 bench/test_media_loss.py build/bench/anl_media_loss
+    add_executable(anl_media_loss bench/media_loss.c)
+    anliu_configure_tool(anl_media_loss)
 endif()
 
 if(BUILD_TESTING)

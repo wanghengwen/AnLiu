@@ -21,6 +21,8 @@ anl_test
 /bench/realnet_trace
 /bench/anl_capacity_step
 /bench/anl_media_startup
+/bench/wndcost
+/bench/media_loss_asan
 /test_fec_diag
 /test_tx_diag
 /test_media_workload

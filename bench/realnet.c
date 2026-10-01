@@ -1262,7 +1262,10 @@ int main(int argc, char **argv)
                 break;
             }
         }
-        if (started && !is_sender() && got_any && t - last_rx_us > 5000000u) {
+        /* Duration-based receivers must survive a temporary path pause during
+           the requested window. Fixed-volume bulk retains its idle completion. */
+        if (started && !is_sender() && got_any && (g_test == 1 || t >= end_us) &&
+            t - last_rx_us > 5000000u) {
             report_receiver();
             printf("RECEIVER %s rx_kbps=%.0f ack_kbps=%.0f\n", proto_name[g_proto],
                    g_rx_bytes * 8.0 / 1000.0 / ((last_rx_us - start_us) / 1e6), g_tx_bytes * 8.0 / 1000.0 / ((last_rx_us - start_us) / 1e6));
