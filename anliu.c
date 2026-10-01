@@ -4752,7 +4752,19 @@ static void rate_update(anl_t *w)
         uint32_t sh = ubound32(128, (uint32_t)umin32((uint32_t)(dp * 256 / dwire), 256), 256);
         w->rate_share = (uint32_t)((int32_t)w->rate_share + ((int32_t)sh - (int32_t)w->rate_share) / 4);
     }
+    /* A small packet acknowledged before the first media flight finishes
+       measures its bytes over the whole RTT, not the path's capacity. Do
+       not initialize encoder feedback or the send/delivery averages from
+       that sample: the 25%/s growth limit would hold the source near zero,
+       while the initial key burst makes delivery look capacity-limited
+       and turns off audio repair. Wait once for the payload of a normal
+       two-datagram ACK batch; BBR and pacing keep operating meanwhile. */
     if (w->btl_bw == 0 || w->rx_srtt <= 0) return;
+    if (w->rate_target == 0 && w->delivered_pay < 2u * w->mss) {
+        w->rate_dpay0 = w->delivered_pay;
+        w->rate_unsent0 = w->tx_unsent;
+        return;
+    }
     /* parity budget (DESIGN 8.6): 90% of the estimate less all else sent,
        smoothed over about 8 steps (1.6 s): a key frame fills a 200 ms
        step by itself, and a budget that read 0 for that step shrank the
