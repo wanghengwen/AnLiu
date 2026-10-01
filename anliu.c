@@ -645,6 +645,7 @@ struct anl_s {
     uint32_t pace_burst, rcv_limit;
 
     int32_t rx_rttval, rx_srtt, rx_rto;
+    int rtt_resume;                  /* resumed after an RTO without input: drain old ACK echoes */
     int reo_mult;                       /* RACK reordering window = reo_mult * min_rtt / 16 */
     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
     uint32_t reo_spur_ts;               /* last spurious RACK retransmission */
@@ -3756,6 +3757,9 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
     }
     if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) w->peer_ts = ts;
     w->peer_ts_valid = 1;
+    /* A delivery gap can release buffered ACKs together on resumption.
+       Ordinary, continuously arriving ACKs must still measure queue delay. */
+    if (w->rx_srtt > 0 && tdiff(w->current, w->last_rx) > w->rx_rto) w->rtt_resume = 1;
     w->last_rx = w->current;
     w->rx_dg++;
 
@@ -3855,13 +3859,12 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
             if (st) {
                 int fresh_acked = handle_ack(w, st, b1, una24, wnd, ts_echo, snbuf, n, &lost, &rs);
                 acked += fresh_acked;
-                /* A buffered old ACK may echo data retired long ago. With
-                   no new confirmation and an echo beyond the current RTO,
-                   it cannot establish a fresh timing sample. Keep in-window
-                   media echoes: retirement alone is not proof that their
-                   queueing delay is stale. New confirmations still learn a
-                   genuine RTT increase without a fixed time ceiling. */
-                if ((fresh_acked > 0 || tdiff(w->current, ts_echo) <= w->rx_rto) && (b1 & ACK_F_FRESH) && (!have_echo || tdiff(ts_echo, max_echo) > 0)) { max_echo = ts_echo; have_echo = 1; }
+                /* After an input gap, an old buffered ACK with no new
+                   confirmation cannot restart RTT from a retired flight.
+                   Keep ordinary and in-window media echoes: retirement
+                   alone does not make queue delay stale. A new confirmation
+                   still learns a genuine RTT increase without a fixed cap. */
+                if ((fresh_acked > 0 || !w->rtt_resume || tdiff(w->current, ts_echo) <= w->rx_rto) && (b1 & ACK_F_FRESH) && (!have_echo || tdiff(ts_echo, max_echo) > 0)) { max_echo = ts_echo; have_echo = 1; }
                 stream_try_release(w, st);
             }
         } else if (type == SEG_FWD) {
@@ -3911,6 +3914,7 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
 
     if (have_echo && w->updated) {
         int32_t rtt = tdiff(w->current, max_echo);
+        if (rtt >= 0 && rtt <= w->rx_rto) w->rtt_resume = 0;
         if (rtt >= 0 && rtt <= (int32_t)RTO_MAX) update_ack(w, rtt);   /* ignore garbage echoes */
     }
     if (rs.valid && w->updated) bbr_on_ack(w, &rs);
