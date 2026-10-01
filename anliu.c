@@ -3563,7 +3563,14 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
 
     if (st->fwd_pending) {
         if (tdiff(una, st->fwd_una) >= 0) st->fwd_pending = 0;
-        else if (tdiff(una, st->fwd_peer_una) > 0) { st->fwd_xmit = 0; st->fwd_rto = 0; }  /* peer is making progress */
+        else if (tdiff(una, st->fwd_peer_una) > 0) {
+            /* Progress clears backoff, including its scheduled deadline.
+               Keeping that old deadline after zeroing fwd_rto made the next
+               liveness check treat a future retry as the last send time. */
+            uint32_t retry = w->current + (uint32_t)w->rx_rto;
+            st->fwd_xmit = 0; st->fwd_rto = 0;
+            if (tdiff(st->fwd_ts, retry) > 0) st->fwd_ts = retry;
+        }
         else if (tdiff(w->current, st->fwd_ts - st->fwd_rto + (uint32_t)w->rx_rto) >= 0 &&
                  tdiff(st->fwd_ts, w->current) > 0) {
             /* The peer answers but stays behind our new_una: the FWD was lost
@@ -3846,8 +3853,15 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
             if (b1 & ACK_F_WASK) urgent = 1;
             st = stream_for_input(w, sid, &urgent);
             if (st) {
-                acked += handle_ack(w, st, b1, una24, wnd, ts_echo, snbuf, n, &lost, &rs);
-                if ((b1 & ACK_F_FRESH) && (!have_echo || tdiff(ts_echo, max_echo) > 0)) { max_echo = ts_echo; have_echo = 1; }
+                int fresh_acked = handle_ack(w, st, b1, una24, wnd, ts_echo, snbuf, n, &lost, &rs);
+                acked += fresh_acked;
+                /* A buffered old ACK may echo data retired long ago. With
+                   no new confirmation and an echo beyond the current RTO,
+                   it cannot establish a fresh timing sample. Keep in-window
+                   media echoes: retirement alone is not proof that their
+                   queueing delay is stale. New confirmations still learn a
+                   genuine RTT increase without a fixed time ceiling. */
+                if ((fresh_acked > 0 || tdiff(w->current, ts_echo) <= w->rx_rto) && (b1 & ACK_F_FRESH) && (!have_echo || tdiff(ts_echo, max_echo) > 0)) { max_echo = ts_echo; have_echo = 1; }
                 stream_try_release(w, st);
             }
         } else if (type == SEG_FWD) {
@@ -4792,6 +4806,10 @@ static void rate_update(anl_t *w)
            app-limited without a queue, up by as much (at most 1.25 x what is
            sent): the estimate only shows what the application sent. */
         uint64_t prev = w->rate_target ? w->rate_target : base;
+        /* The bounded recovery test has to feed the path to test growth.
+           The application may already send above a depressed target (its
+           minimum media rate); start from that measured load, not below it. */
+        if (w->cs_test_ts && prev < w->pay_avg) prev = w->pay_avg;
         uint64_t grow = prev + prev * RATE_GROWTH * (uint32_t)dt / 100000;
         /* 25 ms: at a low rate srtt sits 10..20 ms above its minimum anyway
            (ACKs wait for the flush interval, key frames come in bursts) */
@@ -4811,7 +4829,10 @@ static void rate_update(anl_t *w)
        170 ms a key frame's step sends 2x the average and its delivery
        shows a step later (against the same step the cap read 0.6 and held
        an 8 Mbps link's encoder at 0.8 Mbps) */
-    if (delivery_limited) {
+    /* During the existing 1.5 s capacity test, allow the ordinary bounded
+       upward ramp to produce the load whose delivery the test measures.
+       Capping it at old delivery otherwise defeats the requested probe. */
+    if (delivery_limited && !w->cs_test_ts) {
         uint64_t cap = (uint64_t)w->dlv_avg * (100 - RATE_MARGIN) / 100;
         uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate_share / 256;
         if (cap < floor) cap = floor;
