@@ -545,6 +545,7 @@ typedef struct anl_stream {
     int ack_pending;        /* an ACK is due */
     int ack_fresh;          /* data arrived since the last ACK: ts_echo is an RTT sample */
     uint32_t ack_ts;
+    uint32_t ack_rep_ts;    /* receiver: repeat the last ACK then unless another goes out first (| 1; 0: none) */
     /* RACK (DESIGN 6.3): the newest datagram with data of this stream the peer
        is known to have - orders segments sent in the same millisecond */
     uint32_t rack_ts;       /* its send time (ts_echo) */
@@ -660,6 +661,7 @@ struct anl_s {
     uint32_t delivered_ts;              /* time of the last acknowledgement */
     uint32_t first_sent_ts;             /* send time of the packet starting the sampling interval */
     uint32_t sent_wire, first_sent_wire; /* wire bytes sent (data, retransmissions, parity; wraps) */
+    uint32_t vq_bytes, vq_ts;           /* our own backlog at the bottleneck if it drains at the estimate (vq_ms) */
     uint32_t sent_par, first_sent_par;  /* ... of which parity (wraps) */
     uint64_t app_limited;               /* != 0: samples are app-limited until delivered passes it */
     uint64_t lost_bytes;                /* RACK-marked bytes (spurious marks undone); RTO losses counted at ACK */
@@ -1376,6 +1378,12 @@ static void write_ack_segs(anl_t *w, anl_stream *st)
         dg_commit(w, seglen, 0);
     } while (pos != &st->rcv_runs);
 
+    /* An ACK that carried news is sent once more an update interval later
+       unless another one goes out first: the receiver of a frame-paced
+       stream sends nothing between frames, so losing a frame's last ACK left
+       its segments to the sender's RTO before the next frame's ACK came. The
+       repeat is not FRESH: no RTT sample, no RACK time. */
+    st->ack_rep_ts = st->ack_fresh ? (w->current + (uint32_t)w->interval) | 1 : 0;
     st->ack_pending = 0;
     st->ack_fresh = 0;
     st->probe_ask = 0;
@@ -1393,6 +1401,7 @@ static void ack_schedule(anl_stream *st)
  *-------------------------------------------------------------------*/
 static uint32_t bbr_bw(const anl_t *w);
 static uint32_t bbr_rtt(const anl_t *w);
+static void vq_add(anl_t *w, uint32_t wire);
 static uint32_t bbr_lt_probe_rate(const anl_t *w);
 static int bbr_queue_signal(const anl_t *w);
 static uint64_t bbr_inflight_bytes(const anl_t *w);
@@ -3216,6 +3225,7 @@ static void bbr_on_send(anl_t *w, anl_seg *seg)
         if (--w->burst_left == 0) w->burst_open = 0;    /* sent: later data is not part of it */
     }
     w->sent_wire += wire;
+    vq_add(w, wire);
     seg->rs_sent = w->sent_wire;
     seg->rs_sent_first = w->first_sent_wire;
     seg->rs_par = w->sent_par;
@@ -3982,6 +3992,7 @@ static void fec_send_parity(anl_t *w, anl_stream *st)
     write_ctrl_seg(w, st->sid, CTRL_PARITY, body, PARITY_HDR + b->len);
     dg_seal(w);
     w->sent_wire += PARITY_HDR + b->len + SEG_WIRE_OVH;
+    vq_add(w, PARITY_HDR + b->len + SEG_WIRE_OVH);
     w->sent_par += PARITY_HDR + b->len + SEG_WIRE_OVH;
     w->flush_budget--;
     st->fec_out_i++;
@@ -4620,6 +4631,7 @@ static void control_stream(anl_t *w, anl_stream *st)
         st->probe_wait = 0;
         st->ts_probe = 0;
     }
+    if (st->ack_rep_ts != 0 && tdiff(current, st->ack_rep_ts) >= 0) st->ack_pending = 1;
     if (st->ack_pending || st->probe_ask || st->probe_tell) write_ack_segs(w, st);
 
     /* delay measurement interval; the report to the peer (DESIGN 6.9) */
@@ -4704,6 +4716,35 @@ static void flush_control(anl_t *w)
     w->rx_data_since_ack = 0;
 }
 
+/* Our own backlog at the bottleneck: every wire byte sent, drained at the
+ * bandwidth estimate (below the link while app-limited: the backlog reads
+ * high, the RTO later - the safe side) */
+static uint32_t vq_left(const anl_t *w)
+{
+    uint32_t rate = bbr_bw(w);
+    int32_t dt = tdiff(w->current, w->vq_ts);
+    uint64_t drained = dt > 0 ? (uint64_t)rate * (uint32_t)dt / 1000 : 0;
+    return drained >= w->vq_bytes ? 0 : w->vq_bytes - (uint32_t)drained;
+}
+
+static void vq_add(anl_t *w, uint32_t wire)
+{
+    uint64_t left = (uint64_t)vq_left(w) + wire;
+    w->vq_bytes = left > 0xffffffffu ? 0xffffffffu : (uint32_t)left;
+    w->vq_ts = w->current;
+}
+
+/* The time a segment just sent waits behind that backlog: its RTO waits as
+ * much longer. A key frame's burst, paced above the bottleneck, delays its
+ * last segments and the frames after it: at 5 Mbit, 100 ms, 20% loss their
+ * RTT reached 140..210 ms against an RTO of 130 from the smoothed RTT, and
+ * 57% of the video retransmissions were of segments the peer already had. */
+static uint32_t vq_ms(const anl_t *w)
+{
+    uint32_t rate = bbr_bw(w);
+    return rate ? (uint32_t)umin32((uint64_t)vq_left(w) * 1000 / rate, RTO_MAX) : 0;
+}
+
 static void move_and_send(anl_t *w, anl_stream *st)
 {
     anl_seg *seg = qfirst_seg(&st->snd_queue);
@@ -4717,6 +4758,7 @@ static void move_and_send(anl_t *w, anl_stream *st)
     seg->lost = 0;
     seg->xmit = 0;
     send_seg(w, st, seg);
+    seg->resendts += vq_ms(w);
 }
 
 /* target_rate (DESIGN 6.10): the payload rate the application may send.
@@ -5128,6 +5170,7 @@ static void anl_flush_internal(anl_t *w)
                 if (seg->lost) st->nlost--;
                 seg->lost = 0;
                 send_seg(w, st, seg);
+                seg->resendts += vq_ms(w);
                 if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
                 retrans_spent += data_seg_size(st, seg);
                 if (st->mode == ANL_RELIABLE && seg->xmit >= w->dead_link)
@@ -5452,6 +5495,11 @@ uint32_t anl_check(const anl_t *w, uint32_t current)
         anl_node *pos;
         if (st->state == ANL_STREAM_CLOSED) continue;
         if (st->ack_pending || st->probe_ask || st->probe_tell || st->rst_pending || st->close_answer) return current;
+        if (st->ack_rep_ts != 0) {
+            int32_t d = tdiff(st->ack_rep_ts, current);
+            if (d <= 0) return current;
+            if (d < tm_min) tm_min = d;
+        }
         if (!st->peer_opened) {
             int32_t d = tdiff(st->open_ts, current);
             if (d <= 0) return current;
