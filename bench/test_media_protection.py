@@ -23,7 +23,7 @@ def cases(quick):
     duration = 120 if quick else 600
     for seed in (1, 2, 3):
         for bw in (800, 2000):
-            for rtt in (100, 180):
+            for rtt in (2, 100, 180):
                 yield (bw, rtt, 20, seed, duration, 0, 10, "none", 30, 20, 200)
         for rtt, loss, stop in ((100, 20, 0), (180, 20, 0), (100, 0, 0),
                                 (180, 0, 0), (2, 20, 0), (100, 20, 30)):
