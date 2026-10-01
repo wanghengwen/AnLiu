@@ -3366,6 +3366,9 @@ static void test_target_rate_wrap(void)
         wrapped.sent_wire += 60000;
         plain.tx_payload += 40000;
         wrapped.tx_payload += 40000;
+        /* Exercise feedback with acknowledged payload as well as sent bytes. */
+        plain.delivered_pay += 40000;
+        wrapped.delivered_pay += 40000;
         rate_update(&plain);
         targets[0] = g_rate;
         rate_update(&wrapped);
@@ -3644,6 +3647,51 @@ static void test_outage(void)
     net_stop(&n);
 }
 
+/* Releasing old FRESH ACKs after a pause must not change the RTT model.
+ * A genuine long-delay confirmation still has to update it. */
+static void test_rtt_stale_ack(void)
+{
+    net n;
+    anl_config ca, cb;
+    anl_t *w;
+    anl_stream *st;
+    char packet[64], received[16], *p;
+    int i, before;
+    uint32_t echo, next;
+    printf("[rtt: old/duplicate FRESH ACK and a newly acknowledged segment]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 90;
+    ca.interval = cb.interval = 10;
+    net_start(&n, &ca, &cb);
+    CHECK(anl_send(n.ep[0], "baseline", 8) == 0, "send baseline sample");
+    for (i = 0; i < 2000; i++) net_tick(&n);
+    CHECK(anl_recv(n.ep[1], received, sizeof(received)) == 8, "receive baseline sample");
+    w = n.ep[0]; st = w->dflt; before = w->rx_srtt;
+    CHECK(before > 0 && st->nsnd_buf == 0, "real ACK established RTT and retired baseline");
+    p = packet;
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, w->current);
+    p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
+    p = enc24(p, st->snd_una & SN_MASK); p = enc16(p, st->rcv_wnd);
+    p = enc32(p, w->current - 5000); p = enc_varint(p, 0);
+    CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid old ACK accepted");
+    CHECK(w->rx_srtt == before, "old ACK cannot pollute RTT (%d -> %d)", before, w->rx_srtt);
+    CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid duplicate ACK accepted");
+    CHECK(w->rx_srtt == before, "duplicate ACK cannot pollute RTT");
+    CHECK(anl_send(w, "fresh", 5) == 0, "send a genuine new segment");
+    CHECK(st->nsnd_buf == 1, "new segment remains live");
+    echo = w->current; next = st->snd_nxt;
+    n.now += 1000; anl_update(w, n.now);
+    before = w->rx_srtt;
+    p = packet;
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, w->current);
+    p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
+    p = enc24(p, next & SN_MASK); p = enc16(p, st->rcv_wnd);
+    p = enc32(p, echo); p = enc_varint(p, 0);
+    CHECK(anl_input_plain(w, packet, p-packet) == 0 && st->nsnd_buf == 0, "real ACK retires new data");
+    CHECK(w->rx_srtt != before && abs(w->rx_srtt - 1000) < abs(before - 1000), "new ACK still learns a legitimate RTT (%d -> %d)", before, w->rx_srtt);
+    net_stop(&n);
+}
+
 int main(void)
 {
     const char *seed = getenv("ANL_TEST_SEED");    /* runs are deterministic for a given seed */
@@ -3727,6 +3775,7 @@ int main(void)
     RUN(test_target_rate());
     RUN(test_delay_report());
     RUN(test_outage());
+    RUN(test_rtt_stale_ack());
     RUN(test_start_absent(2000, 10));
     RUN(test_start_absent(17000, 10));
     RUN(test_start_absent(25000, 10));
