@@ -911,10 +911,12 @@ static int tcp_run(void)
     if (fd < 0) { perror("tcp accept"); return 1; }
     end_us = now_us() + (uint64_t)g_dur * 1000000u;
     if (is_sender()) {
+#ifdef __linux__
         struct tcp_info ti;
         socklen_t tl = sizeof(ti);
+        socklen_t cl;
+#endif
         char cc[32] = "?";
-        socklen_t cl = sizeof(cc);
         uint64_t sent = 0;
         memset(buf, 'x', sizeof(buf));
         while (now_us() < end_us) {
@@ -922,12 +924,17 @@ static int tcp_run(void)
             if (n <= 0) break;
             sent += (uint64_t)n;
         }
+#ifdef __linux__
         memset(&ti, 0, sizeof(ti));
+        cl = sizeof(cc);
         getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tl);
         getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, &cl);
         cc[sizeof(cc) - 1] = 0;
         printf("SENDER tcp cc=%s sent=%llu retrans=%u rtt_ms=%.1f cwnd=%u secs=%d\n", cc, (unsigned long long)sent,
                ti.tcpi_total_retrans, ti.tcpi_rtt / 1000.0, ti.tcpi_snd_cwnd, g_dur);
+#else                                               /* no TCP_INFO (macOS): bytes only */
+        printf("SENDER tcp cc=%s sent=%llu secs=%d\n", cc, (unsigned long long)sent, g_dur);
+#endif
         shutdown(fd, SHUT_WR);
         while (recv(fd, buf, sizeof(buf), 0) > 0) {}
     } else {
