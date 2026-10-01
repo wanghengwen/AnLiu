@@ -4717,11 +4717,10 @@ static void flush_control(anl_t *w)
 }
 
 /* Our own backlog at the bottleneck: every wire byte sent, drained at the
- * bandwidth estimate (below the link while app-limited: the backlog reads
- * high, the RTO later - the safe side) */
+ * bandwidth estimate or the rate the last burst went through (vq_ms) */
 static uint32_t vq_left(const anl_t *w)
 {
-    uint32_t rate = bbr_bw(w);
+    uint32_t rate = umax32(bbr_bw(w), w->burst_bw);
     int32_t dt = tdiff(w->current, w->vq_ts);
     uint64_t drained = dt > 0 ? (uint64_t)rate * (uint32_t)dt / 1000 : 0;
     return drained >= w->vq_bytes ? 0 : w->vq_bytes - (uint32_t)drained;
@@ -4738,11 +4737,18 @@ static void vq_add(anl_t *w, uint32_t wire)
  * much longer. A key frame's burst, paced above the bottleneck, delays its
  * last segments and the frames after it: at 5 Mbit, 100 ms, 20% loss their
  * RTT reached 140..210 ms against an RTO of 130 from the smoothed RTT, and
- * 57% of the video retransmissions were of segments the peer already had. */
+ * 57% of the video retransmissions were of segments the peer already had.
+ * Drained at the faster of the estimate and the rate bursts went through, at
+ * most one srtt, and not while capacity is short: an app-limited or collapsed
+ * estimate read a backlog the link did not have, the late RTOs sent less, the
+ * estimate fell further - parity stayed at its floor under 20% loss, and a
+ * 4 Mbit path stayed capacity-short for 30 s after an 800 kbit stretch. */
 static uint32_t vq_ms(const anl_t *w)
 {
-    uint32_t rate = bbr_bw(w);
-    return rate ? (uint32_t)umin32((uint64_t)vq_left(w) * 1000 / rate, RTO_MAX) : 0;
+    uint32_t rate = umax32(bbr_bw(w), w->burst_bw);
+    uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
+    if (w->capacity_short || rate == 0) return 0;
+    return (uint32_t)umin32((uint64_t)vq_left(w) * 1000 / rate, srtt);
 }
 
 static void move_and_send(anl_t *w, anl_stream *st)
