@@ -421,7 +421,8 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define START_BURST_MTU 1       /* ... and pace_burst (unless set) in datagrams */
 #define FEC_K_MAX       64      /* data packets per Reed-Solomon block */
 #define FEC_M_MAX       16      /* parities per block */
-#define FEC_BLOCK_MS    100     /* a block collects data packets for at most this long */
+#define FEC_BLOCK_MS    100     /* a block collects data packets for at most this long - */
+#define FEC_BLOCK_MAX_MS 400    /* adaptive: longer while fec_deadline leaves room, up to this (fec_block_ms) */
 #define FEC_GAP         5       /* ms between the parities of a block (loss bursts) */
 #define FEC_AUTO_START  25      /* fec_ratio 0 (auto, DESIGN 8.5): the ratio it starts from, */
 #define FEC_AUTO_MIN    10      /* its floor (small blocks get no parity at all), */
@@ -609,7 +610,7 @@ typedef struct anl_stream {
     uint32_t peer_rp_wire_ts;           /* newest report's peer clock; reject reordered / replayed reports */
     uint32_t peer_rp_ts;
     fec_buf *fec_slot;                  /* sender: canonical encodings of the open block (FEC_K_MAX) */
-    uint32_t fec_base, fec_first_ts, fec_n;
+    uint32_t fec_base, fec_first_ts, fec_n, fec_blk_ms;  /* fec_blk_ms: the open block collects this long */
     fec_buf *fec_out;                   /* sender: parities of the last block (FEC_M_MAX), FEC_GAP apart */
     uint32_t fec_out_base, fec_out_k, fec_out_m, fec_out_i, fec_out_ts;
     fec_centry *cache;
@@ -1275,13 +1276,13 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
            retransmission (at least a round trip) completed it - late where
            one cannot make the deadline. (Half a round trip also caught key
            frames paced over that long.) Its loss is counted already. A
-           rebuild waits for its block's parity, up to FEC_BLOCK_MS after
+           rebuild waits for its block's parity, up to fec_blk_ms after
            the frame: beyond that as well (counted from the queueing alone,
            every repair read as a retransmission - at 100 ms RTT and 5% loss
            the ratio ran to its ceiling on FEC's own successes) */
         if (r->frames > 0 && w->rx_srtt > 0 &&
             r->frame_delay_max_ms > r->qdelay_max_ms + (uint32_t)w->rx_srtt * 3 / 4 +
-                                    (fec_active(w, st) ? FEC_BLOCK_MS : 0) &&
+                                    (fec_active(w, st) ? umax32(st->fec_blk_ms, FEC_BLOCK_MS) : 0) &&
             fec_repair_ms(w, st, st->fec_frame_avg) > st->fec_deadline)
             fec_auto_count(w, st, FEC_SLOW);
     }
@@ -4320,7 +4321,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
         s->fec_share = (uint16_t)umin32(share, 0xffff);
         /* the RTO counts from the last parity too, as far as a
            retransmission then still makes fec_deadline (reach): a block
-           collects up to FEC_BLOCK_MS, and timed from the send the RTO beat
+           collects up to fec_blk_ms, and timed from the send the RTO beat
            the rebuild's ACK (100 ms RTT: 80% of the retransmissions reached
            a peer that had rebuilt them). Not beyond: where FEC fails, that
            early retransmission is what keeps the frame on time (deferred all
@@ -4407,7 +4408,7 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
     } else {
         st->fec_miss++;
         if (st->fec_miss < 2 || st->fec_miss * 100 <= st->fec_sent * FEC_AUTO_MISS ||
-            (st->fec_adj_ts != 0 && tdiff(w->current, st->fec_adj_ts) < (int32_t)(2 * srtt + FEC_BLOCK_MS))) return;
+            (st->fec_adj_ts != 0 && tdiff(w->current, st->fec_adj_ts) < (int32_t)(2 * srtt + st->fec_blk_ms))) return;
         /* not while large frames are short of parity budget (the bucket
            below half): those losses are likely our own congestion, more
            parity would add to it - the ratio ran to 100% on a 2 Mbps path
@@ -4430,6 +4431,22 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
     st->fec_sent = st->fec_miss = 0;
 }
 
+/* How long the block opening now collects (DESIGN 8.2). Adaptive parity: as
+ * long as fec_deadline leaves after the trip (srtt / 2), the last block's
+ * parities FEC_GAP apart and the jitter (two update intervals, 4 rttvar) -
+ * a longer block needs fewer parities for the same failure target (k = 9 at
+ * 5% loss: 44% for 0.1%; k = 23: 26%). At least FEC_BLOCK_MS: below that
+ * the parities would cost more than a late frame; a fixed ratio keeps it. */
+static uint32_t fec_block_ms(const anl_t *w, const anl_stream *st)
+{
+    uint32_t tail;
+    if (!st->fec_auto || st->fec_deadline == 0 || w->rx_srtt <= 0) return FEC_BLOCK_MS;
+    tail = (uint32_t)w->rx_srtt / 2 + (st->fec_out_m > 1 ? (st->fec_out_m - 1) * FEC_GAP : 0) +
+           2u * (uint32_t)w->interval + 4u * (uint32_t)w->rx_rttval;
+    if (st->fec_deadline <= tail + FEC_BLOCK_MS) return FEC_BLOCK_MS;
+    return umin32(st->fec_deadline - tail, FEC_BLOCK_MAX_MS);
+}
+
 static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
 {
     fec_buf *b;
@@ -4441,6 +4458,7 @@ static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
     if (st->fec_n == 0) {
         st->fec_base = seg->sn;
         st->fec_first_ts = w->current;
+        st->fec_blk_ms = fec_block_ms(w, st);
     }
     b = &st->fec_slot[st->fec_n];
     if (fbuf_reserve(b, seg->len + CANON_HDR_MAX) < 0) { fec_close_block(w, st); return; }
@@ -5337,12 +5355,12 @@ static void anl_flush_internal(anl_t *w)
         w->burst_open = 0;
     }
 
-    /* 5: FEC: blocks that collected FEC_BLOCK_MS, parities still due (streams
+    /* 5: FEC: blocks that collected fec_blk_ms, parities still due (streams
        without new data), in priority order; stale parities */
     for (prio = -1; prio < ANL_MAX_PRIO; prio++) {
         FOR_EACH_STREAM(w, st, n, nx) {
             if (!st->fec || (prio < 0 ? !st->strict : (st->strict || st->prio != prio))) continue;
-            if (st->fec_n > 0 && tdiff(current, st->fec_first_ts) >= FEC_BLOCK_MS) fec_close_block(w, st);
+            if (st->fec_n > 0 && tdiff(current, st->fec_first_ts) >= (int32_t)st->fec_blk_ms) fec_close_block(w, st);
             if (!w->pace_blocked) fec_pump(w, st, 0);
         }
     }
@@ -5602,7 +5620,7 @@ uint32_t anl_check(const anl_t *w, uint32_t current)
             if (d < tm_min) tm_min = d;
         }
         if (st->fec && st->fec_n > 0) {
-            int32_t d = tdiff(st->fec_first_ts + FEC_BLOCK_MS, current);
+            int32_t d = tdiff(st->fec_first_ts + st->fec_blk_ms, current);
             if (d <= 0) return current;
             if (d < tm_min) tm_min = d;
         }
