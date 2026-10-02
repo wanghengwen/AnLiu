@@ -1097,6 +1097,7 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost);
 static void fec_loss_add(anl_t *w, uint32_t sent, uint32_t lost, int hard);
 static uint32_t fec_parities_for(uint32_t k, uint32_t p, uint32_t fail);
 static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t bytes);
+static int fec_active(const anl_t *w, const anl_stream *st);
 
 static void dg_begin(anl_t *w)
 {
@@ -1273,9 +1274,14 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
         /* a frame took 3/4 of a round trip beyond its packets' queueing: a
            retransmission (at least a round trip) completed it - late where
            one cannot make the deadline. (Half a round trip also caught key
-           frames paced over that long.) Its loss is counted already. */
+           frames paced over that long.) Its loss is counted already. A
+           rebuild waits for its block's parity, up to FEC_BLOCK_MS after
+           the frame: beyond that as well (counted from the queueing alone,
+           every repair read as a retransmission - at 100 ms RTT and 5% loss
+           the ratio ran to its ceiling on FEC's own successes) */
         if (r->frames > 0 && w->rx_srtt > 0 &&
-            r->frame_delay_max_ms > r->qdelay_max_ms + (uint32_t)w->rx_srtt * 3 / 4 &&
+            r->frame_delay_max_ms > r->qdelay_max_ms + (uint32_t)w->rx_srtt * 3 / 4 +
+                                    (fec_active(w, st) ? FEC_BLOCK_MS : 0) &&
             fec_repair_ms(w, st, st->fec_frame_avg) > st->fec_deadline)
             fec_auto_count(w, st, FEC_SLOW);
     }
@@ -2262,6 +2268,10 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
         return;
     }
     ack_schedule(st);
+#ifdef ANL_DUP_TRACE
+    if (!recovered && (tdiff(sn, st->rcv_nxt) < 0 || ((r = run_find(st, sn)) && tdiff(sn, r->end) < 0)))
+        ANL_DUP_TRACE(w, st, sn);
+#endif
     if (tdiff(sn, st->rcv_nxt) < 0) return;
 
     r = run_find(st, sn);
@@ -3469,8 +3479,12 @@ static void update_ack(anl_t *w, int32_t rtt)
     }
     /* + srtt / 4 at least: a BBR probe (gain 1.25 for a round trip) queues up
        to a quarter of the RTT at once, faster than rttval follows; losses are
-       RACK's job, the RTO is the fallback for tails */
-    rto = w->rx_srtt + (int32_t)umax32(umax32((uint32_t)w->interval, 4u * (uint32_t)w->rx_rttval), (uint32_t)w->rx_srtt / 4);
+       RACK's job, the RTO is the fallback for tails. Two update intervals
+       at least: the peer's ACK waits up to one for its flush, and a lost
+       ACK's repeat comes one later (write_ack_segs) - with one, the RTO
+       raced both (20 ms RTT: audio retransmitted once a second without loss,
+       a third of the RTOs at 5..15% loss reached a peer that had the data) */
+    rto = w->rx_srtt + (int32_t)umax32(umax32(2u * (uint32_t)w->interval, 4u * (uint32_t)w->rx_rttval), (uint32_t)w->rx_srtt / 4);
     w->rx_rto = (int32_t)ubound32(RTO_MIN, (uint32_t)rto, RTO_MAX);
 }
 
@@ -4164,6 +4178,17 @@ static void fec_budget_refill(anl_t *w)
     if (w->par_tokens < -cap) w->par_tokens = -cap;
 }
 
+/* one retransmission of a typical frame's loss makes fec_deadline
+   (fec_repair_ms without the second retry it may reserve) */
+static int fec_one_retry(const anl_t *w, const anl_stream *st)
+{
+    uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
+    uint32_t pace = w->pace_rate ? w->pace_rate : compute_pace_rate(w);
+    uint32_t ser = pace ? (uint32_t)umin32((uint32_t)((uint64_t)st->fec_frame_avg * 1000 / pace), 10000) : 0;
+    return st->fec_deadline != 0 && w->rx_srtt > 0 &&
+           ser + srtt * 3 / 2 + reo_wnd(w, st) + (uint32_t)w->interval <= st->fec_deadline;
+}
+
 /* Close the open block (DESIGN 8.2): k data packets get m Reed-Solomon
  * parities (up to FEC_M_MAX); any m of the k + m can be lost. m follows the
  * ratio exactly over blocks, not per block: the fraction left over is
@@ -4171,7 +4196,7 @@ static void fec_budget_refill(anl_t *w)
  * block - rounded per block, 10% and 20% were the same). */
 static void fec_close_block(anl_t *w, anl_stream *st)
 {
-    uint32_t k = st->fec_n, m, j, i, lmax = 0, share, x;
+    uint32_t k = st->fec_n, m, j, i, lmax = 0, share, x, reach;
     int key = st->fec_blk_key;
     anl_node *pos;
     if (k == 0 || st->fec_slot == NULL) return;
@@ -4197,13 +4222,20 @@ static void fec_close_block(anl_t *w, anl_stream *st)
         } else if (!(st->fec_deadline && need <= st->fec_deadline)) {
             /* at least what the loss needs - unless a retransmission makes
                the deadline anyway */
+            /* a non-key block of a drop_until_key stream fails at the
+               looser target while one retransmission still makes the
+               deadline: the early RTO repairs what FEC does not */
             m = umax32(m, fec_parities_for(k, w->fec_loss,
-                                          k * lmax > FEC_SMALL_BLOCK && !key && !st->drop_until_key ? FEC_BLOCK_FAIL : FEC_SMALL_FAIL));
-            /* a small block (audio) as many parities as packets: its bytes
-               are few, and nothing else kept long-RTT audio on time (real
-               cross-border paths: 99.9..100% at 100%, 38..62% at 20..40%) */
+                                          k * lmax > FEC_SMALL_BLOCK && !key &&
+                                          (!st->drop_until_key || fec_one_retry(w, st)) ? FEC_BLOCK_FAIL : FEC_SMALL_FAIL));
+            /* a small block (audio) as many parities as packets while the
+               loss estimate settles: its bytes are few, and nothing else kept
+               long-RTT audio on time (real cross-border paths: 99.9..100% at
+               100%, 38..62% at fixed 20..40%). Once it has, the binomial floor
+               above: at 1..3% random loss 33% instead of 100%, audio on time
+               within 0.1 point (simulation, 100..300 ms RTT) */
             if (k * lmax <= FEC_SMALL_BLOCK && (w->fec_loss >= FEC_GATE_LOSS_ON ||
-                st->fec_rtt_auto)) m = umax32(m, k * FEC_SMALL_RATIO / 100);
+                st->fec_rtt_auto) && w->fec_loss_valid < FEC_LOSS_WARM) m = umax32(m, k * FEC_SMALL_RATIO / 100);
         }
         /* the parity budget (DESIGN 8.6): small blocks (audio) outside it;
            a large block gets, beyond the FEC_AUTO_MIN share, what the budget
@@ -4274,6 +4306,11 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     /* parities are lost like data: credit what is expected to arrive, not
        all that was sent (with the loss the credit exceeded the link) */
     share = (uint32_t)((uint64_t)share * (65536u - umin32(w->fec_loss, 65536u)) >> 16);
+    /* from a retransmission until its ACK shows it made fec_deadline: half
+       a round trip, the peer's ACK delay and our flush (an update interval
+       each) and the jitter */
+    reach = (w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF) / 2 + 2u * (uint32_t)w->interval +
+            4u * (uint32_t)w->rx_rttval;
     for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next) {
         anl_seg *s = QENTRY(pos, anl_seg, node);
         uint32_t last = w->current + (m - 1) * FEC_GAP;
@@ -4281,6 +4318,20 @@ static void fec_close_block(anl_t *w, anl_stream *st)
         if (tdiff(s->sn, st->fec_base) < 0 || s->xmit != 1) continue;
         s->fec_ts = last ? last : 1;
         s->fec_share = (uint16_t)umin32(share, 0xffff);
+        /* the RTO counts from the last parity too, as far as a
+           retransmission then still makes fec_deadline (reach): a block
+           collects up to FEC_BLOCK_MS, and timed from the send the RTO beat
+           the rebuild's ACK (100 ms RTT: 80% of the retransmissions reached
+           a peer that had rebuilt them). Not beyond: where FEC fails, that
+           early retransmission is what keeps the frame on time (deferred all
+           the way, video at 180 ms RTT and 15% loss went from 98.9 to 97.3%
+           on time), and one that only just arrives counts as late - the
+           ratio ran to its ceiling where retransmissions are in time */
+        if (st->fec_deadline > reach) {
+            uint32_t defer = last + s->rto, latest = s->ts_enq + st->fec_deadline - reach;
+            if (tdiff(defer, latest) > 0) defer = latest;
+            if (tdiff(defer, s->resendts) > 0) s->resendts = defer;
+        }
     }
     fec_pump(w, st, 0);
 }
@@ -4345,6 +4396,9 @@ static uint32_t fec_parities_for(uint32_t k, uint32_t p, uint32_t fail)
 static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
 {
     uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
+#ifdef ANL_FEC_COUNT_TRACE
+    ANL_FEC_COUNT_TRACE(w, st, lost);
+#endif
     if (st->fec && lost == FEC_SENT) fec_loss_add(w, 1, 0, 0); /* losses: RACK marks, RTO ACKs */
     if (!st->fec_auto || !fec_active(w, st) || lost == FEC_LOST) return; /* the loss estimate only */
     if (lost == FEC_SENT) {
@@ -5195,6 +5249,9 @@ static void anl_flush_internal(anl_t *w)
                 } else if (why == 3) {
                     seg->resendts = current + seg->rto;
                 }
+#ifdef ANL_RTX_TRACE
+                ANL_RTX_TRACE(w, st, seg, why);
+#endif
                 seg->rack_rtx = why == 3 ? 1 : why == 2 ? 2 : 0;
                 if (seg->lost) st->nlost--;
                 seg->lost = 0;

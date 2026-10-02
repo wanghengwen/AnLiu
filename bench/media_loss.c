@@ -10,6 +10,9 @@
  * Timely media uses the original propagation delay as its minimum baseline;
  * an event's extra delay consumes that same delivery budget. A delivery pause
  * retains datagrams instead of adding random packet loss.
+ * RTX: retransmissions by trigger (RTO, RACK; _cov: the segment was covered by
+ * a parity block) and how many reached a receiver that already had the data
+ * (dup_*); FECCNT: what fed the adaptive ratio. MEDIA_LOSS_RTX=1 traces each.
  */
 #include "../anliu.h"
 static void loss_data(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
@@ -18,6 +21,12 @@ static void loss_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, 
 #define ANL_DATA_SEG_TRACE(w, st, bytes, first) loss_data(w, st, seg, bytes, first)
 #define ANL_PARITY_SEG_TRACE loss_parity
 #define ANL_FEC_BLOCK_TRACE(w, st, k, m) loss_block(w, st, k, m, lmax, key)
+static void loss_rtx(const anl_t *, const anl_stream_t *, const void *, int);
+static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t);
+#define ANL_RTX_TRACE(w, st, seg, why) loss_rtx(w, st, seg, why)
+#define ANL_DUP_TRACE(w, st, sn) loss_dup(w, st, sn)
+static unsigned fec_counts[2][4];
+#define ANL_FEC_COUNT_TRACE(w, st, lost) do { if ((st)->tag <= 1 && (lost) >= 0 && (lost) < 4) fec_counts[(st)->tag][lost]++; } while (0)
 #include "../anliu.c"
 #define main benchmark_main
 #include "bench.c"
@@ -39,6 +48,26 @@ static void loss_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint3
     small_blocks[id] += k * lmax <= FEC_SMALL_BLOCK;
     if (getenv("MEDIA_LOSS_BLOCKS"))
         printf("BLOCK ms=%u id=%d k=%u m=%u lmax=%u key=%d frame_avg=%u\n", w->current, id, k, m, lmax, key, st->fec_frame_avg);
+}
+static unsigned rtx_why[2][4], rtx_cov[2][4], dup_rx[2], dup_why[2][4];
+static unsigned char last_why[2][65536];
+static void loss_rtx(const anl_t *w, const anl_stream_t *st, const void *p, int why)
+{
+    const anl_seg *seg = p;
+    int id = st->tag;
+    if (w != owner || id < 0 || id > 1 || why < 0 || why > 3) return;
+    rtx_why[id][why]++;
+    last_why[id][seg->sn & 65535] = (unsigned char)why;
+    if (getenv("MEDIA_LOSS_RTX")) printf("RTXEV ms=%u id=%d why=%d sn=%u xmit=%u sent=%u age=%d rto=%u srtt=%d var=%d fec_ts=%u resend=%u\n", w->current, id, why, seg->sn, seg->xmit, seg->ts_sent, (int)(w->current-seg->ts_sent), seg->rto, w->rx_srtt, w->rx_rttval, seg->fec_ts, seg->resendts);
+    if (seg->fec_ts) rtx_cov[id][why]++;
+}
+static void loss_dup(const anl_t *w, const anl_stream_t *st, uint32_t sn)
+{
+    int id = st->tag;
+    if (w == owner || id < 0 || id > 1) return;
+    dup_rx[id]++;
+    dup_why[id][last_why[id][sn & 65535] & 3]++;
+    if (getenv("MEDIA_LOSS_RTX")) printf("DUPEV ms=%u id=%d sn=%u why=%d\n", w->current, id, sn, last_why[id][sn & 65535]);
 }
 static void loss_data(const anl_t *w, const anl_stream_t *st, const void *p, uint32_t bytes, int first)
 {
@@ -170,8 +199,8 @@ int main(int argc, char **argv)
         }
         if (s.t % 10000 == 0 && s.t <= (uint64_t)duration * 1000) {
             anl_t *w = s.e[0].anl; anl_stream *v = s.e[0].h[1];
-            printf("SAMPLE ms=%llu srtt=%d loss=%u gate=%d need=%u key_need=%u scale=%d short=%d parity_video=%llu\n",
-                (unsigned long long)s.t, w->rx_srtt, w->fec_loss, v->fec_gate,
+            printf("SAMPLE ms=%llu ratio=%d/%d srtt=%d loss=%u gate=%d need=%u key_need=%u scale=%d short=%d parity_video=%llu\n",
+                (unsigned long long)s.t, s.e[0].h[0]->fec_ratio, v->fec_ratio, w->rx_srtt, w->fec_loss, v->fec_gate,
                 fec_repair_ms(w, v, v->fec_frame_avg), fec_repair_ms(w, v, v->fec_key_bytes), scale,
                 w->capacity_short, (unsigned long long)parity_bytes[1]);
         }
@@ -192,6 +221,8 @@ int main(int argc, char **argv)
             i,f[i].seq,received,ontime,keys,key_on,repeated,repeated_late,
             (unsigned long long)first_bytes[i],(unsigned long long)retry_bytes[i],(unsigned long long)parity_bytes[i],
             (unsigned long long)f[i].offered,(unsigned long long)ontime_bytes);
+        printf("FECCNT id=%d sent=%u lost=%u late=%u slow=%u\n", i, fec_counts[i][0], fec_counts[i][1], fec_counts[i][2], fec_counts[i][3]);
+        printf("RTX id=%d rto=%u rto_cov=%u rack=%u rack_cov=%u dup_rx=%u dup_rto=%u dup_rack=%u\n", i, rtx_why[i][2], rtx_cov[i][2], rtx_why[i][3], rtx_cov[i][3], dup_rx[i], dup_why[i][2], dup_why[i][3]);
         printf("BLOCKSUM id=%d blocks=%u small_blocks=%u data=%llu parities=%llu\n", i,blocks[i],small_blocks[i],(unsigned long long)block_data[i],(unsigned long long)block_parities[i]);
         if (strcmp(event, "none") || getenv("MEDIA_LOSS_WINDOWS")) {
             unsigned first_received = 0, first_ontime = 0, first_key = 0;
