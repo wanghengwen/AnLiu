@@ -415,6 +415,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define BBR_LT_PROBE_MAX    16      /* probe steps of 1/4 lt_rate without finding the ceiling: the policer is gone */
 #define BBR_LT_ROUNDS       4       /* rounds per policer-detection interval (and >= BBR_LT_MS) */
 #define BBR_LT_MS           300
+#define LT_GAP_MS           5000    /* after an input gap: its losses and backlog are no policer evidence */
 #define SEG_WIRE_OVH        30      /* per-segment share of datagram / segment headers */
 #define START_WND_MS    300     /* cfg.start_rate: initial window of this long at that rate */
 #define START_BURST_MTU 1       /* ... and pace_burst (unless set) in datagrams */
@@ -647,6 +648,7 @@ struct anl_s {
 
     int32_t rx_rttval, rx_srtt, rx_rto;
     int rtt_resume;                  /* resumed after an RTO without input: drain old ACK echoes */
+    uint32_t lt_gap_ts;              /* ... when input resumed after such a gap (| 1): no policer evidence for LT_GAP_MS */
     int reo_mult;                       /* RACK reordering window = reo_mult * min_rtt / 16 */
     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
     uint32_t reo_spur_ts;               /* last spurious RACK retransmission */
@@ -2563,6 +2565,22 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     if (bbr_queue_signal(w)) w->lt_bad |= 2;
     dur = (uint32_t)tdiff(w->current, w->lt_ts);
     if (w->lt_rounds < BBR_LT_ROUNDS || dur < BBR_LT_MS) return;
+    /* Intervals ending within LT_GAP_MS of a resumed input gap are dropped:
+       the outage's losses, abandoned frames and backlog retransmissions
+       read 40..60% lost, and the test interval after them only the path's
+       random 20% - "halved", a policer - which locked a 5 Mbit path at
+       0.6..0.8 Mbit for the remaining 60 s (simulation, 20 s outage, 180 ms,
+       3 of 400 runs). A real policer is found that much later. */
+    if (w->lt_gap_ts != 0 && tdiff(w->current, w->lt_gap_ts) < LT_GAP_MS) {
+        w->lt_rd = w->lt_lost = 0;
+        w->lt_rounds = 0;
+        w->lt_bad = 0;
+        w->lt_prev_rate = 0;
+        w->lt_ts = w->current | 1;
+        w->lt_sent0 = w->sent_wire;
+        w->lt_infl0 = bbr_inflight_bytes(w);
+        return;
+    }
     rate = sat32(w->lt_rd * 1000 / dur);
     counted = w->lt_rd + w->lt_lost > 0 ? (uint32_t)(w->lt_lost * 1000 / (w->lt_rd + w->lt_lost)) : 0;
     /* The interval's loss from what it sent and what was delivered - what
@@ -3769,7 +3787,7 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
     w->peer_ts_valid = 1;
     /* A delivery gap can release buffered ACKs together on resumption.
        Ordinary, continuously arriving ACKs must still measure queue delay. */
-    if (w->rx_srtt > 0 && tdiff(w->current, w->last_rx) > w->rx_rto) w->rtt_resume = 1;
+    if (w->rx_srtt > 0 && tdiff(w->current, w->last_rx) > w->rx_rto) { w->rtt_resume = 1; w->lt_gap_ts = w->current | 1; }
     w->last_rx = w->current;
     w->rx_dg++;
 

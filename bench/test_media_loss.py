@@ -5,6 +5,7 @@ Checks delivery and wire cost, not the estimator's formula. All configured
 random loss is at most 20%. Three seeds cover each scenario independently.
 """
 import argparse
+import os
 import pathlib
 import subprocess
 
@@ -49,10 +50,17 @@ def run(binary, output, rtt, loss, seed, stop=0):
           f"keys={video['key_ontime']}/{video['keys']}", flush=True)
 
 
+# Video fixed at the encoder level the closed loop averaged on main (01aff48)
+# in the same case, key and P frames scaled alike: the transport is judged at
+# an equal source rate, not through the rate controller's response to it.
+LOW_FIXED_SCALE = {800: 195, 2000: 500}
+
+
 def run_low(binary, output, bw, seed):
     # Six hundred seconds amortize startup and cover many key-frame bursts.
+    env = dict(os.environ, MEDIA_LOSS_FIXED_SCALE=str(LOW_FIXED_SCALE[bw]))
     result = subprocess.run([str(binary), str(bw), "100", "20", str(seed), "600"],
-                            capture_output=True, text=True, check=True)
+                            capture_output=True, text=True, check=True, env=env)
     name = f"low{bw}-seed{seed}"
     if output:
         (output / f"{name}.log").write_text(result.stdout + result.stderr)
