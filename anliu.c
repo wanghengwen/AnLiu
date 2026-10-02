@@ -4357,9 +4357,14 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
         /* not while large frames are short of parity budget (the bucket
            below half): those losses are likely our own congestion, more
            parity would add to it - the ratio ran to 100% on a 2 Mbps path
-           and its key frames overflowed the queue (simulation) */
+           and its key frames overflowed the queue (simulation). Only while
+           network-limited or queueing: app-limited, the budget follows an
+           estimate that shows only what was sent, and the losses are not
+           ours - with fewer spurious retransmissions to inflate it, 20%
+           random loss left the ratio at its floor (test.c, 5 of 140 seeds) */
         if (w->capacity_short || (st->fec_frame_avg * 8 > FEC_SMALL_BLOCK && w->par_rate != 0xffffffffu &&
-                                  w->par_tokens * 2 < (int64_t)par_bucket(w))) {
+                                  w->par_tokens * 2 < (int64_t)par_bucket(w) &&
+                                  (w->app_limited == 0 || bbr_queue_signal(w)))) {
             if (st->fec_ratio > FEC_FLOOR_CAP) st->fec_ratio = FEC_FLOOR_CAP;
             st->fec_adj_ts = w->current | 1;
             st->fec_sent = st->fec_miss = 0;
