@@ -46,6 +46,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -131,6 +132,8 @@ static flow g_fl[NFLOW];
 static int g_proto = P_ANL, g_test = 0 /* 0 media, 1 bulk, 2 stream, 3 mixed */, g_up = 1, g_server = 0;
 static int g_dur = 60, g_bulk_mb = 16, g_port = 0, g_wnd = 1024, g_interval = 10;      /* 0: anl 9836, kcp 9837 */
 static double g_loss = 0;
+static double g_rx_loss;
+static uint64_t g_rx_proto_packets, g_rx_proto_dropped;
 static int g_verify;
 static uint64_t g_input_errors, g_output_errors, g_payload_errors, g_checked_bytes;
 static uint64_t g_rng = 88172645463325252ull;
@@ -960,11 +963,24 @@ static int tcp_run(void)
     return 0;
 }
 
+/* A/K are protocol datagrams, including ACK/control; P/Q/H are probes. */
+static int rx_emulated_drop(const char *in)
+{
+    if (in[0] != 'A' && in[0] != 'K') return 0;
+    g_rx_proto_packets++;
+    if (g_rx_loss > 0 && (rnd() % 1000000) < (uint64_t)(g_rx_loss * 10000)) {
+        g_rx_proto_dropped++;
+        return 1;
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop|tcp]\n"
                     "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N] [--init-cwnd N]\n"
                     "       [--pace-rate BYTES_PER_S] [--pace-burst BYTES] [--start-rate BYTES_PER_S (0 off)]\n"
+                    "       [--rx-loss 0..20] (receive-side random protocol loss after physical network)\n"
                     "       [--rcv-deadline MS (-1 lifetime, 0 off)] [--fec-rtt-auto 0|1] [--fec-ratio 0..100 (0 adaptive)]\n"
                     "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n"
                     "       [--prio-audio 0..3] [--prio-video 0..3] (stream priority, 0 highest; default audio 0, video 1)\n"
@@ -1013,6 +1029,11 @@ int main(int argc, char **argv)
             if (g_start_rate < 0) usage();
         }
         else if (!strcmp(a, "--loss")) g_loss = atof(nx);
+        else if (!strcmp(a, "--rx-loss")) {
+            char *end;
+            g_rx_loss = strtod(nx, &end);
+            if (end == nx || *end || !isfinite(g_rx_loss) || g_rx_loss < 0 || g_rx_loss > 20) usage();
+        }
         else if (!strcmp(a, "--rcv-deadline")) {
             g_rcv_deadline = atoi(nx);
             if (g_rcv_deadline < -1) usage();
@@ -1050,6 +1071,7 @@ int main(int argc, char **argv)
     if (!g_server && !g_host) usage();
     if (g_port == 0) g_port = is_anl() ? 9836 : 9837;
     setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("RXLOSS_CONFIG probability_pct=%.1f scope=protocol_datagrams receive_point=after_network\n", g_rx_loss);
     if ((g_fec_ratio >= 0 || g_fec_ratio_flow[1] >= 0 || g_fec_ratio_flow[2] >= 0) && g_fec_rtt_auto) usage();   /* one FEC policy at a time */
     if (is_anl() && (g_test == 0 || g_test == 3))
         printf("POLICY proto=%s rcv_deadline=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d prio_audio=%d prio_video=%d (-2=library_default, -1=proto default)\n",
@@ -1083,6 +1105,7 @@ int main(int argc, char **argv)
         sa.sin_port = htons((uint16_t)g_port);
         sa.sin_addr.s_addr = INADDR_ANY;
         if (bind(g_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror("bind"); return 1; }
+        printf("WORKLOAD_READY proto=%s port=%d test=%d\n", proto_name[g_proto], g_port, g_test);
     } else {
         struct addrinfo hints, *res;
         char port[16];
@@ -1127,6 +1150,11 @@ int main(int argc, char **argv)
                 g_rx_pkts++;
                 if (g_server && g_peerlen == 0) { memcpy(&g_peer, &from, fl); g_peerlen = fl; }
                 last_rx_us = now_us();
+                if (rx_emulated_drop(in)) {
+                    fl = sizeof(from);
+                    if (g_clock_refresh && now_us() - b0 > 5000) break;
+                    continue;
+                }
                 if (in[0] == 'P' && n >= 9) {                               /* ping: echo */
                     char q[16]; memcpy(q, in + 1, 8); udp_send('Q', q, 8);
                 } else if (in[0] == 'Q' && n >= 9) {
@@ -1250,7 +1278,11 @@ int main(int argc, char **argv)
                 uint64_t linger = t + 2000000u;
                 while (now_us() < linger) {                 /* answer the last ACKs */
                     char in[2048]; ssize_t n = recv(g_fd, in, sizeof(in), MSG_DONTWAIT);
-                    if (n > 0 && in[0] == (is_anl() ? 'A' : 'K')) ep_input(in + 1, (int)n - 1);
+                    if (n > 0) {
+                        g_rx_bytes += (uint64_t)n + 28;
+                        g_rx_pkts++;
+                        if (!rx_emulated_drop(in) && in[0] == (is_anl() ? 'A' : 'K')) ep_input(in + 1, (int)n - 1);
+                    }
                     ep_update(now_ms());
                     usleep(1000);
                 }
@@ -1269,8 +1301,8 @@ int main(int argc, char **argv)
                 break;
             }
         }
-        /* Duration-based receivers must survive a temporary path pause during
-           the requested window. Fixed-volume bulk retains its idle completion. */
+        /* Duration-based receivers survive a pause inside the requested
+           window; fixed-volume bulk retains its idle completion. */
         if (started && !is_sender() && got_any && (g_test == 1 || t >= end_us) &&
             t - last_rx_us > 5000000u) {
             report_receiver();
@@ -1285,6 +1317,11 @@ int main(int argc, char **argv)
             break;
         }
     }
+    printf("RXLOSS probability_pct=%.1f proto_packets=%llu dropped_packets=%llu\n", g_rx_loss,
+           (unsigned long long)g_rx_proto_packets, (unsigned long long)g_rx_proto_dropped);
+    printf("DATAGRAM_COST tx_ipudp_bytes=%llu rx_ipudp_bytes=%llu tx_packets=%llu rx_packets=%llu\n",
+           (unsigned long long)g_tx_bytes, (unsigned long long)g_rx_bytes,
+           (unsigned long long)g_tx_pkts, (unsigned long long)g_rx_pkts);
     report_mdiag();
     report_rate();
     if (is_anl()) {
