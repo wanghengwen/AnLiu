@@ -5,7 +5,8 @@
  *       [interval_ms=10] [event=none|pause|delay] [start_s=30]
  *       [event_duration_s=20] [extra_one_way_ms=200]
  * Same frame_v1 workload / capped encoder feedback as realnet --adapt 1;
- * MEDIA_LOSS_FIXED_SCALE=<100..1000> fixes the video at that per mille instead.
+ * MEDIA_LOSS_FIXED_SCALE=<100..1000> fixes the video at that per mille instead;
+ * MEDIA_LOSS_AUDIO_ONLY=1 sends no video.
  * The link has 100 ms queue depth and independent loss in both directions.
  * Timely media uses the original propagation delay as its minimum baseline;
  * an event's extra delay consumes that same delivery budget. A delivery pause
@@ -39,6 +40,7 @@ static unsigned sent_ms[2][30001], received_ms[2][30001];
 static unsigned blocks[2], small_blocks[2];
 static uint64_t block_data[2], block_parities[2];
 static int scale = 1000;
+static int audio_only;      /* MEDIA_LOSS_AUDIO_ONLY: no video frames */
 static int fixed_scale;     /* MEDIA_LOSS_FIXED_SCALE: video at this per mille, encoder feedback off */
 static void loss_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint32_t m, uint32_t lmax, int key)
 {
@@ -135,6 +137,7 @@ int main(int argc, char **argv)
         if (fixed_scale < 100 || fixed_scale > 1000) return 2;
         scale = fixed_scale;
     }
+    audio_only = getenv("MEDIA_LOSS_AUDIO_ONLY") != NULL;
     anl_set_rate_callback(s.e[0].anl, loss_adapt);
     flow_audio(&f[0], 0, &V_ANLF); flow_video(&f[1], 1, &V_ANLF);
     s.fl = f; s.nfl = 2;
@@ -153,7 +156,7 @@ int main(int argc, char **argv)
         }
         if (s.t < (uint64_t)duration * 1000) {
             scale_sum += scale; gate_ms += s.e[0].h[1]->fec_gate; short_ms += s.e[0].anl->capacity_short;
-            for (i = 0; i < 2; i++) if (s.t >= f[i].next_t) {
+            for (i = 0; i < 2; i++) if (s.t >= f[i].next_t && !(i == 1 && audio_only)) {
                 int key = i && f[i].seq % 30 == 0;
                 int len = loss_size(&f[i], key, seed);
                 frame_bytes[i][f[i].seq] = (unsigned)len;

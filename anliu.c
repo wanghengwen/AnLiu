@@ -454,6 +454,11 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
                                    real cross-border video 97.5..98.6% at 20%, progress 40) */
 #define FEC_SMALL_BLOCK   2048  /* data bytes up to which a block counts as small (audio) */
 #define FEC_SMALL_RATIO   100   /* adaptive, a retransmission too late: parities of a small block, % */
+#define FEC_RIDE_MS       25    /* a small block's parity waits this long for the stream's next first
+                                   transmission to ride with (fec_ride), then goes alone */
+#define FEC_RIDE_LOSS     6554  /* ... below this loss estimate (10%, 1/65536) */
+#define FEC_RIDE_MAX      512   /* ... and only parities up to this long (Lmax: one k = 1 block of
+                                   1300 bytes is small too, and would not fit beside a data segment) */
 
 static const uint32_t prio_weight[ANL_MAX_PRIO] = { 8, 4, 2, 1 };
 
@@ -613,6 +618,7 @@ typedef struct anl_stream {
     uint32_t fec_base, fec_first_ts, fec_n, fec_blk_ms;  /* fec_blk_ms: the open block collects this long */
     fec_buf *fec_out;                   /* sender: parities of the last block (FEC_M_MAX), FEC_GAP apart */
     uint32_t fec_out_base, fec_out_k, fec_out_m, fec_out_i, fec_out_ts;
+    int fec_out_small;                  /* the last block was small (k x Lmax <= FEC_SMALL_BLOCK): fec_ride */
     fec_centry *cache;
     uint32_t cache_n;
     fec_pentry *pcache;
@@ -4007,23 +4013,24 @@ int anl_input(anl_t *w, const char *data, long size)
 /*--------------------------------------------------------------------
  * FEC encoder (DESIGN 8.2 / 8.3)
  *-------------------------------------------------------------------*/
-/* Send the next parity of the last closed block. Each goes in a datagram of
- * its own (never with a member: losing that datagram would take the member and
- * a repair with it) and FEC_GAP after the previous one, so that one loss burst
- * does not take all of them. */
-static void fec_send_parity(anl_t *w, anl_stream *st)
+/* Write the next parity of the last closed block. Never with a member:
+ * losing that datagram would take the member and a repair with it. Alone, a
+ * datagram of its own FEC_GAP after the previous one, so that one loss burst
+ * does not take all of them; riding (fec_ride), into the datagram that just
+ * took the stream's next first transmission - of a later block. */
+static void fec_write_parity(anl_t *w, anl_stream *st, int alone)
 {
     uint8_t *body = (uint8_t *)w->scratch + w->mtu;         /* second half of scratch */
     const fec_buf *b = &st->fec_out[st->fec_out_i];
     char *p = (char *)body;
-    dg_seal(w);
+    if (alone) dg_seal(w);
     p = enc24(p, st->fec_out_base & SN_MASK);
     p = enc8(p, (uint8_t)st->fec_out_k);
     p = enc8(p, (uint8_t)st->fec_out_m);
     p = enc8(p, (uint8_t)st->fec_out_i);
     memcpy(p, b->p, b->len);
     write_ctrl_seg(w, st->sid, CTRL_PARITY, body, PARITY_HDR + b->len);
-    dg_seal(w);
+    if (alone) dg_seal(w);
     w->sent_wire += PARITY_HDR + b->len + SEG_WIRE_OVH;
     vq_add(w, PARITY_HDR + b->len + SEG_WIRE_OVH);
     w->sent_par += PARITY_HDR + b->len + SEG_WIRE_OVH;
@@ -4032,12 +4039,45 @@ static void fec_send_parity(anl_t *w, anl_stream *st)
     st->fec_out_ts = w->current + FEC_GAP;
 }
 
+static void fec_send_parity(anl_t *w, anl_stream *st) { fec_write_parity(w, st, 1); }
+
+/* A small block's parities ride with the stream's following first
+ * transmissions, one each, instead of datagrams of their own: a datagram
+ * header and tag (about 65 bytes with IP/UDP) on a 176-byte audio parity.
+ * Judged by the block's size alone - audio, or video at a low rate. Audio
+ * alone at 3..7% loss: 6..13% fewer bytes, a third fewer datagrams, on time
+ * the same (simulation, 100..300 ms RTT; low-rate video 4..9%). Not while a
+ * queue shows: the 20 ms a parity then waits adds to the queue's and cost
+ * audio 1..2 points at 800 kbit. Not from FEC_RIDE_LOSS on either: a block
+ * that needs several waited 20 ms for each (15%: audio -1..-2), and even the
+ * first one's wait put 20% loss at 100 ms RTT below 99.5% audio. */
+static int fec_ride(const anl_t *w, const anl_stream *st)
+{
+    if (!st->fec_out_small || st->fec_out_m == 0 || st->fec_out[0].len > FEC_RIDE_MAX) return 0;
+    if (w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    return w->fec_loss < FEC_RIDE_LOSS;
+}
+
+/* a first transmission of a later block went into the datagram: a pending
+   parity of the last one rides along */
+static void fec_ride_parity(anl_t *w, anl_stream *st, const anl_seg *seg)
+{
+    if (st->fec_out_i >= st->fec_out_m || !fec_ride(w, st)) return;
+    if (tdiff(seg->sn, st->fec_out_base + st->fec_out_k) < 0) return;  /* a member */
+    /* not if it does not fit: it would seal the data and start a datagram of
+       its own - it waits for the next one, or goes alone after FEC_RIDE_MS */
+    if (dg_room(w) < sid_bytes(st->sid) + 1u + (uint32_t)varint_size(PARITY_HDR + st->fec_out[st->fec_out_i].len) +
+                     PARITY_HDR + st->fec_out[st->fec_out_i].len) return;
+    fec_write_parity(w, st, 0);
+}
+
 /* the parity that is due, if pacing allows - in the stream's turn of the
  * priority schedule (DESIGN 8.2); all of them with flush_all (a new block
  * closes and needs the buffers) */
 static void fec_pump(anl_t *w, anl_stream *st, int flush_all)
 {
-    while (st->fec_out_i < st->fec_out_m && (flush_all || tdiff(w->current, st->fec_out_ts) >= 0)) {
+    while (st->fec_out_i < st->fec_out_m && (flush_all ||
+           tdiff(w->current, st->fec_out_ts + (fec_ride(w, st) ? FEC_RIDE_MS : 0)) >= 0)) {
         if (!flush_all && !pace_can_send(w)) { w->pace_blocked = 1; break; }
         fec_send_parity(w, st);
         if (!flush_all) break;
@@ -4286,6 +4326,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     st->fec_out_m = m;
     st->fec_out_i = 0;
     st->fec_out_ts = w->current;
+    st->fec_out_small = k * lmax <= FEC_SMALL_BLOCK;
     fec_budget_refill(w);
     w->par_tokens -= (int64_t)m * (lmax + PARITY_HDR + SEG_WIRE_OVH);
 #ifdef ANL_FEC_BLOCK_TRACE
@@ -4484,6 +4525,7 @@ static void send_seg(anl_t *w, anl_stream *st, anl_seg *seg)
     bbr_on_send(w, seg);
     if (first) {
         w->tx_payload += seg->len;
+        if (st->fec) fec_ride_parity(w, st, seg);
         if (st->fec) fec_add(w, st, seg);
         fec_auto_count(w, st, FEC_SENT);
     } else {
