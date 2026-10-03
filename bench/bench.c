@@ -350,7 +350,7 @@ static void dir_free(dir *d)
 static int g_fast = 1;
 static int g_init_cwnd;         /* --init-cwnd; 0 keeps the library default */
 
-static int anl_out(const char *buf, int len, anl_t *w, void *user)
+static int anl_out(char *buf, int len, anl_t *w, void *user)
 {
     ep *e = (ep *)user;
     (void)w;

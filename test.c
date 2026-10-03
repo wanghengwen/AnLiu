@@ -69,7 +69,7 @@ static void net_enqueue(net *n, int to, const char *data, int len, uint32_t at)
     if (p->next == NULL) n->qtail = p;
 }
 
-static int net_output(const char *buf, int len, anl_t *w, void *user)
+static int net_output(char *buf, int len, anl_t *w, void *user)
 {
     int *idx = (int *)user;
     net *n = (net *)((char *)idx - offsetof(net, ep_idx) - (size_t)(*idx) * sizeof(int));
@@ -269,6 +269,24 @@ static void test_kat(void)
         wire[50] ^= 1;
         r = siv_open(&keys, 0, wire, 112, plain);
         CHECK(r == ANL_EAUTH, "tampered datagram rejected (%d)", r);
+        wire[50] ^= 1;
+        /* conv (P's first 4 bytes: 0, 7, 14, 21) goes out masked with the
+           4 tag bytes from (tag[0] & 7) + 1, still authenticated */
+        {
+            uint8_t off = (uint8_t)(1 + (wire[0] & 7));
+            uint32_t conv = 0;
+            CHECK((wire[ANL_TAG_SIZE] ^ wire[off]) == 0 && (wire[ANL_TAG_SIZE + 1] ^ wire[off + 1]) == 7 &&
+                  (wire[ANL_TAG_SIZE + 2] ^ wire[off + 2]) == 14 && (wire[ANL_TAG_SIZE + 3] ^ wire[off + 3]) == 21,
+                  "conv masked by tag bytes from offset %u", off);
+            CHECK(anl_peek_conv((const char *)wire, 112, &conv) == ANL_OK && conv == 0x150e0700u,
+                  "conv read without keys (%08x)", conv);
+            wire[ANL_TAG_SIZE + 2] ^= 0x40;
+            r = siv_open(&keys, 0, wire, 112, plain);
+            CHECK(r == ANL_EAUTH, "tampered conv rejected (%d)", r);
+            wire[ANL_TAG_SIZE + 2] ^= 0x40;
+            r = siv_open(&keys, 0, wire, 112, plain);
+            CHECK(r == 100 && plain[2] == 14, "restored datagram opens again (%d)", r);
+        }
     }
 
     /* varint */
@@ -782,7 +800,7 @@ static void test_pacing(void)
 /* capture callback for the demux test */
 static char g_cap[2048];
 static int g_caplen;
-static int cap_output(const char *buf, int len, anl_t *w, void *user)
+static int cap_output(char *buf, int len, anl_t *w, void *user)
 {
     (void)w; (void)user;
     memcpy(g_cap, buf, (size_t)len);
@@ -792,11 +810,11 @@ static int cap_output(const char *buf, int len, anl_t *w, void *user)
 
 static void test_demux(void)
 {
-    anl_keys keys; anl_config ca, cb; anl_t *a, *b;
+    anl_config ca, cb; anl_t *a, *b, *c;
     char plain[2048];
     uint32_t conv = 0;
     int r;
-    printf("[demux: peek_conv + input_plain]\n");
+    printf("[demux: peek_conv without keys, then anl_input]\n");
     anl_config_default(&ca, ANL_ROLE_CLIENT);
     anl_config_default(&cb, ANL_ROLE_SERVER);
     memset(ca.psk, 7, 32); memset(cb.psk, 7, 32);
@@ -807,21 +825,77 @@ static void test_demux(void)
     anl_update(a, 10); anl_update(b, 10);
     anl_send(a, "hello", 5);                    /* default stream: flush_on_send */
     CHECK(g_caplen > 0, "A emitted a datagram");
-    anl_keys_derive(&keys, cb.psk);
-    r = anl_peek_conv(&keys, ANL_ROLE_SERVER, g_cap, g_caplen, &conv, plain);
-    CHECK(r > 0 && conv == 0xabcdef01, "peek_conv r=%d conv=%08x", r, conv);
-    r = anl_peek_conv(&keys, ANL_ROLE_CLIENT, g_cap, g_caplen, &conv, plain);
-    CHECK(r == ANL_EAUTH, "peek with wrong role fails (%d)", r);
-    r = anl_peek_conv(&keys, ANL_ROLE_SERVER, g_cap, g_caplen, &conv, plain);
-    r = anl_input_plain(b, plain, r);
-    CHECK(r == ANL_OK, "input_plain ok (%d)", r);
+    r = anl_peek_conv(g_cap, g_caplen, &conv);
+    CHECK(r == ANL_OK && conv == 0xabcdef01, "peek_conv without keys r=%d conv=%08x", r, conv);
+    CHECK(anl_peek_conv(g_cap, ANL_OVERHEAD - 1, &conv) == ANL_EFORMAT, "too short for a conv");
+    CHECK(anl_peek_conv(NULL, g_caplen, &conv) == ANL_EINVAL, "no data");
+    /* the conv on the wire is no constant: masked by tag bytes */
+    {
+        const uint8_t *t = (const uint8_t *)g_cap;
+        uint32_t raw = (uint32_t)t[12] | (uint32_t)t[13] << 8 | (uint32_t)t[14] << 16 | (uint32_t)t[15] << 24;
+        uint8_t off = (uint8_t)(1 + (t[0] & 7));
+        uint32_t mask = (uint32_t)t[off] | (uint32_t)t[off + 1] << 8 | (uint32_t)t[off + 2] << 16 | (uint32_t)t[off + 3] << 24;
+        CHECK((raw ^ mask) == 0xabcdef01, "wire conv = conv ^ tag[%u..%u]", off, off + 3);
+    }
+    r = anl_input(b, g_cap, g_caplen);
+    CHECK(r == ANL_OK, "anl_input of the peeked datagram ok (%d)", r);
     r = anl_recv(b, plain, sizeof(plain));
-    CHECK(r == 5 && memcmp(plain, "hello", 5) == 0, "B got the data via input_plain (%d)", r);
+    CHECK(r == 5 && memcmp(plain, "hello", 5) == 0, "B got the data (%d)", r);
+    /* a changed conv is caught by the tag, not by the lookup */
+    c = anl_create(0xabcdef02, &cb, NULL);
+    anl_update(c, 10);
+    g_cap[12] ^= 0x03;                      /* the low conv bits: 01 -> 02 after unmasking */
+    r = anl_peek_conv(g_cap, g_caplen, &conv);
+    CHECK(r == ANL_OK && conv == 0xabcdef02, "tampered conv peeks as %08x", conv);
+    r = anl_input(c, g_cap, g_caplen);
+    CHECK(r == ANL_EAUTH, "tampered conv fails authentication (%d)", r);
+    anl_release(a); anl_release(b); anl_release(c);
+}
+
+/* the output callback may rewrite the clear 16 bytes in place (e.g. encrypt
+   them); the receiver undoes it in its own buffer before anl_peek_conv /
+   anl_input */
+static int g_xor_calls;
+static int xor16_output(char *buf, int len, anl_t *w, void *user)
+{
+    int i;
+    for (i = 0; i < 16 && i < len; i++) buf[i] ^= (char)(0x5a + i);
+    g_xor_calls++;
+    return cap_output(buf, len, w, user);
+}
+
+static void test_output_rewrite(void)
+{
+    anl_config ca, cb; anl_t *a, *b;
+    char buf[2048];
+    uint32_t conv = 0;
+    int r, i, len;
+    printf("[output callback: rewrite the clear header in place]\n");
+    anl_config_default(&ca, ANL_ROLE_CLIENT);
+    anl_config_default(&cb, ANL_ROLE_SERVER);
+    memset(ca.psk, 9, 32); memset(cb.psk, 9, 32);
+    a = anl_create(0x01020304, &ca, NULL);
+    b = anl_create(0x01020304, &cb, NULL);
+    anl_setoutput(a, xor16_output);
+    g_caplen = 0; g_xor_calls = 0;
+    anl_update(a, 10); anl_update(b, 10);
+    anl_send(a, "rewritten", 9);
+    CHECK(g_caplen > 0 && g_xor_calls >= 1, "datagram sent through the rewriting callback (%d)", g_xor_calls);
+    len = g_caplen;
+    memcpy(buf, g_cap, (size_t)len);
+    r = anl_input(b, buf, len);
+    CHECK(r == ANL_EAUTH, "not undone: authentication fails (%d)", r);
+    for (i = 0; i < 16; i++) buf[i] ^= (char)(0x5a + i);
+    CHECK(anl_peek_conv(buf, len, &conv) == ANL_OK && conv == 0x01020304, "undone: conv %08x", conv);
+    r = anl_input(b, buf, len);
+    CHECK(r == ANL_OK, "undone: accepted (%d)", r);
+    r = anl_recv(b, buf, sizeof(buf));
+    CHECK(r == 9 && memcmp(buf, "rewritten", 9) == 0, "data through the rewrite (%d)", r);
     anl_release(a); anl_release(b);
 }
 
 /*---------------------------------------------------------------------
- * 5. fuzz: mutate authenticated plaintext, feed through anl_input_plain
+ * 5. fuzz: mutate authenticated plaintext, feed through the internal anl_input_plain
  *-------------------------------------------------------------------*/
 static void test_fuzz(void)
 {
@@ -1754,7 +1828,7 @@ static void test_receiver_deadline_default(void)
 static int g_skip_packets, g_skip_acks, g_skip_want;
 static uint32_t g_skip_watermark;
 
-static int skip_ack_output(const char *wire, int len, anl_t *w, void *user)
+static int skip_ack_output(char *wire, int len, anl_t *w, void *user)
 {
     uint8_t plain[2048];
     const char *p, *end;
@@ -2839,7 +2913,7 @@ static void test_fec_dither(void)
 /* the parity budget (DESIGN 8.6): an 8-packet video block at 10% loss;
  * without budget it gets only the FEC_AUTO_MIN share, a key frame's block
  * the full loss floor */
-static int out_nop(const char *buf, int len, anl_t *w, void *user) { (void)buf; (void)len; (void)w; (void)user; return 0; }
+static int out_nop(char *buf, int len, anl_t *w, void *user) { (void)buf; (void)len; (void)w; (void)user; return 0; }
 static uint32_t run_fec_budget(uint32_t par_rate, int key)
 {
     anl_config c; anl_stream_opt o; anl_t *w; anl_stream_t *s; int err;
@@ -3703,6 +3777,7 @@ int main(void)
     RUN(test_sid_churn(10, 4000));
     RUN(test_kat());
     RUN(test_demux());
+    RUN(test_output_rewrite());
     RUN(test_default_stream());
     RUN(test_reliable(0, 0));
     RUN(test_reliable(10, 0));

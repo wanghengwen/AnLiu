@@ -244,7 +244,12 @@ typedef struct anl_stream_stats {
 typedef struct anl_s anl_t;
 typedef struct anl_stream anl_stream_t;
 
-typedef int (*anl_output_fn)(const char *buf, int len, anl_t *w, void *user);
+/* Sends one finished datagram (DESIGN 3.2). buf is the library's own and is
+ * not used after the call: the callback may rewrite it in place - typically
+ * the clear tag + conv (the first 16 bytes), e.g. to encrypt them - but not
+ * its length. The receiver undoes that in its own buffer before
+ * anl_peek_conv / anl_input. Must not call anl_* functions. */
+typedef int (*anl_output_fn)(char *buf, int len, anl_t *w, void *user);
 
 /* Called from anl_input when the peer opens a new stream. s is the new
  * stream (anl_stream_tag / anl_stream_id tell what it is); opt is pre-filled
@@ -269,23 +274,13 @@ void anl_config_default(anl_config *cfg, int role);
 void anl_stream_opt_default(anl_stream_opt *opt, int mode);
 
 /*---------------------------------------------------------------------
- * keys / server demux
+ * server demux
  *---------------------------------------------------------------------*/
-/* per-direction keys derived from the PSK; index = sender role */
-typedef struct anl_keys {
-    uint8_t enc[2][32];         /* ChaCha20 key */
-    uint8_t mac[2][16];         /* SipHash key */
-    uint8_t rng[2][16];         /* built-in PRNG seed key */
-} anl_keys;
-
-void anl_keys_derive(anl_keys *keys, const uint8_t psk[ANL_PSK_SIZE]);
-
-/* Verify and decrypt one datagram with the peer-direction keys of `role`.
- * On success returns the plaintext length, writes the plaintext into
- * `plain` (capacity >= size - ANL_TAG_SIZE) and outputs conv.
- * Returns ANL_EAUTH / ANL_EFORMAT on failure; never reply on ANL_EAUTH. */
-int anl_peek_conv(const anl_keys *keys, int role, const char *data, long size,
-                  uint32_t *conv, char *plain);
+/* conv of a datagram as it arrives, without keys or decryption: it travels
+ * in the clear after the tag, only masked (DESIGN 3.4, 4). Unauthenticated -
+ * use it to find the connection, then anl_input verifies the datagram.
+ * Returns ANL_OK, or ANL_EFORMAT / ANL_EINVAL. */
+int anl_peek_conv(const char *data, long size, uint32_t *conv);
 
 /*---------------------------------------------------------------------
  * connection
@@ -310,9 +305,6 @@ void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
  * avoid blocking it. Up to one interval of staleness is tolerated (DESIGN 6.8),
  * but larger gaps can underestimate RTT and corrupt the path model. */
 int      anl_input(anl_t *w, const char *data, long size);
-/* Feed plaintext already verified by anl_peek_conv (skips crypto).
- * The same clock-refresh requirements as anl_input apply. */
-int      anl_input_plain(anl_t *w, const char *plain, long size);
 
 /* Drive timers; current is a monotonic millisecond clock. anl_check also
  * accounts for pacing: drive a timer from its return value (1..5 ms

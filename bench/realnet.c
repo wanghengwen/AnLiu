@@ -368,7 +368,7 @@ static void udp_send(char tag, const char *buf, int len)
     } else g_output_errors++;
 }
 
-static int anl_out(const char *buf, int len, anl_t *w, void *user)
+static int anl_out(char *buf, int len, anl_t *w, void *user)
 {
     (void)w; (void)user;
     udp_send('A', buf, len);

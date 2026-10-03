@@ -193,7 +193,7 @@ ANL_TEST_ONLY=priority ./anl_test   # 只运行名字包含 priority 的测试
 
 | 类别 | 测试 |
 |---|---|
-| 密码学 | ChaCha20（RFC 8439 向量）、SipHash-2-4 已知答案；服务端分发（`anl_peek_conv` / `anl_input_plain`）；反射攻击；过期重放 |
+| 密码学 | ChaCha20（RFC 8439 向量）、SipHash-2-4 已知答案；服务端分发（`anl_peek_conv` 免解密取 conv、conv 混淆与篡改检测）；反射攻击；过期重放 |
 | 可靠流 | 0% / 10% 丢包，消息模式与字节流模式，内容与顺序校验 |
 | 半可靠流 | 0% / 5% 丢包、有无 FEC、1 Mbps 拥塞；帧号、`lost_before` 统计闭合 |
 | FEC | 指定丢掉某些数据报（帧的最后一个分片、分散丢 3 个、连续丢 4 个）必须在一个 RTT 内由 RS 恢复；自适应冗余（无丢包降到下限、误时的丢失使其上升、重传赶得上时不上升）；音频 + 视频两个流同时自适应；PARITY 段模糊测试 |
@@ -281,7 +281,7 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 3. **密钥交换与前向保密**：目前只有 PSK，握手和会话密钥管理仍由应用解决；
 4. **连接迁移与路径 MTU 探测**：当前不提供地址验证、迁移握手或自动 MTU 探测；
 5. **接收端反馈参与码率控制**：时延报告已交给应用，当前 `target_rate` 主要根据发送端模型、RTT 与实际交付计算；
-6. **持续模糊测试**：对 `anl_input_plain` 接入覆盖率引导的长期模糊测试。
+6. **持续模糊测试**：对解密后的报文解析（内部 `anl_input_plain`）接入覆盖率引导的长期模糊测试。
 
 ---
 
@@ -290,7 +290,8 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 ```c
 #include "anliu.h"
 
-static int udp_out(const char *buf, int len, anl_t *w, void *user) {
+static int udp_out(char *buf, int len, anl_t *w, void *user) {
+    /* 需要时可先原地处理前 16 字节明文头（tag + conv），长度不变 */
     /* sendto(sock, buf, len, ...) */
     return 0;
 }

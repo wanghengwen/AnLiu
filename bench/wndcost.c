@@ -42,7 +42,7 @@ static uint64_t g_bps;              /* bytes per second */
 static uint32_t g_owd, g_loss, g_qlimit_us;
 static uint64_t g_drops, g_tx;
 
-static int out(const char *buf, int len, anl_t *w, void *user)
+static int out(char *buf, int len, anl_t *w, void *user)
 {
     int from = *(int *)user;
     dirq *q = &g_q[from];

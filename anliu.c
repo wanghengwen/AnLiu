@@ -285,8 +285,14 @@ static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
     return d == 0;
 }
 
-/* DESIGN 3.1: per-direction keys */
-void anl_keys_derive(anl_keys *keys, const uint8_t psk[ANL_PSK_SIZE])
+/* DESIGN 3.1: per-direction keys; index = sender role */
+typedef struct anl_keys {
+    uint8_t enc[2][32];         /* ChaCha20 key */
+    uint8_t mac[2][16];         /* SipHash key */
+    uint8_t rng[2][16];         /* built-in PRNG seed key */
+} anl_keys;
+
+static void anl_keys_derive(anl_keys *keys, const uint8_t psk[ANL_PSK_SIZE])
 {
     static const uint8_t kdf_nonce[12] = { 'A','n','L','i','u','-','K','D','F','-','v','1' };
     int dir;
@@ -299,14 +305,26 @@ void anl_keys_derive(anl_keys *keys, const uint8_t psk[ANL_PSK_SIZE])
     }
 }
 
+/* conv goes out in the clear right after the tag (DESIGN 3.2, 4), XOR-masked
+ * with the 4 tag bytes at (tag[0] & 7) + 1: not a secret - anyone with the
+ * algorithm undoes it - only no constant on the wire. It stays part of P and
+ * so under the tag. The mask is its own inverse. */
+static void conv_mask(const uint8_t *tag, uint8_t *conv)
+{
+    const uint8_t *m = tag + 1 + (tag[0] & 7);
+    int i;
+    for (i = 0; i < 4; i++) conv[i] ^= m[i];
+}
+
 /* Seal P in place. buf points at the tag slot; P starts at buf + ANL_TAG_SIZE
- * and is plen bytes long. */
+ * and is plen bytes long: the tag covers all of P, the encryption P after conv. */
 static void siv_seal(const anl_keys *keys, int dir, uint8_t *buf, size_t plen)
 {
     uint8_t tag[16];
     siphash128(keys->mac[dir], buf + ANL_TAG_SIZE, plen, tag);
     memcpy(buf, tag, ANL_TAG_SIZE);
-    chacha20_xor(keys->enc[dir], buf, 0, buf + ANL_TAG_SIZE, plen);
+    chacha20_xor(keys->enc[dir], buf, 0, buf + ANL_TAG_SIZE + 4, plen - 4);
+    conv_mask(buf, buf + ANL_TAG_SIZE);
 }
 
 /* Open a datagram: decrypt into plain, verify. Returns plaintext length or error. */
@@ -317,7 +335,8 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
     if (size < (size_t)ANL_OVERHEAD) return ANL_EFORMAT;
     plen = size - ANL_TAG_SIZE;
     memcpy(plain, wire + ANL_TAG_SIZE, plen);
-    chacha20_xor(keys->enc[dir], wire, 0, plain, plen);
+    conv_mask(wire, plain);
+    chacha20_xor(keys->enc[dir], wire, 0, plain + 4, plen - 4);
     siphash128(keys->mac[dir], plain, plen, tag);
     if (!ct_equal(tag, wire, ANL_TAG_SIZE)) return ANL_EAUTH;
     return (int)plen;
@@ -3778,7 +3797,8 @@ static void handle_close(anl_t *w, int sid, const char *body, uint32_t blen, int
 /*--------------------------------------------------------------------
  * datagram parsing (DESIGN 3.3 step 5 onwards)
  *-------------------------------------------------------------------*/
-int anl_input_plain(anl_t *w, const char *plain, long size)
+/* plaintext P that siv_open verified (test.c feeds crafted ones) */
+static int anl_input_plain(anl_t *w, const char *plain, long size)
 {
     const char *p, *end;
     uint32_t conv, ts;
@@ -3979,18 +3999,15 @@ int anl_input_plain(anl_t *w, const char *plain, long size)
     return ANL_OK;
 }
 
-int anl_peek_conv(const anl_keys *keys, int role, const char *data, long size,
-                  uint32_t *conv, char *plain)
+int anl_peek_conv(const char *data, long size, uint32_t *conv)
 {
-    int r;
-    const char *p;
-    if (keys == NULL || data == NULL || plain == NULL || (role != 0 && role != 1)) return ANL_EINVAL;
+    uint8_t c[4];
+    if (data == NULL || conv == NULL) return ANL_EINVAL;
     if (size < ANL_OVERHEAD || size > 65535) return ANL_EFORMAT;
-    r = siv_open(keys, 1 - role, (const uint8_t *)data, (size_t)size, (uint8_t *)plain);
-    if (r < 0) return r;
-    p = plain;
-    if (conv) *conv = dec32(&p);
-    return r;
+    memcpy(c, data + ANL_TAG_SIZE, 4);
+    conv_mask((const uint8_t *)data, c);
+    *conv = (uint32_t)c[0] | (uint32_t)c[1] << 8 | (uint32_t)c[2] << 16 | (uint32_t)c[3] << 24;
+    return ANL_OK;
 }
 
 int anl_input(anl_t *w, const char *data, long size)

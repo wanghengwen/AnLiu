@@ -8,7 +8,7 @@
 #include <assert.h>
 
 static uint64_t outbytes;
-static int sink(const char *p, int len, anl_t *w, void *u)
+static int sink(char *p, int len, anl_t *w, void *u)
 {
     (void)p; (void)w; (void)u; outbytes += (uint32_t)len; return 0;
 }

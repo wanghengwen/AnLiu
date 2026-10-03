@@ -195,7 +195,7 @@ Coverage:
 
 | Category | Tests |
 |---|---|
-| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` / `anl_input_plain`); reflection attack; stale replay |
+| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` without keys, conv masking and tamper detection); reflection attack; stale replay |
 | Reliable streams | 0% / 10% loss, message mode and byte-stream mode, content and order checks |
 | Semi-reliable streams | 0% / 5% loss, with and without FEC, 1 Mbps congestion; frame numbers, `lost_before` accounting closes |
 | FEC | Specific datagram drops (last fragment of a frame, 3 scattered, 4 consecutive) must be recovered by RS within one RTT; adaptive redundancy (falls to the floor without loss, rises on late losses, does not rise when retransmission is in time); audio + video streams adapting simultaneously; PARITY segment fuzzing |
@@ -283,7 +283,7 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 3. **Key exchange and forward secrecy**: only PSK for now; handshakes and session-key management are left to the application;
 4. **Connection migration and path MTU discovery**: no address validation, migration handshake or automatic MTU probing yet;
 5. **Receiver feedback in rate control**: delay reports are delivered to the application, but `target_rate` is currently computed mainly from the sender model, RTT and actual delivery;
-6. **Continuous fuzzing**: long-running coverage-guided fuzzing of `anl_input_plain`.
+6. **Continuous fuzzing**: long-running coverage-guided fuzzing of the decrypted-datagram parser (internal `anl_input_plain`).
 
 ---
 
@@ -292,7 +292,8 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 ```c
 #include "anliu.h"
 
-static int udp_out(const char *buf, int len, anl_t *w, void *user) {
+static int udp_out(char *buf, int len, anl_t *w, void *user) {
+    /* may first rewrite the clear 16-byte header (tag + conv) in place, same length */
     /* sendto(sock, buf, len, ...) */
     return 0;
 }

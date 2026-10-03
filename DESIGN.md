@@ -78,25 +78,27 @@ k_rng[dir] = blk[dir][48..63]   // 本端内置 PRNG 的种子密钥，16 字节
 - 因此把 A 发出的数据报反射回 A，会因为密钥方向不匹配而认证失败。这是防反射攻击的关键；
 - 两端角色配置相同时，双方无法验证对方的包；认证失败包必须静默丢弃。
 
-服务端可让同一分发域的连接共用一个 PSK；这由应用决定，协议不要求不同连接必须共用。这样服务端在查到连接之前，就能先验证数据报并解出 conv（见 3.4）。派生结果可以放在 `anl_keys` 中复用，避免每个数据报都重做 KDF。
+每个连接用自己的配置（PSK）派生密钥；不同连接可以共用 PSK，也可以各用各的，由应用决定。服务端不需要先解密就能读出 conv（3.4），按 conv 找到连接后再用该连接的密钥验证和解密。
 
 ### 3.2 SIV 构造（发送）
 
 设 `P` 为明文数据报（数据报头 + 各段 + 可选填充），不含 tag。
 
 ```
-tag   = SipHash-2-4-128(k_mac[role], P)[0..11]        // 16 字节输出截断为 12 字节
-nonce = tag                                          // 12 字节 IETF nonce
-C     = P XOR ChaCha20(k_enc[role], nonce, counter=0) // 整个 P 都加密
-wire  = tag || C
+tag   = SipHash-2-4-128(k_mac[role], P)[0..11]         // 16 字节输出截断为 12 字节，覆盖整个 P（含 conv）
+nonce = tag                                           // 12 字节 IETF nonce
+off   = (tag[0] & 7) + 1                              // 1..8
+convx = conv XOR tag[off..off+3]                      // conv 只做混淆，不加密
+C     = P[4..] XOR ChaCha20(k_enc[role], nonce, 0)    // conv 之后的部分加密
+wire  = tag || convx || C
 ```
 
-只有一种加密模式：整包认证和加密。tag 在加密区之外，其他字段和填充均在加密区内。
+只有一种模式：整包认证，conv 之后加密。conv 不是秘密：知道算法的人都能用明文 tag 还原它；混淆只是让线上不出现每包固定的 4 字节。conv 仍在认证范围内，改动它会使认证失败。tag 与 conv 共 16 字节是明文，需要的话由应用自行处理：output 回调（`int output(char *buf, int len, anl_t *w, void *user)`）拿到的是库自己的缓冲，回调返回后不再使用，可以在发送前原地改写（例如加密）这 16 字节或其他字节，但不能改变长度；接收方在自己的接收缓冲里原地还原后再调用 `anl_peek_conv` / `anl_input`。
 
 ### 3.3 接收
 
 1. 数据报长度小于 `12 + 9` 字节，或大于配置的 `mtu`，直接丢弃（`ANL_EFORMAT`）；
-2. 用 tag 当 nonce、用 `k_enc[1 - role]` 解密；
+2. 用 tag 去掉 conv 的混淆；用 tag 当 nonce、用 `k_enc[1 - role]` 解密 conv 之后的部分；
 3. 用 `k_mac[1 - role]` 重新计算 `SipHash-2-4-128(P)[0..11]`，与 tag 做常量时间比较；
 4. 比较失败时，`anl_input` 返回 `ANL_EAUTH`。**调用方不得对该包做任何回应**，这是抗主动探测的关键；
 5. 认证通过后依次检查版本号/保留位（`ANL_EFORMAT`）、conv（`ANL_ECONV`）、时间窗（`ANL_ESTALE`，见 4.2），任一失败即丢弃。
@@ -104,21 +106,14 @@ wire  = tag || C
 ### 3.4 服务端分发（demux）
 
 ```c
-typedef struct anl_keys anl_keys;                       /* 两个方向的 k_enc / k_mac / k_rng */
-void anl_keys_derive(anl_keys *keys, const uint8_t psk[32]);
-
-/* 用 keys 验证并解密一个数据报。成功时返回明文 P 的长度，P 写入 plain（容量 >= size - 12），
- * 并输出 conv；失败返回 ANL_EAUTH / ANL_EFORMAT。role 是本端角色。 */
-int  anl_peek_conv(const anl_keys *keys, int role, const char *data, long size,
-                   uint32_t *conv, char *plain);
-
-/* 喂入已经由 anl_peek_conv 验证过的明文 P，跳过解密和认证，只做步骤 5 及之后的处理。 */
-int  anl_input_plain(anl_t *w, const char *plain, long size);
+/* 不用密钥、不解密，从数据报读出 conv（去掉混淆）。未经认证，只用于找连接。
+ * 返回 ANL_OK，或 ANL_EFORMAT / ANL_EINVAL。 */
+int anl_peek_conv(const char *data, long size, uint32_t *conv);
 ```
 
-服务端流程：`anl_keys_derive` 一次 → 每个数据报 `anl_peek_conv` → 用 conv 找到连接 → `anl_input_plain`。
+服务端流程：每个数据报 `anl_peek_conv` → 用 conv 找到连接 → `anl_input`（用该连接的密钥认证并解密）。conv 未知时，用应用为该 conv 准备的 PSK 新建连接后再 `anl_input`；认证失败（`ANL_EAUTH`）即丢弃，不回应。
 
-这样每个数据报只做一次解密和认证。`anl_input` 保留用于单连接场景；`anl_input_plain` 只能接收已经验证通过的明文，不能直接喂入网络输入。
+conv 未经认证：攻击者可以把任意数据报的 conv 改成另一个连接的，但这个包会在该连接的认证中失败。按 conv 先查表，垃圾数据报里 conv 未知的部分不必解密就能丢弃。
 
 **服务端建连策略**：协议没有握手，服务端对"认证通过但 conv 未知"的数据报创建新连接，就是事实上的隐式建连。任何拿到历史抓包的人都可以重放不同 conv 的旧数据报，让服务端批量创建僵尸连接；重放包还会成为新连接第一个初始化 `peer_ts`（4.2）的包。协议层面的对策和对应用的要求：
 
@@ -154,6 +149,7 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
 - **密钥分离**：同一 PSK 的所有连接共用密钥，任何持有 PSK 的一方都可以伪造任意 conv 的数据报。PSK 的信任边界是"同一组互信端点"；
 - **未认证包的处理代价**：SIV 必须先解密整个 P 才能计算 tag，垃圾数据报也有解密和认证成本。历史加解密测量见 performance.md。
 - 版本号位于加密区内，密码套件升级无法通过版本号协商，只能靠更换端口或 PSK 实现（见第 4 节）。
+- **conv 可见**：conv 只做混淆，算法公开，旁观者可以还原 conv，跨数据报、跨 IP/端口变化关联同一连接。需要隐藏时由应用在库外处理前 16 字节（3.2）。
 
 ---
 
@@ -166,13 +162,14 @@ int  anl_input_plain(anl_t *w, const char *plain, long size);
   +-------------+--------+------+--------+-----------------------+-------------+
   | tag (12)    | conv(4)| flg  | ts (4) |  段 1 | 段 2 | ...     | [填充 N 字节] |
   +-------------+--------+------+--------+-----------------------+-------------+
-   明文           └────────────────── 加密区（一直加密到包尾）───────────────────┘
+   明文           混淆     └──────────────── 加密区（一直加密到包尾）─────────────┘
+                  └──────────────────────── 认证范围（P）──────────────────────────┘
 ```
 
 | 字段 | 大小 | 说明 |
 |---|---|---|
 | tag | 12 | SipHash-2-4-128 标签的前 12 字节，同时作为 nonce |
-| conv | 4 | 连接号，非零 |
+| conv | 4 | 连接号，非零；线上为 conv XOR tag[off..off+3]，off = (tag[0] & 7) + 1（3.2） |
 | flg | 1 | bit7-6：版本号（当前为 1）；bit0：PAD；其余位保留，必须为 0 |
 | ts | 4 | 发送方时钟（毫秒），供对端在 ACK 中回显，并用于时间窗检查 |
 
@@ -402,7 +399,7 @@ rto    = srtt + max(2 × interval, 4 × rttval, srtt / 4)
 
 `anl_stream_send_frame` 成功时，`flush_on_send=1` 会立即 flush；半可靠流默认开启、普通可靠流默认关闭，默认流另行开启。所有发送都需要先通过 `anl_update` 初始化协议时钟。
 
-应用传入 32 位单调毫秒时间，内部按有符号差值处理回绕。定时器按 `anl_check` 返回的时刻驱动；每个 `anl_input / anl_input_plain` 前还要检查当前时间，只要已变化就先 `anl_update`，即使下一个定时器尚未到期。接收批次内也须刷新，并限制批次工作量以保证定时器和应用得到调度。库没有系统时钟，无法自行发现调用方传入过时时间。
+应用传入 32 位单调毫秒时间，内部按有符号差值处理回绕。定时器按 `anl_check` 返回的时刻驱动；每个 `anl_input` 前还要检查当前时间，只要已变化就先 `anl_update`，即使下一个定时器尚未到期。接收批次内也须刷新，并限制批次工作量以保证定时器和应用得到调度。库没有系统时钟，无法自行发现调用方传入过时时间。
 
 ### 6.6 连接存活
 
@@ -702,8 +699,8 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 |---|---|
 | 初始化 | anl_config_default、anl_stream_opt_default、anl_create、anl_release、anl_allocator |
 | 输出与回调 | anl_setoutput、anl_set_accept、anl_set_rate_callback、anl_set_report_callback |
-| 收包与时钟 | anl_input、anl_input_plain、anl_update、anl_check、anl_flush |
-| 密钥与分发 | anl_keys_derive、anl_peek_conv |
+| 收包与时钟 | anl_input、anl_update、anl_check、anl_flush |
+| 分发 | anl_peek_conv |
 | 默认流 | anl_send、anl_recv、anl_peeksize、anl_waitsnd、anl_default_stream |
 | 流创建与释放 | anl_stream_open、anl_stream_close、anl_stream_shutdown、anl_readable |
 | 可靠消息/字节流 | anl_stream_send、anl_stream_recv |
