@@ -762,6 +762,7 @@ struct anl_s {
     uint32_t qfall;                     /* consecutive congestive rounds whose delivery rate fell with our cuts */
     uint32_t qflat, qflat_rtt;          /* consecutive loss-free rounds at gain <= 1 whose RTT stayed above min_rtt, and that RTT */
     uint8_t  qflat_probe;               /* the current PROBE_RTT was asked for by qflat: its RTT becomes min_rtt */
+    uint32_t probed_rtt;                /* the lowest min_rtt a PROBE_RTT has seen, before or after it (0: none) */
     uint8_t  min_rtt_probed;            /* a PROBE_RTT has run since min_rtt last took a lower value */
     uint32_t qfall_rtt, qfall_rate;     /* ... the round min RTT and delivery rate of the last one counted */
     uint32_t round_ts, last_round_rate; /* start of the round; delivery rate of the last round, bytes/s */
@@ -3032,7 +3033,15 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
 {
     int expired = w->min_rtt != 0 && tdiff(w->current, w->min_rtt_ts) > BBR_MIN_RTT_WIN;
     if (w->min_rtt == 0 || (uint32_t)rtt <= w->min_rtt || expired) {
-        if (w->min_rtt == 0 || (uint32_t)rtt < w->min_rtt) w->min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
+        /* a new value no PROBE_RTT has seen yet - below what the last one
+           saw. Not merely below the current min_rtt: a flat-queue probe
+           sets min_rtt to the drained round's RTT, a few ms above the path
+           when the pipe does not fully drain, and the 10 s expiry takes any
+           sample; the path's own RTT then read as new every few seconds and
+           re-armed the probe against the same standing queue (2 Mbit, 20 ms,
+           encoder following target_rate: 3..6 PROBE_RTT a minute, key
+           frames on time 81%) */
+        if (w->min_rtt == 0 || ((uint32_t)rtt < w->min_rtt && (w->probed_rtt == 0 || (uint32_t)rtt < w->probed_rtt))) w->min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
         w->min_rtt = umax32((uint32_t)rtt, 1);
         w->min_rtt_ts = w->current;
     }
@@ -3295,12 +3304,14 @@ static void bbr_update_state(anl_t *w)
         } else if (tdiff(w->current, w->probe_rtt_done_ts) >= 0 && tdiff(w->round_count, w->probe_rtt_round) >= 0) {
             /* a probe the flat queue signal asked for: the RTT of the drained
                pipe is the path's, above the old min_rtt or not (bbr_round_end) */
+            w->probed_rtt = w->min_rtt;
             if (w->qflat_probe) {
                 uint32_t m = w->round_min_rtt ? w->round_min_rtt : w->prev_round_min_rtt;
                 if (m != 0) w->min_rtt = m;
                 w->qflat_probe = 0;
             }
             w->min_rtt_probed = 1;
+            if (w->min_rtt < w->probed_rtt) w->probed_rtt = w->min_rtt;
             w->min_rtt_ts = w->current;
             if (w->full_bw_reached) bbr_enter_probe_bw(w);
             else { w->bbr_state = ANL_BBR_STARTUP; w->pacing_gain = BBR_STARTUP_GAIN; }
