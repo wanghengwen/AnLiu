@@ -259,6 +259,12 @@ static int g_tbf_kb;                       /* --tbf: the bottleneck is a token b
                                               burst in KB: a burst of that size passes at once after an idle
                                               period, the rest waits for tokens (up to qdelay), 0 = plain FIFO */
 
+/* SIM_SEND_HOOK(s, from, len, at, lost): every datagram handed to the link -
+   lost (queue or random) or delivered at `at` (ms, before rounding to the
+   tick); a no-op unless the including program defines it (media_loss: GCC) */
+#ifndef SIM_SEND_HOOK
+#define SIM_SEND_HOOK(s, from, len, at, lost) ((void)0)
+#endif
 static void sim_send(sim *s, int from, const char *buf, int len)
 {
     dir *d = &s->d[from];
@@ -280,7 +286,7 @@ static void sim_send(sim *s, int from, const char *buf, int len)
         d->tokens += (t - d->tok_t) * g_pol_kbps / 8.0;
         if (d->tokens > cap) d->tokens = cap;
         d->tok_t = t;
-        if (d->tokens < len + IPUDP_HDR) { d->lost_queue++; return; }
+        if (d->tokens < len + IPUDP_HDR) { d->lost_queue++; SIM_SEND_HOOK(s, from, len, 0.0, 1); return; }
         d->tokens -= len + IPUDP_HDR;
     }
     if (d->c.bw_kbps > 0 && g_tbf_kb > 0) {
@@ -296,7 +302,9 @@ static void sim_send(sim *s, int from, const char *buf, int len)
         if (avail >= size) { d->tbf_tokens = avail - size; d->tbf_t = t; extra = 0; }
         else {
             double wait = (size - avail) / rate;
-            if (wait > d->c.qdelay) { d->lost_queue++; return; }
+            /* tc tbf's queue: latency x rate plus the bucket (its limit) -
+               at 800 kbit and a 16 KB bucket 260 ms, not 100 */
+            if (wait > d->c.qdelay + cap / rate) { d->lost_queue++; SIM_SEND_HOOK(s, from, len, 0.0, 1); return; }
             d->tbf_tokens = 0;
             d->tbf_t = t + wait;                /* tokens accumulate again after this departure */
             extra = wait;
@@ -304,11 +312,11 @@ static void sim_send(sim *s, int from, const char *buf, int len)
     } else if (d->c.bw_kbps > 0) {
         double ser = (len + IPUDP_HDR) * 8.0 / d->c.bw_kbps;     /* ms */
         double start = d->free_at > t ? d->free_at : t;
-        if (start - t > d->c.qdelay) { d->lost_queue++; return; }
+        if (start - t > d->c.qdelay) { d->lost_queue++; SIM_SEND_HOOK(s, from, len, 0.0, 1); return; }
         d->free_at = start + ser;
         extra = d->free_at - t;
     }
-    if (link_lost(d, s->t)) { d->lost_rand++; return; }
+    if (link_lost(d, s->t)) { d->lost_rand++; SIM_SEND_HOOK(s, from, len, 0.0, 1); return; }
     delay = d->c.delay + extra;
     /* the path's own RTT moves between two values for a second or so at a
        time (a cross-border path over changing routes): every sample of a
@@ -326,6 +334,7 @@ static void sim_send(sim *s, int from, const char *buf, int len)
     if (d->c.jitter == 0 && at < d->last_at) at = d->last_at;
     d->last_at = at;
 
+    SIM_SEND_HOOK(s, from, len, s->t + (delay < 0 ? 0 : delay), 0);
     p = (pkt *)malloc(sizeof(pkt) + (size_t)len);
     p->at = at; p->len = len;
     memcpy(p->data, buf, (size_t)len);
@@ -642,7 +651,7 @@ static void flow_video(flow *f, int sid, const variant *v)
 /*---------------------------------------------------------------------
  * traffic generation and reception
  *-------------------------------------------------------------------*/
-static char g_buf[1 << 18];
+static char g_buf[1 << 20];        /* a keyframe at MEDIA_LOSS_VIDEO_MAX 8000 is ~280 KB */
 static uint64_t g_trng;
 
 static void lat_push(flow *f, uint32_t v)

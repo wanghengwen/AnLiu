@@ -6,7 +6,16 @@
  *       [event_duration_s=20] [extra_one_way_ms=200]
  * Same frame_v1 workload / capped encoder feedback as realnet --adapt 1;
  * MEDIA_LOSS_FIXED_SCALE=<100..1000> fixes the video at that per mille instead;
- * MEDIA_LOSS_AUDIO_ONLY=1 sends no video.
+ * MEDIA_LOSS_VIDEO_MAX=<per mille> lets the encoder follow the target up to that
+ * scale (default 1000, ~940 kbit/s of video; 8000 ~7.5 Mbit/s);
+ * MEDIA_LOSS_AUDIO_ONLY=1 sends no video; MEDIA_LOSS_TBF_KB=<n> makes the
+ * bottleneck a token-bucket shaper with an n KB bucket (tc tbf); MEDIA_LOSS_BURST=<n>
+ * loses in Gilbert-Elliott bursts of mean length n (same average loss).
+ * MEDIA_LOSS_RATE=gcc|gccd: the encoder follows a model of WebRTC's GCC
+ * (bench/gcc_model.h; gccd without its loss-based part) instead of AnLiu's
+ * target, and AnLiu's pace is capped at 2.5x the GCC target (WebRTC's pacer);
+ * the transport, its window and FEC stay AnLiu's. Event "bw" sets
+ * the bottleneck to extra_one_way_ms kbit/s for the event's duration.
  * The link has 100 ms queue depth and independent loss in both directions.
  * Timely media uses the original propagation delay as its minimum baseline;
  * an event's extra delay consumes that same delivery budget. A delivery pause
@@ -29,6 +38,9 @@ static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t);
 static unsigned fec_counts[2][4];
 #define ANL_FEC_COUNT_TRACE(w, st, lost) do { if ((st)->tag <= 1 && (lost) >= 0 && (lost) < 4) fec_counts[(st)->tag][lost]++; } while (0)
 #include "../anliu.c"
+#include "gcc_model.h"
+static gcc_t g_gcc;
+#define SIM_SEND_HOOK(s, from, len, at, lost) do { if ((from) == 0) gcc_on_packet(&g_gcc, (double)(s)->t, (at), (len) + IPUDP_HDR, (lost)); } while (0)
 #define main benchmark_main
 #include "bench.c"
 #undef main
@@ -41,7 +53,35 @@ static unsigned blocks[2], small_blocks[2];
 static uint64_t block_data[2], block_parities[2];
 static int scale = 1000;
 static int audio_only;      /* MEDIA_LOSS_AUDIO_ONLY: no video frames */
+/* MEDIA_LOSS_DRIVE=check: anl_update driven by anl_check (at most
+   MEDIA_LOSS_DRIVE_MAX ms apart, default 10) and before every input / send
+   whose millisecond differs, like an event loop - instead of every ms */
+static int drive_check, drive_max = 10;
+/* MEDIA_LOSS_ORDER=legacy: each ms input, frames, then anl_update (as
+   before); default: anl_update first, then input and frames - what an
+   application's loop does (realnet: poll, update, receive, generate) */
+static int order_legacy;
+static uint32_t drv_last[2], drv_next[2];
+static unsigned long long drv_updates[2];
+static void drv_update(sim *s, int k, uint32_t t)
+{
+    anl_t *w = s->e[k].anl;
+    anl_update(w, t);
+    drv_last[k] = t;
+    drv_updates[k]++;
+}
+static void drv_rearm(sim *s, int k, uint32_t t)
+{
+    uint32_t n = anl_check(s->e[k].anl, t);
+    if ((int32_t)(n - (t + (uint32_t)drive_max)) > 0) n = t + (uint32_t)drive_max;
+    drv_next[k] = n;
+}
+static void drv_touch(sim *s, int k, uint32_t t)
+{
+    if (drive_check && drv_last[k] != t) drv_update(s, k, t);
+}
 static int fixed_scale;     /* MEDIA_LOSS_FIXED_SCALE: video at this per mille, encoder feedback off */
+static int scale_max = 1000;    /* MEDIA_LOSS_VIDEO_MAX */
 static void loss_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint32_t m, uint32_t lmax, int key)
 {
     int id = st->tag;
@@ -88,9 +128,9 @@ static void loss_adapt(anl_t *w, uint32_t target, void *user)
 {
     int64_t video = (int64_t)target - 8000;
     (void)w; (void)user;
-    if (fixed_scale) return;
+    if (fixed_scale || g_gcc.on) return;
     scale = video <= 0 ? 100 : (int)(video * 1000 / 117500);
-    if (scale > 1000) scale = 1000;
+    if (scale > scale_max) scale = scale_max;
     if (scale < 100) scale = 100;
 }
 static int loss_size(const flow *f, int key, uint64_t seed)
@@ -124,12 +164,14 @@ int main(int argc, char **argv)
     if (bw < 1 || rtt < 1 || rtt > 10000 || loss < 0 || loss > 20 || seed < 1 ||
         duration < 3 || duration > 600 || stop < 0 || stop > duration ||
         (interval != 10 && interval != 20) ||
-        (strcmp(event, "none") && strcmp(event, "pause") && strcmp(event, "delay")) ||
+        (strcmp(event, "none") && strcmp(event, "pause") && strcmp(event, "delay") && strcmp(event, "bw")) ||
         event_start < 0 || event_duration < 1 || event_delay < 0 || event_delay > 10000 ||
         (strcmp(event, "none") && event_end >= duration)) return 2;
     g_seed = seed; g_fec_ratio = 0; g_init_cwnd = 16;
+    if (getenv("MEDIA_LOSS_TBF_KB")) g_tbf_kb = atoi(getenv("MEDIA_LOSS_TBF_KB"));
     g_fast = interval == 10;
     lc.delay = rtt / 2; lc.bw_kbps = bw; lc.loss = loss / 100.0; lc.qdelay = 100;
+    if (getenv("MEDIA_LOSS_BURST")) lc.burst = atof(getenv("MEDIA_LOSS_BURST"));
     sim_init(&s, &V_ANLF, &lc, 1000, g_seed);
     owner = s.e[0].anl;
     if (getenv("MEDIA_LOSS_FIXED_SCALE")) {
@@ -138,7 +180,21 @@ int main(int argc, char **argv)
         scale = fixed_scale;
     }
     audio_only = getenv("MEDIA_LOSS_AUDIO_ONLY") != NULL;
+    if (getenv("MEDIA_LOSS_VIDEO_MAX")) {
+        scale_max = atoi(getenv("MEDIA_LOSS_VIDEO_MAX"));
+        if (scale_max < 1000 || scale_max > 20000) return 2;
+    }
+    drive_check = getenv("MEDIA_LOSS_DRIVE") && !strcmp(getenv("MEDIA_LOSS_DRIVE"), "check");
+    order_legacy = getenv("MEDIA_LOSS_ORDER") && !strcmp(getenv("MEDIA_LOSS_ORDER"), "legacy");
+    if (getenv("MEDIA_LOSS_DRIVE_MAX")) drive_max = atoi(getenv("MEDIA_LOSS_DRIVE_MAX"));
     anl_set_rate_callback(s.e[0].anl, loss_adapt);
+    if (getenv("MEDIA_LOSS_RATE") && strcmp(getenv("MEDIA_LOSS_RATE"), "anl")) {
+        const char *m = getenv("MEDIA_LOSS_RATE");
+        if (strcmp(m, "gcc") && strcmp(m, "gccd")) return 2;
+        /* the encoder's maximum with audio, over a payload share of 2/3 */
+        gcc_init(&g_gcc, !strcmp(m, "gcc"), ((double)scale_max * 117500 / 1000 + 8000) * 8 * 1.5);
+        if (!fixed_scale) scale = 100 + 0 * scale;      /* GCC starts at 300 kbit/s: the encoder too */
+    }
     flow_audio(&f[0], 0, &V_ANLF); flow_video(&f[1], 1, &V_ANLF);
     s.fl = f; s.nfl = 2;
     for (i = 0; i < 2; i++) { f[i].fec = ANL_FEC_RTT_AUTO; ep_open(&s.e[0], &f[i]); }
@@ -146,13 +202,34 @@ int main(int argc, char **argv)
     while (s.t < (uint64_t)duration * 1000 + 5000) {
         s.t++;
         event_on = s.t >= (uint64_t)event_start * 1000 && s.t < (uint64_t)event_end * 1000;
+        if (!drive_check && !order_legacy) {
+            ep_update(&s.e[0], now32(&s)); ep_update(&s.e[1], now32(&s));
+            drv_updates[0]++; drv_updates[1]++;
+        }
         s.d[0].c.delay = s.d[1].c.delay = lc.delay + (event_on && !strcmp(event, "delay") ? event_delay : 0);
+        if (!strcmp(event, "bw")) s.d[0].c.bw_kbps = event_on ? event_delay : bw;
+        if (g_gcc.on) {
+            anl_t *w = s.e[0].anl;
+            double rtt = w->rx_srtt > 0 ? w->rx_srtt : 2.0 * s.d[0].c.delay;
+            gcc_tick(&g_gcc, (double)s.t, (double)s.d[0].c.delay, rtt, (double)s.d[0].c.bw_kbps, lc.loss);
+            /* WebRTC's pacer: 2.5 x the target (pacing_factor), a cap on AnLiu's own pace */
+            w->pace_rate_cfg = (uint32_t)(g_gcc.target / 8 * 2.5);
+            if (!fixed_scale && s.t % 10 == 0) {
+                /* the target is for everything sent: the encoder gets the payload share */
+                int64_t video = (int64_t)(g_gcc.target / 8 * (w->rate_share ? w->rate_share : 230) / 256) - 8000;
+                scale = video <= 0 ? 100 : (int)(video * 1000 / 117500);
+                if (scale > scale_max) scale = scale_max;
+                if (scale < 100) scale = 100;
+            }
+        }
         if (stop && s.t == (uint64_t)stop * 1000) s.d[0].c.loss = s.d[1].c.loss = 0;
         for (k = 0; k < 2; k++) while (!(event_on && !strcmp(event, "pause")) && s.d[k].head && s.d[k].head->at <= s.t) {
             pkt *p = s.d[k].head;
             s.d[k].head = p->next;
             if (p->next) p->next->prev = NULL; else s.d[k].tail = NULL;
+            drv_touch(&s, 1 - k, now32(&s));
             ep_input(&s.e[1-k], p->data, p->len); free(p);
+            if (drive_check) drv_rearm(&s, 1 - k, now32(&s));
         }
         if (s.t < (uint64_t)duration * 1000) {
             scale_sum += scale; gate_ms += s.e[0].h[1]->fec_gate; short_ms += s.e[0].anl->capacity_short;
@@ -161,11 +238,21 @@ int main(int argc, char **argv)
                 int len = loss_size(&f[i], key, seed);
                 frame_bytes[i][f[i].seq] = (unsigned)len;
                 sent_ms[i][f[i].seq] = (unsigned)s.t;
+                drv_touch(&s, 0, now32(&s));
                 if (gen_one(&s, &f[i], len, key) < 0) errors++;
+                if (drive_check) drv_rearm(&s, 0, now32(&s));
                 f[i].next_t = i ? (uint64_t)f[i].seq * 1000 / 30 : (uint64_t)f[i].seq * 20;
             }
         }
-        ep_update(&s.e[0], now32(&s)); ep_update(&s.e[1], now32(&s));
+        if (!drive_check) {
+            if (order_legacy) {
+                ep_update(&s.e[0], now32(&s)); ep_update(&s.e[1], now32(&s));
+                drv_updates[0]++; drv_updates[1]++;
+            }
+        } else for (k = 0; k < 2; k++) if ((int32_t)(now32(&s) - drv_next[k]) >= 0) {
+            drv_update(&s, k, now32(&s));
+            drv_rearm(&s, k, now32(&s));
+        }
         for (i = 0; i < 2; i++) {
             anl_frame_info fi;
             int len;
@@ -181,6 +268,8 @@ int main(int argc, char **argv)
         if (!ep_alive(&s.e[0]) || !ep_alive(&s.e[1])) { errors++; break; }
         if (getenv("MEDIA_LOSS_DIAG") && s.t % 200 == 0 && s.t <= (uint64_t)duration * 1000) {
             anl_t *w = s.e[0].anl;
+            printf("ENC ms=%llu scale=%d gcc_target=%.0f gcc_delay=%.0f gcc_loss=%.0f trend=%.2f thr=%.2f usage=%d\n",
+                (unsigned long long)s.t, scale, g_gcc.target, g_gcc.delay_rate, g_gcc.loss_rate, g_gcc.trend, g_gcc.thr, g_gcc.usage);
             printf("BUDGET ms=%llu srtt=%d rmin=%u bw=%u pace=%u target=%u par_rate=%u tokens=%lld pay=%u delivered=%u offered=%u unsent=%u short=%d gate=%d audio_par=%llu video_par=%llu video_retry=%llu wire=%llu drops=%llu\n",
                 (unsigned long long)s.t,w->rx_srtt,umin32(w->rate_rtt_min,w->rate_rtt_old),bbr_bw(w),w->pace_rate,
                 w->rate_target,w->par_rate,(long long)w->par_tokens,w->pay_avg,w->dlv_avg,w->off_avg,w->unsent_avg,
@@ -251,9 +340,12 @@ int main(int argc, char **argv)
                 printf("RECOVERY id=%d received_ms=%d ontime_ms=%d key_ms=%d\n", i,first_received ? (int)first_received-event_end*1000:-1,first_ontime ? (int)first_ontime-event_end*1000:-1,first_key ? (int)first_key-event_end*1000:-1);
         }
     }
-    printf("TOTAL wire=%llu queue_drop=%llu scale=%.3f gate_ms=%llu short_ms=%llu errors=%d\n",
+    if (g_gcc.on) printf("GCCSUM overuses=%u decreases=%u\n", g_gcc.overuses, g_gcc.decreases);
+    printf("DRIVE mode=%s updates_sender=%llu updates_receiver=%llu\n", drive_check ? "check" : order_legacy ? "1ms-legacy" : "1ms", drv_updates[0], drv_updates[1]);
+    printf("TOTAL wire=%llu queue_drop=%llu scale=%.3f gate_ms=%llu short_ms=%llu errors=%d pkts=%llu rev_wire=%llu rev_pkts=%llu\n",
         (unsigned long long)(s.d[0].bytes + s.d[0].pkts * IPUDP_HDR), (unsigned long long)s.d[0].lost_queue,
-        scale_sum / (duration * 1000.0), (unsigned long long)gate_ms, (unsigned long long)short_ms, errors);
+        scale_sum / (duration * 1000.0), (unsigned long long)gate_ms, (unsigned long long)short_ms, errors,
+        (unsigned long long)s.d[0].pkts, (unsigned long long)(s.d[1].bytes + s.d[1].pkts * IPUDP_HDR), (unsigned long long)s.d[1].pkts);
     ep_release(&s.e[0]); ep_release(&s.e[1]); dir_free(&s.d[0]); dir_free(&s.d[1]);
     return errors != 0;
 }

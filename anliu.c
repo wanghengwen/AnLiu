@@ -392,15 +392,20 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define OPEN_RTO_MAX    5000
 #define KEEPALIVE_PAD   16
 
-#define SID_LO_BITS     13      /* type(2) | X(1) | sid[12:0](13) [sid[28:13](16) if X], DESIGN 5 */
-#define SID_X           0x20    /* b0: the 2-byte sid extension follows */
-#define SID_HI_MASK     0x1f
-#define DATA_HDR_MAX    13      /* type|sid(2) b1 frg_ext(3) sn(3) frame(2) len(2); + OPEN_BODY until the peer is
-                                   heard; a sid >= 2^13 takes 2 more bytes off its stream's mss (stream_mss) */
-#define ACK_FIX         10      /* after type|sid: b1 una(3) wnd(2) ts_echo(4) */
+/* a segment's first byte (DESIGN 5): type(2) | L(1) | F(1) | sid[3:0](4), then
+   if F the rest of the sid, sid >> 4, as a minimal non-zero varint */
+#define SID_LO_BITS     4
+#define SID_LO_MASK     0x0f
+#define SID_F           0x10    /* b0: the sid's varint extension follows */
+#define SEG_L           0x20    /* b0: the segment runs to the end of the datagram (before
+                                   padding): a DATA or CTRL segment without its length field */
+#define DATA_HDR_MAX    12      /* type|sid(1) b1 frg_ext(3) sn(3) frame(2) len(2); + OPEN_BODY until the peer is
+                                   heard; a sid >= 16 takes its extension off its stream's mss (stream_mss) */
+#define ACK_FIX         8       /* after type|sid: b1 una(3) wnd(2) ts_echo(2, or a 1-byte delta) */
 #define SKIP_BODY       4       /* CTRL_RCV_SKIP body: the retired una, 32 bits */
 #define ACK_F_WASK      0x80    /* window probe: please answer with an ACK */
 #define ACK_F_FRESH     0x40    /* data arrived since the last ACK: ts_echo is an RTT sample */
+#define ACK_F_DELTA     0x20    /* ts_echo is a zigzag varint delta from the datagram's previous ACK */
 #define SACK_REPEAT     3       /* every received segment is reported in at least 3 ACKs */
 #define RCV_HELD_MAX    64      /* over rcv_limit: unread segments above which a stream's window closes */
 #define REO_DIV         16      /* RACK reordering window starts at min_rtt / 16 */
@@ -437,6 +442,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define LT_GAP_MS           5000    /* after an input gap: its losses and backlog are no policer evidence */
 #define SEG_WIRE_OVH        30      /* per-segment share of datagram / segment headers */
 #define START_WND_MS    300     /* cfg.start_rate: initial window of this long at that rate */
+#define START_IPUDP     28      /* ... a wire rate: each datagram's IPv4 + UDP header counts against it */
 #define START_BURST_MTU 1       /* ... and pace_burst (unless set) in datagrams */
 #define FEC_K_MAX       64      /* data packets per Reed-Solomon block */
 #define FEC_M_MAX       16      /* parities per block */
@@ -700,7 +706,7 @@ struct anl_s {
     uint64_t round_delivered0, round_lost0;
     uint32_t bw_round[BBR_BW_ROUNDS];   /* max delivery rate per round, bytes/s */
     uint32_t btl_bw;                    /* bottleneck bandwidth: max over the last 10 rounds */
-    uint32_t net_round;                 /* round of the last network-limited sample (| 1); 0 = none */
+    uint32_t net_round;                 /* round of the last network-limited or queued sample (| 1); 0 = none */
     uint32_t net_sample_ts;             /* ... its time (| 1); 0 = none (stats.bw_estimate_age_ms) */
     uint32_t bw_lo;                     /* BBRv2 lower bound after congestive loss, until the next probe; 0 = none */
     uint32_t bw_idx;                    /* filter slot of the current round */
@@ -769,7 +775,8 @@ struct anl_s {
     int updated;
     int state;
 
-    uint32_t peer_ts;
+    uint32_t peer_ts;                   /* the peer's ts, extended from 16 bits (DESIGN 4.2) */
+    uint32_t peer_ts_at;                /* our time when peer_ts was taken */
     int peer_ts_valid;
     uint32_t last_rx, last_tx;
 
@@ -842,6 +849,9 @@ struct anl_s {
     char *buf;
     uint32_t ptr;
     int dg_has_data;
+    uint32_t dg_last_b0, dg_len_at, dg_len_n;   /* the last DATA / CTRL segment: its first byte and length
+                                                  field, dropped at output (SEG_L); n = 0: none */
+    uint16_t dg_echo; int dg_echo_valid;        /* the echo of the datagram's last ACK (ACK_F_DELTA) */
     char *rxbuf;
     char *scratch;      /* 2 * mtu */
     int64_t flush_budget;
@@ -986,10 +996,14 @@ static void peer_heard(anl_t *w, anl_stream *st)
     st->peer_opened = 1;
 }
 
-static uint32_t sid_bytes(int sid) { return (uint32_t)sid >> SID_LO_BITS ? 4u : 2u; }
+static uint32_t sid_bytes(int sid)
+{
+    uint32_t hi = (uint32_t)sid >> SID_LO_BITS;
+    return hi ? 1u + (uint32_t)varint_size(hi) : 1u;
+}
 
 /* a stream's payload per segment: the connection's, less the sid extension */
-static uint32_t stream_mss(const anl_t *w, int sid) { return w->mss + 2 - sid_bytes(sid); }
+static uint32_t stream_mss(const anl_t *w, int sid) { return w->mss + 1 - sid_bytes(sid); }
 
 /* schedule control output (ACK / RST / CLOSE / probe) for the next flush_control */
 static void ctl_mark(anl_stream *st)
@@ -1000,9 +1014,8 @@ static void ctl_mark(anl_stream *st)
 static char *enc_sid(char *p, int type, int sid)
 {
     uint32_t hi = (uint32_t)sid >> SID_LO_BITS;
-    p = enc8(p, (uint8_t)((type << 6) | (hi ? SID_X : 0) | ((sid >> 8) & SID_HI_MASK)));
-    p = enc8(p, (uint8_t)(sid & 0xff));
-    return hi ? enc16(p, (uint16_t)hi) : p;
+    p = enc8(p, (uint8_t)((type << 6) | (hi ? SID_F : 0) | (sid & SID_LO_MASK)));
+    return hi ? enc_varint(p, hi) : p;
 }
 
 /* stream parameters chosen by the opener (DESIGN 5.2 / 6.1) */
@@ -1129,6 +1142,8 @@ static void dg_begin(anl_t *w)
 {
     w->ptr = ANL_OVERHEAD;
     w->dg_has_data = 0;
+    w->dg_len_n = 0;
+    w->dg_echo_valid = 0;
 }
 
 static uint32_t dg_room(const anl_t *w) { return w->mtu - w->ptr; }
@@ -1141,9 +1156,19 @@ static void dg_output(anl_t *w, int force_pad)
 
     if (w->output == NULL) { dg_begin(w); return; }
 
-    /* random padding (DESIGN 3.5) */
+    /* the last segment runs to the end: it loses its length field (SEG_L, DESIGN 5) */
+    if (w->dg_len_n) {
+        uint32_t at = w->dg_len_at, n = w->dg_len_n;
+        memmove(w->buf + at, w->buf + at + n, w->ptr - at - n);
+        w->ptr -= n;
+        w->buf[w->dg_last_b0] = (char)((uint8_t)w->buf[w->dg_last_b0] | SEG_L);
+        w->dg_len_n = 0;
+    }
+
+    /* random padding of datagrams without data (DESIGN 3.5): an ACK's length is
+       otherwise a fixed fingerprint, a data datagram's length is the media's */
     room = dg_room(w);
-    if ((w->pad_max > 0 || force_pad) && room >= 1) {
+    if (((w->pad_max > 0 && !w->dg_has_data) || force_pad) && room >= 1) {
         uint8_t r;
         uint32_t pm = w->pad_max > 0 ? (uint32_t)w->pad_max : KEEPALIVE_PAD;
         uint32_t n;
@@ -1159,7 +1184,7 @@ static void dg_output(anl_t *w, int force_pad)
     p = w->buf + ANL_TAG_SIZE;
     p = enc32(p, w->conv);
     p = enc8(p, flg);
-    (void)enc32(p, w->current);
+    (void)enc16(p, (uint16_t)w->current);
 
     siv_seal(&w->keys, w->role, (uint8_t *)w->buf, w->ptr - ANL_TAG_SIZE);
     w->output(w->buf, (int)w->ptr, w, w->user);
@@ -1168,7 +1193,11 @@ static void dg_output(anl_t *w, int force_pad)
 #ifdef ANL_TX_OUTPUT_TRACE
     ANL_TX_OUTPUT_TRACE(w, w->ptr, w->dg_has_data);
 #endif
-    if (w->dg_has_data) w->pace_tokens -= (int64_t)w->ptr;
+    /* paced at a start_rate hint, the hint is the path's rate: the IP/UDP
+       header counts too - at 240 kB/s over 2 Mbit/s, datagrams without the
+       padding they used to carry overran the bottleneck (test_start_rate:
+       first key frame lost, 7 of 10 key frames) */
+    if (w->dg_has_data) w->pace_tokens -= (int64_t)w->ptr + (w->start_cap != 0 ? START_IPUDP : 0);
     dg_begin(w);
 }
 
@@ -1187,6 +1216,7 @@ static char *dg_ptr(anl_t *w) { return w->buf + w->ptr; }
 
 static void dg_commit(anl_t *w, uint32_t size, int is_data)
 {
+    w->dg_len_n = 0;                    /* the last segment so far has no length to drop */
     w->ptr += size;
     if (is_data) w->dg_has_data = 1;
 #ifdef ANL_SEG_COMMIT_TRACE
@@ -1209,9 +1239,13 @@ static void write_data_seg(anl_t *w, const anl_stream *st, const anl_seg *seg)
     p = enc24(p, seg->sn & SN_MASK);
     if (seg->flags & F_HAS_FRAME) p = enc16(p, (uint16_t)seg->frame_no);
     if (!st->peer_opened) p = enc_open_body(p, st);
-    p = enc_varint(p, seg->len);
-    memcpy(p, seg->data, seg->len);
-    dg_commit(w, size, 1);
+    {
+        uint32_t b0 = w->ptr, at = (uint32_t)(p - w->buf);
+        p = enc_varint(p, seg->len);
+        memcpy(p, seg->data, seg->len);
+        dg_commit(w, size, 1);
+        w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(seg->len);
+    }
 #ifdef ANL_DATA_SEG_TRACE
     ANL_DATA_SEG_TRACE(w, st, size, seg->xmit == 0);
 #endif
@@ -1236,9 +1270,13 @@ static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *bo
     p = dg_ptr(w);
     p = enc_sid(p, SEG_CTRL, sid);
     p = enc8(p, subtype);
-    p = enc_varint(p, blen);
-    if (blen) memcpy(p, body, blen);
-    dg_commit(w, size, subtype == CTRL_PARITY);
+    {
+        uint32_t b0 = w->ptr, at = (uint32_t)(p - w->buf);
+        p = enc_varint(p, blen);
+        if (blen) memcpy(p, body, blen);
+        dg_commit(w, size, subtype == CTRL_PARITY);
+        w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(blen);
+    }
 #ifdef ANL_PARITY_SEG_TRACE
     if (subtype == CTRL_PARITY) ANL_PARITY_SEG_TRACE(w, sid, size);
 #endif
@@ -1391,15 +1429,7 @@ static void write_ack_segs(anl_t *w, anl_stream *st)
             }
             pos = pos->next;
         }
-        p = enc_sid(p, SEG_ACK, st->sid);
-        p = enc8(p, b1);
-        p = enc24(p, st->rcv_nxt & SN_MASK);
-        p = enc16(p, (uint16_t)wnd_unused(w, st));
-        p = enc32(p, st->ack_ts);
-        p = enc_varint(p, cnt);
-        memcpy(p, rb, rlen);
-        p += rlen;
-        seglen = (uint32_t)(p - w->scratch);
+        seglen = sid_bytes(st->sid) + ACK_FIX + (uint32_t)varint_size(cnt) + rlen;    /* at most */
         /* Keep the retirement marker and its ACK in the same datagram:
            losing the marker alone would turn a skipped prefix into credit. */
         dg_need(w, seglen + (skip ? sid_bytes(st->sid) + 1 + 1 + SKIP_BODY : 0));
@@ -1408,8 +1438,25 @@ static void write_ack_segs(anl_t *w, anl_stream *st)
             (void)enc32((char *)body, st->rcv_skip_una);
             write_ctrl_seg(w, st->sid, CTRL_RCV_SKIP, body, sizeof(body));
         }
-        memcpy(dg_ptr(w), w->scratch, seglen);
-        dg_commit(w, seglen, 0);
+        {
+            /* the echo: 16 bits, or a 1-byte delta from the datagram's previous
+               ACK (streams of one flight echo nearby times) */
+            uint16_t echo = (uint16_t)st->ack_ts;
+            int16_t d = (int16_t)(uint16_t)(echo - w->dg_echo);
+            uint32_t zz = (uint32_t)(d >= 0 ? 2 * d : -2 * (int32_t)d - 1);
+            int delta = w->dg_echo_valid && zz < 0x80u;
+            p = dg_ptr(w);
+            p = enc_sid(p, SEG_ACK, st->sid);
+            p = enc8(p, (uint8_t)(b1 | (delta ? ACK_F_DELTA : 0)));
+            p = enc24(p, st->rcv_nxt & SN_MASK);
+            p = enc16(p, (uint16_t)wnd_unused(w, st));
+            p = delta ? enc8(p, (uint8_t)zz) : enc16(p, echo);
+            p = enc_varint(p, cnt);
+            memcpy(p, rb, rlen);
+            p += rlen;
+            dg_commit(w, (uint32_t)(p - dg_ptr(w)), 0);
+            w->dg_echo = echo; w->dg_echo_valid = 1;
+        }
     } while (pos != &st->rcv_runs);
 
     /* An ACK that carried news is sent once more an update interval later
@@ -1442,10 +1489,11 @@ static uint64_t bbr_inflight_bytes(const anl_t *w);
 
 /* Burst headroom for an app-limited sender whose bandwidth estimate only
  * shows what the application offered: a key frame goes out at the STARTUP
- * gain and its samples find the path. Not when the path was measured in the
- * last BBR_BW_ROUNDS rounds: then the estimate is the path, and a burst
- * above it would only move the queue from the sender - where a control
- * stream overtakes it - into the network, where nothing can. A bounded
+ * gain and its samples find the path. Not when the path was measured (or a
+ * burst came back queued) in the last BBR_BW_ROUNDS rounds: then the
+ * estimate is the path, and a burst above it would only move the queue from
+ * the sender - where a control stream overtakes it - into the network,
+ * where nothing can. A bounded
  * capacity-recovery probe also gets headroom: its old model is precisely
  * what it is testing (rate_update); adaptive parity stays off meanwhile. */
 static int bbr_headroom(const anl_t *w)
@@ -3477,6 +3525,16 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
         if (bw > 0xffffffffu) bw = 0xffffffffu;
         if (bw > w->round_bw) w->round_bw = (uint32_t)bw;
         w->bw_last_app = rs->app_limited;
+        /* An app-limited burst that came back queued (RTT as bbr_queue_signal)
+           filled the path: the estimate is the path, as after a network-limited
+           sample - no STARTUP-gain headroom for BBR_BW_ROUNDS (bbr_headroom).
+           Without it a sender held app-limited by its encoder (target below the
+           estimate) at 190 ms sent every key frame at 2.9x into a 100 ms queue:
+           key frames on time 27%, 8.6 queue drops/s at 2 Mbit/s (media_loss,
+           encoder following the target, no random loss). */
+        if (rs->app_limited && w->min_rtt > 0 && w->last_rtt > 0 &&
+            (uint32_t)w->last_rtt > bbr_rtt(w) + umax32(bbr_rtt(w) / 4, 5))
+            w->net_round = w->round_count | 1;
         if (!rs->app_limited) { w->round_net_sample = 1; w->net_round = w->round_count | 1; w->net_sample_ts = w->current | 1; }
         if (!rs->app_limited || bw >= w->btl_bw) {
             if (bw > *slot) *slot = (uint32_t)bw;
@@ -3802,8 +3860,9 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
 {
     const char *p, *end;
     uint32_t conv, ts;
+    uint16_t ts16, echo_prev = 0;
     uint8_t flg;
-    int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0;
+    int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0, echo_prev_ok = 0;
     bbr_sample rs;
     uint32_t max_echo = 0;
     uint32_t *snbuf = (uint32_t *)w->scratch;
@@ -3817,14 +3876,23 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
     end = plain + size;
     conv = dec32(&p);
     flg = dec8(&p);
-    ts = dec32(&p);
+    ts16 = dec16(&p);
     if ((flg & FLG_VER_MASK) != (ANL_VERSION << 6) || (flg & FLG_RSV_MASK)) return ANL_EFORMAT;
     if (conv != w->conv) return ANL_ECONV;
+    /* the 16-bit ts, extended around where the peer's clock should be now:
+       the last ts plus the time since here - a pause longer than the 65 s wrap
+       does not make every later datagram look old (DESIGN 4.2) */
+    if (!w->peer_ts_valid) ts = ts16;
+    else {
+        int32_t since = tdiff(w->current, w->peer_ts_at);
+        uint32_t ref = w->peer_ts + (uint32_t)(since > 0 ? since : 0);
+        ts = ref + (uint32_t)(int32_t)(int16_t)(uint16_t)(ts16 - (uint16_t)ref);
+    }
     if (w->peer_ts_valid && tdiff(ts, w->peer_ts) < -(int32_t)w->ts_window) {
         w->rx_stale++;
         return ANL_ESTALE;
     }
-    if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) w->peer_ts = ts;
+    if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) { w->peer_ts = ts; w->peer_ts_at = w->current; }
     w->peer_ts_valid = 1;
     /* A delivery gap can release buffered ACKs together on resumption.
        Ordinary, continuously arriving ACKs must still measure queue delay. */
@@ -3840,19 +3908,20 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
 
     while (p < end) {
         uint8_t b0;
-        int type, sid;
+        int type, sid, last;
         anl_stream *st;
-        if (end - p < 2) return ANL_EFORMAT;
         b0 = dec8(&p);
         type = b0 >> 6;
-        sid = ((b0 & SID_HI_MASK) << 8) | dec8(&p);
-        if (b0 & SID_X) {
+        last = (b0 & SEG_L) != 0;
+        sid = b0 & SID_LO_MASK;
+        if (b0 & SID_F) {
+            const char *q = p;
             uint32_t hi;
-            if (end - p < 2) return ANL_EFORMAT;
-            hi = dec16(&p);
-            if (hi == 0) return ANL_EFORMAT;    /* one encoding per sid */
+            /* one encoding per sid: a minimal, non-zero extension */
+            if (dec_varint(&p, end, &hi) < 0 || hi == 0 || varint_size(hi) != (int)(p - q)) return ANL_EFORMAT;
             sid |= (int)(hi << SID_LO_BITS);
         }
+        if (last && (type == SEG_ACK || type == SEG_FWD)) return ANL_EFORMAT;
 
         if (type == SEG_DATA) {
             uint8_t b1, flags;
@@ -3884,7 +3953,8 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 if (end - p < OPEN_BODY) return ANL_EFORMAT;
                 dec_open_body(&p, &oi);
             }
-            if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
+            if (last) len = (uint32_t)(end - p);
+            else if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
             if ((uint32_t)(end - p) < len) return ANL_EFORMAT;
             had_data = 1;
             if (b1 & F_OPEN) {
@@ -3908,11 +3978,22 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             uint8_t b1;
             uint16_t wnd;
             uint32_t una24, ts_echo, n, i, span = 0;
-            if (end - p < ACK_FIX) return ANL_EFORMAT;
+            uint16_t echo16;
+            if (end - p < ACK_FIX - 1) return ANL_EFORMAT;
             b1 = dec8(&p);
             una24 = dec24(&p);
             wnd = dec16(&p);
-            ts_echo = dec32(&p);
+            if (b1 & ACK_F_DELTA) {
+                uint8_t zz = dec8(&p);
+                if (!echo_prev_ok || (zz & 0x80)) return ANL_EFORMAT;
+                echo16 = (uint16_t)(echo_prev + (uint16_t)((zz & 1) ? -(int)((zz + 1) / 2) : (int)(zz / 2)));
+            } else {
+                if (end - p < 2) return ANL_EFORMAT;
+                echo16 = dec16(&p);
+            }
+            echo_prev = echo16; echo_prev_ok = 1;
+            /* our own clock, 16 bits back: the newest time with these low bits */
+            ts_echo = w->current - (uint16_t)((uint16_t)w->current - echo16);
             if (dec_varint(&p, end, &n) < 0) return ANL_EFORMAT;
             if (2 * n > snbuf_cap) return ANL_EFORMAT;
             for (i = 0; i < n; i++) {
@@ -3946,9 +4027,10 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
         } else {
             uint8_t sub;
             uint32_t blen;
-            if (end - p < 2) return ANL_EFORMAT;
+            if (end - p < 1) return ANL_EFORMAT;
             sub = dec8(&p);
-            if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
+            if (last) blen = (uint32_t)(end - p);
+            else if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
             if ((uint32_t)(end - p) < blen) return ANL_EFORMAT;
             if (sub == CTRL_PARITY) {
                 st = stream_for_input(w, sid, &urgent);
@@ -5500,6 +5582,7 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
     if (cfg->role != ANL_ROLE_CLIENT && cfg->role != ANL_ROLE_SERVER) return NULL;
     if (cfg->mtu < ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN_BODY + 64 || cfg->mtu > 65535) return NULL;
     if (cfg->pad_max < 0 || cfg->pad_max > ANL_MAX_PAD) return NULL;
+    if (cfg->ts_window_ms > 30000) return NULL;     /* a 16-bit ts: well inside half its range */
     if (cfg->default_snd_wnd < 0 || cfg->default_snd_wnd > ANL_MAX_WND) return NULL;
     if (cfg->default_rcv_wnd < 0 || cfg->default_rcv_wnd > ANL_MAX_WND) return NULL;
     gf_init();                          /* FEC tables (idempotent) */

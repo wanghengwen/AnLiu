@@ -26,8 +26,9 @@ extern "C" {
  *---------------------------------------------------------------------*/
 #define ANL_VERSION         1       /* wire version, flg bit7-6 */
 
-#define ANL_MAX_SID         ((1 << 29) - 1) /* 13 bits on the wire, 29 with the 2-byte extension;
-                                               never reused: about 2^28 opens per side */
+#define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
+                                               varint extension (DESIGN 5); never reused: about
+                                               2^24 opens per side */
 #define ANL_MAX_STREAMS     8192    /* upper bound of max_peer_streams (streams open at once) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
 #define ANL_MAX_WND         32768   /* 24-bit sn requires wnd << 2^23; window fields are 16 bits */
@@ -37,8 +38,8 @@ extern "C" {
 #define ANL_MAX_PAD         255     /* pad length is stored in one byte */
 
 #define ANL_TAG_SIZE        12      /* SipHash-2-4-128 truncated, doubles as nonce */
-#define ANL_HDR_SIZE        9       /* conv(4) + flg(1) + ts(4) */
-#define ANL_OVERHEAD        (ANL_TAG_SIZE + ANL_HDR_SIZE)   /* 21 */
+#define ANL_HDR_SIZE        7       /* conv(4) + flg(1) + ts(2) */
+#define ANL_OVERHEAD        (ANL_TAG_SIZE + ANL_HDR_SIZE)   /* 19 */
 #define ANL_FEC_OVERHEAD    12      /* mss reduction for FEC streams */
 
 /*---------------------------------------------------------------------
@@ -99,13 +100,14 @@ typedef struct anl_config {
     uint8_t psk[ANL_PSK_SIZE];  /* pre-shared key */
     int role;                   /* ANL_ROLE_CLIENT / ANL_ROLE_SERVER */
     int mtu;                    /* 1400 */
-    int pad_max;                /* 32; 0 = no padding; <= ANL_MAX_PAD */
+    int pad_max;                /* 32: datagrams without data (ACK, control) get 1..pad_max
+                                   random bytes; data datagrams none. 0 = no padding; <= ANL_MAX_PAD */
     anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG */
     int interval;               /* 20 ms (ikcp default is 100) */
     int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
                                   also seeds pacing before the first bandwidth sample */
     int dead_link;              /* 20 retransmissions (data / FWD / CLOSE, not OPEN) */
-    int ts_window_ms;           /* 1000, fixed; not tied to RTO */
+    int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2) */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
     int idle_timeout_ms;        /* SERVER default 30000, CLIENT default 0 */
     int pace_rate;              /* bytes/s; 0 = BBR alone (gain * bandwidth estimate), > 0 = upper

@@ -614,7 +614,7 @@ static void test_violation(void)
     anl_stream_opt_default(&o, ANL_RELIABLE);
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
-    q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc32(q, n.now);
+    q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now);
     q = enc_sid(q, SEG_FWD, anl_stream_id(b));
     q = enc24(q, 5);
     r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
@@ -922,18 +922,18 @@ static void test_fuzz(void)
     }
     for (i = 0; i < iters; i++) {
         int len, j;
-        len = 9 + (int)(rnd() % 300);
+        len = ANL_HDR_SIZE + (int)(rnd() % 300);
         for (j = 0; j < len; j++) plain[j] = (char)(uint8_t)rnd();
         {
             char *p = plain;
             p = enc32(p, 0x11223344);
             p = enc8(p, (uint8_t)((rnd() % 4 == 0) ? (rnd() & 0xff) : 0));
-            (void)enc32(p, n.now);
+            (void)enc16(p, (uint16_t)n.now);
         }
         /* bias: sometimes start with a plausible segment header on a live sid */
         if (rnd() % 2) {
             static const int sids[4] = { 0, 1, 2, 4 };
-            char *p = plain + 9;
+            char *p = plain + ANL_HDR_SIZE;
             (void)enc_sid(p, (int)(rnd() % 4), sids[rnd() % 4]);
         }
         (void)anl_input_plain(n.ep[1], plain, len);
@@ -1084,19 +1084,22 @@ static void test_sid_once(void)
     r = anl_input(n.ep[1], old, oldlen);
     CHECK(r == ANL_ESTALE, "old datagram now outside the ts window (%d)", r);
 
-    /* sid wire format: type(2) | X(1) | sid(13) [sid_hi(16)]; X with a zero extension is not
-       the one encoding of a small sid and drops the datagram */
+    /* sid wire format: type(2) | L(1) | F(1) | sid[3:0] [sid >> 4 as a varint]; F with a zero
+       or a non-minimal extension is not the one encoding of the sid and drops the datagram */
     {
-        char pl[32], *q = pl;
-        q = enc32(q, 0x11223344);
-        q = enc8(q, ANL_VERSION << 6);
-        q = enc32(q, n.now);
-        q = enc8(q, (uint8_t)((SEG_FWD << 6) | SID_X | ((sid >> 8) & SID_HI_MASK)));
-        q = enc8(q, (uint8_t)sid);
-        q = enc16(q, 0);
-        q = enc24(q, 0);
-        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
-        CHECK(r == ANL_EFORMAT, "non-canonical sid extension rejected (%d)", r);
+        int k;
+        for (k = 0; k < 2; k++) {
+            char pl[32], *q = pl;
+            q = enc32(q, 0x11223344);
+            q = enc8(q, ANL_VERSION << 6);
+            q = enc16(q, (uint16_t)n.now);
+            q = enc8(q, (uint8_t)((SEG_FWD << 6) | SID_F | (sid & SID_LO_MASK)));
+            if (k == 0) q = enc8(q, 0);                     /* zero */
+            else { q = enc8(q, (uint8_t)(0x80 | ((sid >> SID_LO_BITS) & 0x7f))); q = enc8(q, 0); }   /* padded */
+            q = enc24(q, 0);
+            r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+            CHECK(r == ANL_EFORMAT, "non-canonical sid extension %d rejected (%d)", k, r);
+        }
     }
     net_stop(&n);
 }
@@ -1453,7 +1456,7 @@ static void test_sid_churn(int loss, int TOTAL)
             fill_pattern(buf, 2500, (uint32_t)anl_stream_id(a[j]));
             anl_stream_send(a[j], buf, 2500);
             anl_stream_close(a[j]);             /* orderly: the data is still delivered */
-            if (anl_stream_id(a[j]) >= 1 << SID_LO_BITS) big++;
+            if (anl_stream_id(a[j]) >= 1 << SID_LO_BITS) big++;    /* takes the varint extension */
             if (anl_stream_id(a[j]) == 8200) { n.cap_len = 0; }
         }
         for (i = 0; i < 60000; i++) {
@@ -1488,7 +1491,7 @@ static void test_sid_churn(int loss, int TOTAL)
     printf("  done after %u ms of simulated time\n", n.now - 1000);
     CHECK(open_fail == 0, "every open succeeded (%d failed)", open_fail);
     CHECK(got == TOTAL, "every stream delivered its data (%d / %d)", got, TOTAL);
-    CHECK(big == (TOTAL > 4095 ? TOTAL - 4095 : 0), "%d sids took the 2-byte extension", big);
+    CHECK(big == (TOTAL > 7 ? TOTAL - 7 : 0), "%d sids took the varint extension", big);
     CHECK(n.ep[1]->peer_floor == (uint32_t)TOTAL && n.ep[0]->own_floor == (uint32_t)TOTAL, "floors at %u / %u", n.ep[1]->peer_floor, n.ep[0]->own_floor);
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all freed (%d / %d)",
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
@@ -1840,8 +1843,10 @@ static int skip_ack_output(char *wire, int len, anl_t *w, void *user)
     p = (const char *)plain + ANL_HDR_SIZE; end = (const char *)plain + size;
     g_skip_packets++;
     while (p < end) {
-        int type = dec8(&p) >> 6;
-        (void)dec8(&p);
+        uint8_t b0 = dec8(&p);
+        int type = b0 >> 6;
+        uint32_t hi;
+        if ((b0 & SID_F) && dec_varint(&p, end, &hi) < 0) break;
         if (type == SEG_CTRL) {
             uint8_t sub = dec8(&p); uint32_t n = 0;
             CHECK(dec_varint(&p, end, &n) == 0 && n == 4 && sub == CTRL_RCV_SKIP,
@@ -1853,7 +1858,7 @@ static int skip_ack_output(char *wire, int len, anl_t *w, void *user)
             uint32_t n = 0, i, v;
             CHECK(marker == g_skip_want, "each split ACK shares a datagram with its retirement marker");
             if (end - p < ACK_FIX) break;
-            p += ACK_FIX;
+            p += (dec8(&p) & ACK_F_DELTA) ? 6 : 7;     /* una(3) wnd(2), echo 1 or 2 */
             CHECK(dec_varint(&p, end, &n) == 0, "SACK count");
             for (i = 0; i < 2 * n; i++) CHECK(dec_varint(&p, end, &v) == 0, "SACK range");
             g_skip_acks++;
@@ -2253,7 +2258,7 @@ static int input_test_report(anl_t *w, anl_stream_t *st, uint32_t ts, uint16_t r
 {
     char buf[128], *p = buf;
     int i;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, ts);
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)ts);
     p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
     for (i = 0; i < 7; i++) p = enc16(p, 0);
     p = enc16(p, recovered);
@@ -2855,7 +2860,7 @@ static void test_fec_expiry(void)
             w->rx_srtt = 300;                       /* a repair misses the 250 ms deadline */
             for (i = 0; i < 3; i++) {
                 p = body;
-                p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, 100u + (uint32_t)i);
+                p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)(100u + (uint32_t)i));
                 p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
                 p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0);
                 p = enc16(p, 10); p = enc16(p, (uint16_t)(i * 2)); p = enc16(p, 0);
@@ -3743,10 +3748,10 @@ static void test_rtt_stale_ack(void)
     w = n.ep[0]; st = w->dflt; before = w->rx_srtt;
     CHECK(before > 0 && st->nsnd_buf == 0, "real ACK established RTT and retired baseline");
     p = packet;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, w->current);
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
     p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
     p = enc24(p, st->snd_una & SN_MASK); p = enc16(p, st->rcv_wnd);
-    p = enc32(p, w->current - 5000); p = enc_varint(p, 0);
+    p = enc16(p, (uint16_t)(w->current - 5000)); p = enc_varint(p, 0);
     CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid old ACK accepted");
     CHECK(w->rx_srtt == before, "old ACK cannot pollute RTT (%d -> %d)", before, w->rx_srtt);
     CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid duplicate ACK accepted");
@@ -3757,10 +3762,10 @@ static void test_rtt_stale_ack(void)
     n.now += 1000; anl_update(w, n.now);
     before = w->rx_srtt;
     p = packet;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc32(p, w->current);
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
     p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
     p = enc24(p, next & SN_MASK); p = enc16(p, st->rcv_wnd);
-    p = enc32(p, echo); p = enc_varint(p, 0);
+    p = enc16(p, (uint16_t)echo); p = enc_varint(p, 0);
     CHECK(anl_input_plain(w, packet, p-packet) == 0 && st->nsnd_buf == 0, "real ACK retires new data");
     CHECK(w->rx_srtt != before && abs(w->rx_srtt - 1000) < abs(before - 1000), "new ACK still learns a legitimate RTT (%d -> %d)", before, w->rx_srtt);
     net_stop(&n);
