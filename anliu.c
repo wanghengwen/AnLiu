@@ -5724,10 +5724,16 @@ void anl_update(anl_t *w, uint32_t current)
 
 uint32_t anl_check(const anl_t *w, uint32_t current)
 {
+    /* The next time anl_update acts: the periodic flush, or the pacing bucket
+       holding the next datagram while one waits for it. Timers of streams
+       (ACKs, block close, parities, RTO, RACK, FWD / CLOSE / OPEN retries)
+       run in the periodic flush, or in a flush that input or a send triggers -
+       reporting them here only made an application driven by anl_check call
+       anl_update over and over in the same millisecond, with nothing sent
+       (an ACK pending: 10^6 calls, no datagram). It also walked every
+       segment in flight on each call. */
     uint32_t ts_flush, minimal;
     int32_t tm_flush, tm_min = 0x7fffffff;
-    anl_node *n, *nx;
-    anl_stream *st;
 
     if (w == NULL || !w->updated) return current;
     if (w->state < 0) return current + (uint32_t)w->interval;
@@ -5736,59 +5742,12 @@ uint32_t anl_check(const anl_t *w, uint32_t current)
     if (tdiff(current, ts_flush) >= 0) return current;
     tm_flush = tdiff(ts_flush, current);
 
-    if (w->nrstq > 0 || !QEMPTY(&w->ctl_list)) return current;
-    FOR_EACH_STREAM(w, st, n, nx) {
-        anl_node *pos;
-        if (st->state == ANL_STREAM_CLOSED) continue;
-        if (st->ack_pending || st->probe_ask || st->probe_tell || st->rst_pending || st->close_answer) return current;
-        if (st->ack_rep_ts != 0) {
-            int32_t d = tdiff(st->ack_rep_ts, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        if (!st->peer_opened) {
-            int32_t d = tdiff(st->open_ts, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        if (st->fwd_pending) {
-            int32_t d = tdiff(st->fwd_ts, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        if (st->state == ANL_STREAM_CLOSING && !st->fin_acked) {
-            int32_t d = tdiff(st->close_ts, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        if (st->fec && st->fec_n > 0) {
-            int32_t d = tdiff(st->fec_first_ts + st->fec_blk_ms, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        if (st->fec && st->fec_out_i < st->fec_out_m) {
-            int32_t d = tdiff(st->fec_out_ts, current);
-            if (d <= 0) return current;
-            if (d < tm_min) tm_min = d;
-        }
-        for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next) {
-            const anl_seg *seg = QENTRY(pos, anl_seg, node);
-            int32_t d = tdiff(seg->resendts, current);
-            if (d <= 0 || seg->lost) return current;
-            if (d < tm_min) tm_min = d;
-            if (rack_candidate(w, st, seg)) {
-                d = tdiff(rack_sent(seg) + w->rack_rtt + reo_wnd(w, st), current);  /* RACK timer */
-                if (d <= 0) return current;
-                if (d < tm_min) tm_min = d;
-            }
-        }
-    }
     if (w->pace_blocked) {
         uint32_t wait = pace_wait_ms(w);
         int32_t elapsed = tdiff(current, w->pace_last);
         int32_t d = (int32_t)wait - elapsed;
         if (d <= 0) return current;
-        if (d < tm_min) tm_min = d;
+        tm_min = d;
     }
     minimal = (uint32_t)(tm_min < tm_flush ? tm_min : tm_flush);
     if (minimal >= (uint32_t)w->interval) minimal = (uint32_t)w->interval;
