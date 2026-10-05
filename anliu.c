@@ -622,6 +622,8 @@ typedef struct anl_stream {
     int fec_rtt_auto;                   /* reserve FEC from open, gate new parity blocks by RTT */
     uint32_t fec_deadline;              /* auto: a retransmission arriving within this (ms from
                                            enqueue) is fine, FEC is not needed for it; 0 = none */
+    uint32_t fec_deadline_cfg;          /* ... as configured; latency_rtt raises fec_deadline above it */
+    uint32_t latency_rtt;               /* fec_deadline follows N x min_rtt (0: off, fec_deadline_follow) */
     uint32_t fec_sent, fec_miss, fec_adj_ts;    /* auto: first transmissions, lost ones, last raise */
     int fec_gate;                       /* RTT auto: parity for the stream's blocks (DESIGN 8.6) */
     int fec_gate_was;                   /* ... ever opened on hard loss (the first opening skips the hold) */
@@ -5424,6 +5426,22 @@ static uint32_t fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg
     return until ? until : 1;
 }
 
+/* latency_rtt (DESIGN 8.6): the application waits N path round trips for a
+ * frame - FEC is needed only for what retransmission cannot repair within
+ * them. The deadline follows the windowed minimum RTT (the path, not the
+ * queue this stream builds), never below the configured one and never past
+ * max_age, when the sender gives the frame up */
+static void fec_deadline_follow(const anl_t *w, anl_stream *st)
+{
+    uint32_t d = st->fec_deadline_cfg, r;
+    if (w->min_rtt > 0) {
+        r = st->latency_rtt * w->min_rtt;
+        if (st->max_age_ms && r > (uint32_t)st->max_age_ms) r = (uint32_t)st->max_age_ms;
+        if (r > d) d = r;
+    }
+    st->fec_deadline = d;
+}
+
 /* a stream the flush's passes by priority have anything to do for */
 static int flush_busy(const anl_stream *st)
 {
@@ -5462,6 +5480,7 @@ static void anl_flush_internal(anl_t *w)
        frees a stream (control_stream, which may, ran above) */
     memset(bo, 0, sizeof(bo));
     FOR_EACH_STREAM(w, st, n, nx) {
+        if (st->latency_rtt) fec_deadline_follow(w, st);
         if (stream_sendable(st)) {
             if (st->nsnd_que || st->nsnd_buf) semi_drop_check(w, st);      /* nothing to drop otherwise */
             if (st->nsnd_que > 0 && tdiff(st->snd_nxt, st->snd_una + umin32(st->snd_wnd, st->rmt_wnd)) < 0) new_data = 1;
@@ -5976,6 +5995,7 @@ static int stream_opt_check(const anl_stream_opt *opt)
     if (opt->fec < ANL_FEC_RTT_AUTO ||
         (opt->fec == ANL_FEC_RTT_AUTO && opt->mode != ANL_SEMI)) return ANL_EINVAL;
     if (opt->rcv_deadline_ms < -1) return ANL_EINVAL;
+    if (opt->latency_rtt < 0 || opt->latency_rtt > 16 || (opt->latency_rtt && opt->mode != ANL_SEMI)) return ANL_EINVAL;
     if (opt->tag < 0 || opt->tag > 0xffff) return ANL_EINVAL;
     return 0;
 }
@@ -5988,6 +6008,8 @@ static int stream_apply_local(anl_t *w, anl_stream *st, const anl_stream_opt *op
     st->report = opt->report != 0;
     st->fec_deadline = opt->fec_deadline_ms > 0 ? (uint32_t)opt->fec_deadline_ms
                      : st->mode == ANL_SEMI && opt->max_age_ms > 0 ? (uint32_t)opt->max_age_ms / 2 : 0;
+    st->fec_deadline_cfg = st->fec_deadline;
+    st->latency_rtt = st->mode == ANL_SEMI ? (uint32_t)opt->latency_rtt : 0;
     st->snd_wnd = (uint32_t)opt->snd_wnd;
     if (st->mode == ANL_SEMI) {
         st->max_age_ms = opt->max_age_ms > 0 ? opt->max_age_ms : 0;

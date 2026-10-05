@@ -159,6 +159,13 @@ typedef struct anl_stream_opt {
     int fec_deadline_ms;        /* adaptive FEC: a loss whose estimated recovery arrives within this
                                    (from enqueue) needs no FEC - also the RTT-auto gate's target;
                                    0 = semi max_age_ms / 2, reliable none */
+    int latency_rtt;            /* semi only: 0 (default) = off; N = 1..16: the application can
+                                   wait N path round trips for a frame (SRT advises a latency of
+                                   3..4 RTT): fec_deadline_ms grows to N x min RTT, at most
+                                   max_age_ms, so a long path repairs more by retransmission and
+                                   sends less parity - less bandwidth, more latency. Raise
+                                   max_age_ms with it: with 500 ms one retry no longer fits
+                                   beyond ~250 ms RTT (DESIGN 8.6) */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
     int drop_until_key;         /* semi only: 0 */

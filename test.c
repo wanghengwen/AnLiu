@@ -2022,6 +2022,9 @@ static void test_key_receiver_discard(void)
  * after `ms` and the peer's FEC repairs */
 static int g_gate_noreport;             /* run_fec_gate: the peer sends no delay reports */
 static int g_gate_open_pct;             /* ... % of 100 ms samples after 3 s with parity on */
+static int g_gate_latency_rtt;          /* ... the sender's latency_rtt */
+static int g_gate_deadline_cfg;         /* ... and fec_deadline_ms */
+static uint32_t g_gate_deadline;        /* ... its fec_deadline at the end */
 static int run_fec_gate(int fec, int max_age, int size, int period, int delay, int loss, int ms, uint32_t *repaired, int *got)
 {
     net n; anl_config ca, cb; anl_stream_opt o, op; anl_stream_stats ss;
@@ -2039,6 +2042,8 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
     o.fec = fec;
     op = o;
     op.report = !g_gate_noreport;
+    o.latency_rtt = g_gate_latency_rtt;
+    o.fec_deadline_ms = g_gate_deadline_cfg;
     a = open_pair(&n, 0, &o, &op, &b);
     if (!b) { net_stop(&n); return -1; }
     n.loss_pct = loss;
@@ -2053,6 +2058,7 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
         while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) (*got)++;
     }
     g_gate_open_pct = samples ? on * 100 / samples : 0;
+    g_gate_deadline = ((anl_stream *)a)->fec_deadline;
     anl_stream_get_stats(a, &ss);
     open = ss.fec_ratio != 0;
     anl_stream_get_stats(b, &ss);
@@ -2060,6 +2066,45 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
     CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
     net_stop(&n);
     return open;
+}
+
+/* latency_rtt (DESIGN 8.6): the application waits N round trips - the FEC
+ * deadline follows N x min RTT up to max_age, and video a retransmission
+ * repairs within it gets no parity */
+static void test_latency_rtt(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    uint32_t rep;
+    int open, got, err = 0;
+    printf("[semi: latency_rtt - the FEC deadline follows the RTT]\n");
+    net_init(&n, &ca, &cb);
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.latency_rtt = 3;
+    CHECK(anl_stream_open(n.ep[0], &o, &err) == NULL && err == ANL_EINVAL, "reliable stream: refused (%d)", err);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.latency_rtt = 17; err = 0;
+    CHECK(anl_stream_open(n.ep[0], &o, &err) == NULL && err == ANL_EINVAL, "17 round trips: refused (%d)", err);
+    net_stop(&n);
+    /* video, 250 ms RTT, 5% loss, fec_deadline 300 ms: a repair (with the
+       second retry the loss asks for) does not fit - parity */
+    g_gate_deadline_cfg = 300;
+    open = run_fec_gate(ANL_FEC_RTT_AUTO, 1200, 3000, 33, 125, 5, 8000, &rep, &got);
+    printf("  video, rtt 250 ms, 5%% loss, deadline 300, max_age 1200:  gate %d, deadline %u ms\n", open, g_gate_deadline);
+    CHECK(open == 1 && g_gate_deadline == 300, "configured deadline: parity (%d, %u)", open, g_gate_deadline);
+    /* four round trips: about 1000 ms - retransmission only (the last frames
+       are still on their way when the run ends) */
+    g_gate_latency_rtt = 4;
+    open = run_fec_gate(ANL_FEC_RTT_AUTO, 1200, 3000, 33, 125, 5, 8000, &rep, &got);
+    printf("  ... latency_rtt 4:  gate %d, deadline %u ms, %d of 243 frames\n", open, g_gate_deadline, got);
+    CHECK(open == 0 && g_gate_deadline >= 996 && g_gate_deadline <= 1040, "4 x min RTT: no parity (%d, %u)", open, g_gate_deadline);
+    CHECK(got >= 230, "frames delivered by retransmission (%d)", got);
+    /* never past max_age: the sender gives the frame up there */
+    open = run_fec_gate(ANL_FEC_RTT_AUTO, 800, 3000, 33, 125, 5, 8000, &rep, &got);
+    printf("  ... latency_rtt 4, max_age 800:  gate %d, deadline %u ms\n", open, g_gate_deadline);
+    CHECK(g_gate_deadline == 800, "capped at max_age (%u)", g_gate_deadline);
+    g_gate_deadline_cfg = 0;
+    g_gate_latency_rtt = 0;
 }
 
 static void test_fec_rtt_default(void)
@@ -3870,6 +3915,7 @@ int main(void)
     RUN(test_receiver_skip_ack_fragments());
     RUN(test_rcv_skip_clears_fwd());
     RUN(test_fec_rtt_default());
+    RUN(test_latency_rtt());
     RUN(test_fec_first_key());
     RUN(test_report_late_clock());
     RUN(test_fec_repair());
