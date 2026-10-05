@@ -26,3 +26,6 @@ anl_test
 /test_fec_diag
 /test_tx_diag
 /test_media_workload
+
+# python bytecode (tools/realnet)
+__pycache__/

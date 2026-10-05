@@ -1,0 +1,8 @@
+{
+  "a":  {"ssh": "user@192.0.2.10", "ip": "192.0.2.10", "base": "workspace", "dev": "eth0", "shape": true},
+  "b":  {"ssh": "user@192.0.2.20", "ip": "192.0.2.20", "base": "workspace", "dev": "eth0", "shape": true},
+  "c":  {"ssh": "user@198.51.100.30", "ip": "198.51.100.30", "base": "workspace", "dev": "", "shape": false,
+         "cap_kbps": 30000, "slots": 8, "pool": "big"},
+  "lan": {"ssh": "user@192.168.1.1", "ip": "192.168.1.1", "base": "workspace", "dev": "br0", "shape": true,
+          "cap_kbps": 1000000, "slots": 8, "pool": "big"}
+}
