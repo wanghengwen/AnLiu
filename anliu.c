@@ -497,6 +497,9 @@ typedef struct anl_seg {
     uint32_t ts_sent;       /* time of the last transmission (RACK); receiver: the peer's send time */
     uint32_t fec_ts;        /* its FEC block's last parity goes out (first transmission only) */
     uint16_t fec_share;     /* its share of the block's parity bytes (delivery rate) */
+    uint32_t fec_base;      /* its small FEC block: first sn, data packets, parities (fec_rto_hold;
+                               m = 0: a large block, none, or the RTO was held once) */
+    uint8_t  fec_k, fec_m;
     uint8_t  lost_cnt;      /* counted in lost_bytes (RACK marked it; undone if the original arrives) */
     uint32_t resendts;
     uint32_t rto;
@@ -4470,6 +4473,8 @@ static void fec_close_block(anl_t *w, anl_stream *st)
         if (tdiff(s->sn, st->fec_base) < 0 || s->xmit != 1) continue;
         s->fec_ts = last ? last : 1;
         s->fec_share = (uint16_t)umin32(share, 0xffff);
+        s->fec_base = st->fec_base; s->fec_k = (uint8_t)k;
+        s->fec_m = k * lmax <= FEC_SMALL_BLOCK ? (uint8_t)m : 0;      /* fec_rto_hold: small blocks only */
         /* the RTO counts from the last parity too, as far as a
            retransmission then still makes fec_deadline (reach): a block
            collects up to fec_blk_ms, and timed from the send the RTO beat
@@ -5324,6 +5329,47 @@ static void rate_update(anl_t *w)
     }
 }
 
+/* The RTO of a first transmission in a small block (audio) that the peer can
+ * almost surely rebuild. Its retransmission is held back by the deadline
+ * (fec_close_block: it must still make fec_deadline), which comes before the
+ * rebuild's ACK can: 94% of them reached a peer that already had the segment
+ * (5 Mbit, 100 ms, 5%). The members still unacknowledged plus the parities
+ * leave the block short only if more than m of them are lost: at twice the
+ * measured loss, no more than a tenth of the small-block target - hold the
+ * RTO for a round trip, once; the rebuild's ACK is on its way. Not near the
+ * link (a recent queue, capacity short): there losses come together and the
+ * independent estimate is too low. Large blocks (video) keep the early
+ * retransmission: holding theirs too cost 2 points of video at 2 Mbit 280 ms
+ * and 3..5 of a cold start (review 0.4). */
+static int fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg *seg)
+{
+    const anl_node *pos;
+    uint32_t u = 1, n, m = seg->fec_m;
+    if (seg->xmit != 1 || m == 0 || !w->fec_loss_valid || w->capacity_short) return 0;
+    if (w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    for (pos = seg->node.prev; pos != &st->snd_buf; pos = pos->prev) {
+        const anl_seg *s = QENTRY(pos, anl_seg, node);
+        if (tdiff(s->sn, seg->fec_base) < 0) break;
+        u++;
+    }
+    for (pos = seg->node.next; pos != &st->snd_buf; pos = pos->next) {
+        const anl_seg *s = QENTRY(pos, anl_seg, node);
+        if (tdiff(s->sn, seg->fec_base + seg->fec_k) >= 0) break;
+        u++;
+    }
+    n = u + m;
+    /* P(more than m of n lost) at twice the measured loss, as fec_parities_for */
+    {
+        const uint64_t one = 1ull << 32;
+        uint64_t p = umin32(2 * w->fec_loss, 32768), q = 65536u - p, pmf = one, cdf;
+        uint32_t i;
+        for (i = 0; i < n; i++) pmf = pmf * q >> 16;
+        cdf = pmf;
+        for (i = 0; i < m && i < n; i++) { pmf = pmf * (n - i) / (i + 1) * p / q; cdf += pmf; }
+        return cdf < one && (one - cdf) * 10000 <= one * FEC_SMALL_FAIL;
+    }
+}
+
 static void anl_flush_internal(anl_t *w)
 {
     uint32_t current = w->current;
@@ -5412,6 +5458,12 @@ static void anl_flush_internal(anl_t *w)
                 }
                 if (!pace_can_send(w)) { w->pace_blocked = 1; next_rto = current; break; }
                 if (retrans_spent >= retrans_limit) { rtx_capped = 1; next_rto = current; break; }
+                if (why == 2 && fec_rto_hold(w, st, seg)) {
+                    seg->fec_m = 0;
+                    seg->resendts = current + (uint32_t)(w->rx_srtt > 0 ? w->rx_srtt : RTO_DEF);
+                    if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
+                    continue;
+                }
                 if (why == 2) {
                     lost = 1;
                     seg->rto = umin32(seg->rto + seg->rto / 2, RTO_MAX);  /* back off x1.5 */
