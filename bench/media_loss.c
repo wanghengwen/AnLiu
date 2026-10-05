@@ -20,6 +20,10 @@
  * Timely media uses the original propagation delay as its minimum baseline;
  * an event's extra delay consumes that same delivery budget. A delivery pause
  * retains datagrams instead of adding random packet loss.
+ * LAT: extra delay percentiles of the received frames and how many made the
+ * budget + 100 ms. SIM_VIDEO_FEC_DEADLINE=<ms> sets the video fec_deadline_ms,
+ * SIM_VIDEO_LATENCY_RTT=<N> its latency_rtt, SIM_VIDEO_LATENCY=<ms> the video
+ * budget (max_age = budget + 200 ms).
  * RTX: retransmissions by trigger (RTO, RACK; _cov: the segment was covered by
  * a parity block) and how many reached a receiver that already had the data
  * (dup_*); FECCNT: what fed the adaptive ratio. MEDIA_LOSS_RTX=1 traces each.
@@ -197,7 +201,8 @@ int main(int argc, char **argv)
     }
     flow_audio(&f[0], 0, &V_ANLF); flow_video(&f[1], 1, &V_ANLF);
     s.fl = f; s.nfl = 2;
-    for (i = 0; i < 2; i++) { f[i].fec = ANL_FEC_RTT_AUTO; ep_open(&s.e[0], &f[i]); }
+    /* MEDIA_LOSS_FEC_OFF=1: both flows without FEC (retransmission only) */
+    for (i = 0; i < 2; i++) { f[i].fec = getenv("MEDIA_LOSS_FEC_OFF") ? 0 : ANL_FEC_RTT_AUTO; ep_open(&s.e[0], &f[i]); }
     printf("CONFIG bw=%d rtt=%d loss=%d seed=%d duration=%d stop=%d interval=%u event=%s event_start=%d event_duration=%d event_delay=%d\n", bw, rtt, loss, seed, duration, stop, s.e[0].anl->interval, event, event_start, event_duration, event_delay);
     while (s.t < (uint64_t)duration * 1000 + 5000) {
         s.t++;
@@ -313,6 +318,20 @@ int main(int argc, char **argv)
             i,f[i].seq,received,ontime,keys,key_on,repeated,repeated_late,
             (unsigned long long)first_bytes[i],(unsigned long long)retry_bytes[i],(unsigned long long)parity_bytes[i],
             (unsigned long long)f[i].offered,(unsigned long long)ontime_bytes);
+        {
+            /* LAT: extra delay of the received frames (over the propagation
+               delay) - percentiles and on time at a budget 100 ms looser */
+            static unsigned ex[65536];
+            unsigned n = 0, on_loose = 0, j, t;
+            for (k = 0; k < (int)f[i].seq && n < 65536; k++) {
+                unsigned lat = latency_ms[i][k];
+                if (!lat) continue;
+                ex[n++] = lat - 1 > (unsigned)lc.delay ? lat - 1 - (unsigned)lc.delay : 0;
+                on_loose += lat - 1 <= (unsigned)(lc.delay + f[i].budget_ms + 100);
+            }
+            for (j = 1; j < n; j++) for (t = j; t > 0 && ex[t - 1] > ex[t]; t--) { unsigned x = ex[t]; ex[t] = ex[t - 1]; ex[t - 1] = x; }
+            printf("LAT id=%d p50=%u p95=%u p99=%u ontime_loose=%u\n", i, n ? ex[n / 2] : 0, n ? ex[n * 95 / 100] : 0, n ? ex[n * 99 / 100] : 0, on_loose);
+        }
         printf("FECCNT id=%d sent=%u lost=%u late=%u slow=%u\n", i, fec_counts[i][0], fec_counts[i][1], fec_counts[i][2], fec_counts[i][3]);
         printf("RTX id=%d rto=%u rto_cov=%u rack=%u rack_cov=%u dup_rx=%u dup_rto=%u dup_rack=%u\n", i, rtx_why[i][2], rtx_cov[i][2], rtx_why[i][3], rtx_cov[i][3], dup_rx[i], dup_why[i][2], dup_why[i][3]);
         printf("BLOCKSUM id=%d blocks=%u small_blocks=%u data=%llu parities=%llu\n", i,blocks[i],small_blocks[i],(unsigned long long)block_data[i],(unsigned long long)block_parities[i]);

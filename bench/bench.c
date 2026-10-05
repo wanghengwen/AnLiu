@@ -432,6 +432,12 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
         o->max_age_ms = f->max_age;
         if (g_rcv_deadline >= -1) o->rcv_deadline_ms = g_rcv_deadline;
         o->drop_until_key = f->until_key;
+        /* SIM_VIDEO_FEC_DEADLINE=<ms>: the video (drop_until_key) stream's
+           fec_deadline_ms - how late a repair by retransmission may come
+           before FEC is needed (library default max_age / 2) */
+        if (f->until_key && getenv("SIM_VIDEO_FEC_DEADLINE")) o->fec_deadline_ms = atoi(getenv("SIM_VIDEO_FEC_DEADLINE"));
+        /* SIM_VIDEO_LATENCY_RTT=<N>: the video stream's latency_rtt */
+        if (f->until_key && getenv("SIM_VIDEO_LATENCY_RTT")) o->latency_rtt = atoi(getenv("SIM_VIDEO_LATENCY_RTT"));
     }
 }
 
@@ -643,6 +649,9 @@ static void flow_video(flow *f, int sid, const variant *v)
     f->period_ms = 33; f->gop = 30;
     f->key_min = 25000; f->key_max = 35000; f->size_min = 2500; f->size_max = 3500;
     f->max_age = 500; f->until_key = 1; f->budget_ms = 300;
+    /* SIM_VIDEO_LATENCY=<ms>: the application's video latency L - frames on
+       time within L, dropped at L + 200 ms (max_age) */
+    if (getenv("SIM_VIDEO_LATENCY")) { f->budget_ms = atoi(getenv("SIM_VIDEO_LATENCY")); f->max_age = f->budget_ms + 200; }
     f->fec = v->fec;
     /* unsent backlog of max_age: ~140 KB/s * 0.5 s / mss */
     f->kcp_drop = v->drop; f->kcp_thr = 140000 / 2 / 1376 + 1;

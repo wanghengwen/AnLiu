@@ -6,11 +6,17 @@ directions done by tc (multi_tc.py --loss: gact on the sender's egress filter
 and on its ingress for the peer's datagrams) - no in-application drop.
 
 Usage: cmp_round.py SENDER RECEIVER RATE_KBPS LOSS SEED PORTBASE [--dur S] [--anl VARIANT]
+                    [--protos NAME,...] [--drive-check]
 Hosts from ANL_REALNET_HOSTS (../hosts.py). --anl names the AnLiu variant
 deployed with ../deploy.py (default main); srtnet is expected at
 base/ANL_REALNET_REMOTE_DIR/srt/srtnet on both hosts (deploy_srt.py).
-Protocols (ports PORTBASE+0..3):
-  anl      realnet --proto anl, fixed video scale 1000 (no encoder feedback)
+--protos picks the protocols run side by side (default anl,srt-b,srt-fec,srt-rec;
+ports PORTBASE+0.. in that order); --drive-check drives AnLiu by anl_check
+(REALNET_DRIVE=check) instead of 1 ms polling. Protocols:
+  anl      realnet --proto anl, RTT-auto FEC, fixed video scale 1000 (no encoder feedback)
+  anl-nf   the same with FEC off (--fec-rtt-auto 0): retransmission only
+  anl-nf-aN  anl-nf with the audio receiver gap wait at N ms (--rcv-deadline-audio N)
+  NAME@VARIANT  an AnLiu lane run from another deployed variant (e.g. anl-nf@cand)
   srt-b    SRT latency audio 120 / video 250 ms (the budgets 150 / 300 less margin)
   srt-fec  srt-b + packetfilter fec,cols:10,rows:5,layout:staircase,arq:onreq
   srt-rec  SRT latency max(120, 4 x RTT) for both (SRT's usual guidance)
@@ -26,6 +32,11 @@ if '--dur' in argv:
     i = argv.index('--dur'); dur = int(argv[i + 1]); argv = argv[:i] + argv[i + 2:]
 if '--anl' in argv:
     i = argv.index('--anl'); anl_variant = argv[i + 1]; argv = argv[:i] + argv[i + 2:]
+want = ['anl', 'srt-b', 'srt-fec', 'srt-rec']
+if '--protos' in argv:
+    i = argv.index('--protos'); want = argv[i + 1].split(','); argv = argv[:i] + argv[i + 2:]
+drive_check = '--drive-check' in argv
+argv = [a for a in argv if a != '--drive-check']
 snd, rcv, rate, loss, seed, pbase = argv[0], argv[1], int(argv[2]), int(argv[3]), int(argv[4]), int(argv[5])
 S, C = HOSTS[snd], HOSTS[rcv]
 assert S['shape'], 'sender cannot shape'
@@ -51,7 +62,8 @@ def ssh(h, cmd, check=True, timeout=120):
 
 
 CMP = lambda h: H.remote(h, 'srt')
-RN = lambda h: '$HOME/' + H.remote(h, anl_variant) + '/src/bench/realnet_trace'
+lane_variant = lambda name: name.partition('@')[2] or anl_variant     # NAME@VARIANT: this lane's own variant
+RN = lambda h, name: '$HOME/' + H.remote(h, lane_variant(name)) + '/src/bench/realnet_trace'
 manifest = json.loads((H.WORK / anl_variant / 'deployment-manifest.json').read_text())
 ping = None
 meta = dict(tag=tag, sender=snd, receiver=rcv, rate_kbps=rate, loss_pct=loss, seed=seed, duration_s=dur,
@@ -69,8 +81,14 @@ try:
     if ping is None: raise RuntimeError('no ping: ' + out)
     meta['rtt_min_ms'] = ping
     rec_lat = max(120, int(4 * ping))
-    protos = [('anl', None), ('srt-b', (120, 250, '')), ('srt-fec', (120, 250, 'fec,cols:10,rows:5,layout:staircase,arq:onreq')),
-              ('srt-rec', (rec_lat, rec_lat, ''))]
+    known = dict([('anl', 1), ('anl-nf', 0), ('srt-b', (120, 250, '')), ('srt-fec', (120, 250, 'fec,cols:10,rows:5,layout:staircase,arq:onreq')),
+                  ('srt-rec', (rec_lat, rec_lat, ''))])
+    for n in want:
+        base = n.partition('@')[0]
+        if base.startswith('anl-nf-a'): known[n] = (0, int(base[8:]))
+        elif '@' in n: known[n] = known[base]
+    protos = [(n, known[n]) for n in want]
+    meta['drive'] = 'check' if drive_check else 'poll1ms'
     subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(B.parent / 'multi_tc.py'),
                     S['ssh'] + ':' + CMP(S) + '/multi_tc.py'], check=True, timeout=120)
     for k, (name, cfg) in enumerate(protos):
@@ -81,8 +99,10 @@ try:
         o = ssh(S, f"python3 {CMP(S)}/multi_tc.py setup --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()
         band = int(o.split('band')[-1].split()[0])
         bands[name] = (port, band, state)
-        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 300} </dev/null > {CMP(S)}/logs/deadman_{port}.log 2>&1 &")
+        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 900} </dev/null > {CMP(S)}/logs/deadman_{port}.log 2>&1 &")
         meta['protocols'][name] = dict(port=port, band=band, cfg=cfg)
+        if name.startswith('anl'):
+            meta['protocols'][name]['revision'] = json.loads((H.WORK / lane_variant(name) / 'deployment-manifest.json').read_text())['revision']
 
     def start(h, name, role, cmd, env=''):
         rel = f"logs/{tag}.{name}.{role}"; log = f"{CMP(h)}/{rel}"
@@ -90,13 +110,17 @@ try:
         procs.append((h, log))
         return log
 
-    anl_args = f"--proto anl --test media --dir down --dur {dur} --interval 10 --loss 0 --rx-loss 0 --seed {seed} --rcv-deadline -1 --init-cwnd 16 --fec-rtt-auto 1 --adapt 0 --prio-audio 0 --prio-video 1"
-    anl_env = 'REALNET_MDIAG=1 REALNET_TIMEBASE=1 REALNET_CLOCK=1 REALNET_FECCOST=1 REALNET_FIXED_SCALE=1000'
+    def anl_args(cfg):
+        fec, rda = cfg if isinstance(cfg, tuple) else (cfg, None)
+        return (f"--proto anl --test media --dir down --dur {dur} --interval 10 --loss 0 --rx-loss 0 --seed {seed} --rcv-deadline -1 "
+                f"--init-cwnd 16 --fec-rtt-auto {fec} --adapt 0 --prio-audio 0 --prio-video 1"
+                + (f" --rcv-deadline-audio {rda}" if rda is not None else ''))
+    anl_env = 'REALNET_MDIAG=1 REALNET_TIMEBASE=1 REALNET_CLOCK=1 REALNET_FECCOST=1 REALNET_FIXED_SCALE=1000' + (' REALNET_DRIVE=check' if drive_check else '')
     logs = {}
     for name, cfg in protos:
         port = bands[name][0]
-        if name == 'anl':
-            logs[name, 'srv'] = start(S, name, 'srv', f"{RN(S)} server --port {port} {anl_args}", anl_env)
+        if name.startswith('anl'):
+            logs[name, 'srv'] = start(S, name, 'srv', f"{RN(S, name)} server --port {port} {anl_args(cfg)}", anl_env)
         else:
             logs[name, 'srv'] = start(S, name, 'srv', f"./srtnet server --port {port} --dur {dur} --seed {seed}")
     for _ in range(40):
@@ -107,8 +131,8 @@ try:
         raise RuntimeError('servers not ready')
     for name, cfg in protos:
         port = bands[name][0]
-        if name == 'anl':
-            logs[name, 'cli'] = start(C, name, 'cli', f"{RN(C)} client --host {S['ip']} --port {port} {anl_args}", anl_env)
+        if name.startswith('anl'):
+            logs[name, 'cli'] = start(C, name, 'cli', f"{RN(C, name)} client --host {S['ip']} --port {port} {anl_args(cfg)}", anl_env)
         else:
             la, lv, fec = cfg
             logs[name, 'cli'] = start(C, name, 'cli', f"./srtnet client --host {S['ip']} --port {port} --lat-audio {la} --lat-video {lv} --dur {dur}"

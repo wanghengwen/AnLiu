@@ -7,7 +7,7 @@ the tc loss actually applied.
 One-way delays are absolute (CLOCK_REALTIME): srtnet stamps both ends with
 it; realnet's monotonic stamps are converted with each host's TIMEBASE
 (wall_us - event_mono_us). The base is the smallest AnLiu audio delay of the
-same round (same hosts, same time, so the hosts' clock offset cancels): it
+same round, over all AnLiu lanes (same hosts, same time, so the hosts' clock offset cancels): it
 stands for the path's propagation delay. SRT delivers every packet a fixed
 latency after it was sent (TSBPD), so subtracting its own minimum would hide
 that latency; this base does not."""
@@ -52,9 +52,9 @@ def analyse(meta):
     for name in meta['protocols']:
         srv = (B / 'results' / f'{tag}.{name}.srv').read_text(errors='replace')
         cli = (B / 'results' / f'{tag}.{name}.cli').read_text(errors='replace')
-        raw[name] = (anl_delays if name == 'anl' else srt_delays)(srv, cli)
+        raw[name] = (anl_delays if name.startswith('anl') else srt_delays)(srv, cli)
         rows[name] = {'srt_stats': [l for l in srv.splitlines() + cli.splitlines() if l.startswith('SRTSTAT')]}
-    base = min(d for (f, s), d in raw['anl'][1].items() if f == 1)
+    base = min(d for n in raw if n.startswith('anl') for (f, s), d in raw[n][1].items() if f == 1)
     for name, (sent, rcv) in raw.items():
         r = rows[name]
         for f, fname in ((1, 'audio'), (2, 'video')):
@@ -78,7 +78,8 @@ def analyse(meta):
 
 
 if __name__ == '__main__':
-    path_of = lambda m: 'LAN' if m['rtt_min_ms'] < 10 else f"{m['rtt_min_ms']:.0f}ms"
+    path_of = lambda m: ('LAN' if m['rtt_min_ms'] < 10 else '~100ms' if m['rtt_min_ms'] < 135 else '~170ms' if m['rtt_min_ms'] < 220
+                         else f"{m['rtt_min_ms']:.0f}ms")
     agg = collections.defaultdict(list)
     for f in sorted(glob.glob(str(B / 'results' / 'cmp_*.json'))):
         m = json.load(open(f))
@@ -93,7 +94,8 @@ if __name__ == '__main__':
                   f"tvk {r['video']['timely_kbps']:6.1f} wire {r['wire_kbps']:6.1f} loss {lf}")
             agg[(path_of(m), m['loss_pct'], name)].append(r)
     print('\npath loss proto n | audio on (delivered) | video on (delivered) | keys | timely video kbps | wire kbps | audio p50 / video p95 ms')
-    for k in sorted(agg, key=lambda k: (k[0], k[1], ['anl', 'srt-b', 'srt-fec', 'srt-rec'].index(k[2]))):
+    order = lambda n: ['anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec'].index(n) if n in ('anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec') else 1.5
+    for k in sorted(agg, key=lambda k: (k[0], k[1], order(k[2]), k[2])):
         xs = agg[k]; mn = lambda f: statistics.mean(f(x) for x in xs)
         print(f"{k[0]:6} {k[1]:2}% {k[2]:8} {len(xs)} | {mn(lambda x: x['audio']['ontime']):6.2f} ({mn(lambda x: x['audio']['delivered']):6.2f}) | "
               f"{mn(lambda x: x['video']['ontime']):6.2f} ({mn(lambda x: x['video']['delivered']):6.2f}) | {mn(lambda x: x['keys']):5.1f} | "

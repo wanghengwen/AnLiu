@@ -206,6 +206,7 @@ static int g_adapt_max = 1000;             /* REALNET_VIDEO_MAX: the encoder's m
 static int g_fixed_scale;                  /* REALNET_FIXED_SCALE: video at this per mille, no rate callback */
 static int g_rcv_deadline = -2, g_fec_rtt_auto, g_fec_ratio = -1; /* explicit policy A/B controls */
 static int g_fec_ratio_flow[3] = { -1, -1, -1 };   /* --fec-ratio-audio / --fec-ratio-video: per-flow override, [1] audio, [2] video */
+static int g_rcv_deadline_flow[3] = { -2, -2, -2 }; /* --rcv-deadline-audio / --rcv-deadline-video: per-flow receiver gap wait */
 static int g_prio_flow[3] = { -1, -1, -1 };        /* --prio-audio / --prio-video: stream priority override (0..3, 0 highest), [1] audio, [2] video */
 static mdiag_s *g_mds; static size_t g_nmds, g_capmds;
 static mdiag_r *g_mdr; static size_t g_nmdr, g_capmdr;
@@ -454,6 +455,7 @@ static void flow_opt(const flow *f, anl_stream_opt *o)
         if (g_fec_ratio >= 0) { o->fec = 1; o->fec_ratio = g_fec_ratio; }   /* --fec-ratio: fixed, 0 adaptive */
         if (f->id >= 1 && f->id <= 2 && g_fec_ratio_flow[f->id] >= 0) { o->fec = 1; o->fec_ratio = g_fec_ratio_flow[f->id]; }
         if (g_rcv_deadline >= -1) o->rcv_deadline_ms = g_rcv_deadline;
+        if (f->id >= 1 && f->id <= 2 && g_rcv_deadline_flow[f->id] >= -1) o->rcv_deadline_ms = g_rcv_deadline_flow[f->id];
     }
 }
 
@@ -1005,6 +1007,7 @@ static void usage(void)
                     "       [--rx-loss 0..20] (receive-side random protocol loss after physical network)\n"
                     "       [--rcv-deadline MS (-1 lifetime, 0 off)] [--fec-rtt-auto 0|1] [--fec-ratio 0..100 (0 adaptive)]\n"
                     "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n"
+                    "       [--rcv-deadline-audio MS] [--rcv-deadline-video MS] (per-flow receiver gap wait)\n"
                     "       [--prio-audio 0..3] [--prio-video 0..3] (stream priority, 0 highest; default audio 0, video 1)\n"
                     "       [--adapt 0|1] (media sender: video frame sizes follow the target_rate callback)\n");
     exit(2);
@@ -1060,6 +1063,11 @@ int main(int argc, char **argv)
             g_rcv_deadline = atoi(nx);
             if (g_rcv_deadline < -1) usage();
         }
+        else if (!strcmp(a, "--rcv-deadline-audio") || !strcmp(a, "--rcv-deadline-video")) {
+            int v = atoi(nx);
+            if (v < -1) usage();
+            g_rcv_deadline_flow[a[15] == 'a' ? 1 : 2] = v;
+        }
         else if (!strcmp(a, "--fec-ratio-audio") || !strcmp(a, "--fec-ratio-video")) {
             int v = atoi(nx);
             if (v < 0 || v > 100) usage();
@@ -1096,8 +1104,8 @@ int main(int argc, char **argv)
     printf("RXLOSS_CONFIG probability_pct=%.1f scope=protocol_datagrams receive_point=after_network\n", g_rx_loss);
     if ((g_fec_ratio >= 0 || g_fec_ratio_flow[1] >= 0 || g_fec_ratio_flow[2] >= 0) && g_fec_rtt_auto) usage();   /* one FEC policy at a time */
     if (is_anl() && (g_test == 0 || g_test == 3))
-        printf("POLICY proto=%s rcv_deadline=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d prio_audio=%d prio_video=%d (-2=library_default, -1=proto default)\n",
-               proto_name[g_proto], g_rcv_deadline, g_fec_rtt_auto, g_fec_ratio, g_fec_ratio_flow[1], g_fec_ratio_flow[2],
+        printf("POLICY proto=%s rcv_deadline=%d rcv_deadline_audio=%d rcv_deadline_video=%d fec_rtt_auto=%d fec_ratio=%d fec_ratio_audio=%d fec_ratio_video=%d prio_audio=%d prio_video=%d (-2=library_default, -1=proto default)\n",
+               proto_name[g_proto], g_rcv_deadline, g_rcv_deadline_flow[1], g_rcv_deadline_flow[2], g_fec_rtt_auto, g_fec_ratio, g_fec_ratio_flow[1], g_fec_ratio_flow[2],
                g_prio_flow[1] >= 0 ? g_prio_flow[1] : 0, g_prio_flow[2] >= 0 ? g_prio_flow[2] : 1);
     g_timebase = getenv("REALNET_TIMEBASE") && atoi(getenv("REALNET_TIMEBASE")) != 0;
     if (g_proto == P_TCP) return tcp_run();
