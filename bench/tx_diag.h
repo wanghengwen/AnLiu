@@ -13,6 +13,17 @@ typedef struct {
 } tx_diag;
 static tx_diag g_tx_diag;
 
+/* a stream holds unsent data (the library's flush no longer needs this walk) */
+static int has_queued_data(const anl_t *w)
+{
+    anl_node *n, *nx;
+    anl_stream *st;
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (stream_sendable(st) && st->nsnd_que > 0) return 1;
+    }
+    return 0;
+}
+
 enum { TX_EMPTY = 1, TX_WINDOW = 2, TX_CWND = 4, TX_PACE = 8, TX_READY = 16 };
 
 static void tx_diag_observe(tx_diag *d, const anl_t *w)
