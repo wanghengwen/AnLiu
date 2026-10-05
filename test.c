@@ -1765,7 +1765,10 @@ static void test_receiver_deadline_default(void)
         int i, r = ANL_EAGAIN, dropped_ack = 0;
         uint32_t start, received_at = 0;
         net_init(&n, &ca, &cb);
-        n.min_delay = n.max_delay = 10;
+        /* 1 ms one way: a retransmission would still come within the 40 ms
+           lifetime, so this is the local timer's wait, not the skip of a
+           hopeless hole (rcv_hole_hopeless, test_rcv_hole_echo) */
+        n.min_delay = n.max_delay = 1;
         ca.pad_max = cb.pad_max = 0;
         net_start(&n, &ca, &cb);
         anl_stream_opt_default(&o, ANL_SEMI);
@@ -1811,8 +1814,8 @@ static void test_receiver_deadline_default(void)
             int deadline = policy == -1 ? 40 : 20;
             CHECK(r == (int)sizeof(buf) && fi.frame_no == 1 && fi.lost_before == 1 &&
                   check_pattern(buf, sizeof(buf), 1), "skip missing frame, preserve next frame and loss count");
-            CHECK(received_at - start >= (uint32_t)(10 + deadline) &&
-                  received_at - start <= (uint32_t)(10 + deadline + 2 * cb.interval),
+            CHECK(received_at - start >= (uint32_t)(1 + deadline) &&
+                  received_at - start <= (uint32_t)(1 + deadline + 2 * cb.interval),
                   "local timer bounds gap wait (elapsed=%u)", received_at - start);
             handle_fwd(n.ep[1], b, 1);
             CHECK(anl_stream_recv_frame(b, buf, sizeof(buf), &fi) == ANL_EAGAIN,
@@ -1913,6 +1916,62 @@ static int null_output(char *buf, int len, anl_t *w, void *user)
 {
     (void)buf; (void)len; (void)w; (void)user;
     return 0;
+}
+
+/* run_hole: audio frames of 160 B every 20 ms, max_age 200, FEC off, 5% loss
+ * both ways, one-way delay `delay`; frames later than 150 ms past it */
+static void run_hole(int delay, int *late, int *got, uint32_t *echo_rtt)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    static char buf[2000];
+    int i, sent = 0;
+    *late = *got = 0; *echo_rtt = 0;
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = delay;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.max_age_ms = 200;
+    o.fec = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    n.loss_pct = 5;
+    for (i = 0; i < 21000; i++) {
+        net_tick(&n);
+        if (i % 20 == 0 && sent < 1000) {
+            fill_pattern(buf, 160, (uint32_t)sent);
+            anl_stream_send_frame(a, 0, buf, 160, NULL);
+            sent++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) {
+            (*got)++;
+            if (i - (int)fi.frame_no * 20 > delay + 150) (*late)++;
+        }
+    }
+    *echo_rtt = n.ep[1]->echo_rtt;
+    CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
+    net_stop(&n);
+}
+
+/* A receive-only peer learns the RTT from CTRL_ECHO, and a hole a
+ * retransmission can no longer fill within the lifetime is skipped at once:
+ * the frames behind it are not held back (DESIGN 5.5, 7.5). Audio, 170 ms
+ * RTT, max_age 200, FEC off, 5% loss: before, each loss held the next frames
+ * until the 200 ms deadline */
+static void test_rcv_hole_echo(void)
+{
+    int late, got;
+    uint32_t er;
+    printf("[semi: receiver RTT from CTRL_ECHO, hopeless holes skipped at once]\n");
+    run_hole(85, &late, &got, &er);
+    printf("  rtt 170 ms, 5%% loss, audio max_age 200, FEC off: echo rtt %u ms, %d of %d frames later than 150 ms\n", er, late, got);
+    CHECK(er >= 165 && er <= 200, "receiver RTT from echoes (%u)", er);
+    CHECK(late * 100 <= got, "frames behind a lost one not held back (%d of %d late)", late, got);
+    /* 60 ms RTT: a retransmission is in time - wait for it, as before */
+    run_hole(30, &late, &got, &er);
+    printf("  rtt 60 ms: echo rtt %u ms, %d of 1000 frames delivered\n", er, got);
+    CHECK(got >= 990, "short RTT: retransmissions fill the holes (%d)", got);
 }
 
 static void test_rcv_skip_clears_fwd(void)
@@ -3914,6 +3973,7 @@ int main(void)
     RUN(test_receiver_deadline_default());
     RUN(test_receiver_skip_ack_fragments());
     RUN(test_rcv_skip_clears_fwd());
+    RUN(test_rcv_hole_echo());
     RUN(test_fec_rtt_default());
     RUN(test_latency_rtt());
     RUN(test_fec_first_key());

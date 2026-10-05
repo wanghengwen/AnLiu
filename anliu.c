@@ -355,6 +355,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define CTRL_CLOSE      0x03
 #define CTRL_REPORT     0x04    /* receiver's delay report (DESIGN 6.9) */
 #define CTRL_RCV_SKIP   0x05    /* receiver retired a prefix; not delivery credit */
+#define CTRL_ECHO       0x06    /* the peer's datagram ts back: its RTT where it gets no ACK echo */
 #define REPORT_BODY     16      /* jitter qavg qmax favg fmax frames skipped fec_rec, u16 each */
 #define REPORT_MIN_MS   100     /* reports every max(srtt, this) while data arrives */
 #define DELAY_WIN_MS    5000    /* base transit: min over two such windows */
@@ -403,6 +404,9 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
                                    heard; a sid >= 16 takes its extension off its stream's mss (stream_mss) */
 #define ACK_FIX         8       /* after type|sid: b1 una(3) wnd(2) ts_echo(2, or a 1-byte delta) */
 #define SKIP_BODY       4       /* CTRL_RCV_SKIP body: the retired una, 32 bits */
+#define ECHO_BODY       3       /* CTRL_ECHO body: the peer's ts (16 bits), held here this long (ms, 8 bits) */
+#define ECHO_MS         100     /* at most this often, and only while our ACKs give the peer no echo */
+#define ECHO_RTT_WIN    10000   /* echo_rtt: a windowed minimum, like min_rtt (BBR_MIN_RTT_WIN) */
 #define ACK_F_WASK      0x80    /* window probe: please answer with an ACK */
 #define ACK_F_FRESH     0x40    /* data arrived since the last ACK: ts_echo is an RTT sample */
 #define ACK_F_DELTA     0x20    /* ts_echo is a zigzag varint delta from the datagram's previous ACK */
@@ -656,6 +660,7 @@ typedef struct anl_stream {
     uint32_t cache_n;
     fec_pentry *pcache;
     uint32_t pcache_n;
+    uint32_t par_rx_ts;                 /* receiver: the last parity arrived (| 1; 0: none) */
     int in_retry;
 
     uint32_t fec_rec_ring[FEC_REC_RING];/* receiver: the last rebuilt sn (spurious when the original follows) */
@@ -786,6 +791,10 @@ struct anl_s {
 
     uint32_t peer_ts;                   /* the peer's ts, extended from 16 bits (DESIGN 4.2) */
     uint32_t peer_ts_at;                /* our time when peer_ts was taken */
+    uint32_t echo_tx_ts;                /* the last CTRL_ECHO went out (| 1; 0: none) */
+    uint32_t echo_rtt, echo_rtt_ts;     /* the lowest RTT a CTRL_ECHO gave within ECHO_RTT_WIN, and when */
+    uint32_t ack_rx_ts;                 /* the last ACK segment arrived (| 1; 0: none) */
+    uint32_t ack_echo_tx_ts;            /* the last ACK with a ts echo went out (| 1; 0: none) */
     int peer_ts_valid;
     uint32_t last_rx, last_tx;
 
@@ -1174,6 +1183,34 @@ static void dg_begin(anl_t *w)
 
 static uint32_t dg_room(const anl_t *w) { return w->mtu - w->ptr; }
 
+/* CTRL_ECHO (DESIGN 5.5): a peer that only receives - it sends ACKs, which
+ * nobody acknowledges - has no RTT sample, and its receiver deadline cannot
+ * tell a hole a retransmission will still fill from one it will not
+ * (rcv_hole_hopeless). Like SRT's ACKACK: send back the ts of its latest
+ * datagram and how long it waited here, at most every ECHO_MS, while our
+ * own ACKs (which echo its data) do not already give it samples. Rides at
+ * the end of a datagram that carries data and has room for it, never alone
+ * (alone, ~10 more datagrams a second changed the sending) */
+#define ECHO_SEG (1 + 1 + 1 + ECHO_BODY)        /* sid 0, subtype, len, body */
+static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *body, uint32_t blen);
+static void echo_ride(anl_t *w)
+{
+    char body[ECHO_BODY], *p = body;
+    uint32_t hold;
+    if (!w->dg_has_data || w->mtu - w->ptr < ECHO_SEG) return;
+    /* only for a peer that acknowledges our data (an echo never asks for
+       one: two peers would echo each other for ever) */
+    if (!w->peer_ts_valid || !w->ack_rx_ts || (w->echo_tx_ts && tdiff(w->ack_rx_ts, w->echo_tx_ts) <= 0)) return;
+    if (w->ack_echo_tx_ts && tdiff(w->current, w->ack_echo_tx_ts) < ECHO_MS) return;
+    if (w->echo_tx_ts && tdiff(w->current, w->echo_tx_ts) < ECHO_MS) return;
+    hold = (uint32_t)tdiff(w->current, w->peer_ts_at);
+    if (hold > 0xff) return;                        /* stale: wait for a fresh datagram */
+    p = enc16(p, (uint16_t)w->peer_ts);
+    (void)enc8(p, (uint8_t)hold);
+    write_ctrl_seg(w, 0, CTRL_ECHO, (const uint8_t *)body, sizeof(body));
+    w->echo_tx_ts = w->current | 1;
+}
+
 static void dg_output(anl_t *w, int force_pad)
 {
     uint8_t flg = (uint8_t)(ANL_VERSION << 6);
@@ -1181,6 +1218,7 @@ static void dg_output(anl_t *w, int force_pad)
     char *p;
 
     if (w->output == NULL) { dg_begin(w); return; }
+    echo_ride(w);
 
     /* the last segment runs to the end: it loses its length field (SEG_L, DESIGN 5) */
     if (w->dg_len_n) {
@@ -1482,6 +1520,7 @@ static void write_ack_segs(anl_t *w, anl_stream *st)
             p += rlen;
             dg_commit(w, (uint32_t)(p - dg_ptr(w)), 0);
             w->dg_echo = echo; w->dg_echo_valid = 1;
+            w->ack_echo_tx_ts = w->current | 1;
         }
     } while (pos != &st->rcv_runs);
 
@@ -2307,6 +2346,7 @@ static void handle_parity(anl_t *w, anl_stream *st, const char *body, uint32_t b
     uint32_t base, k, m, jj, lmax, i, slot = 0;
     fec_pentry *e;
     if (!st->fec || st->cache == NULL || blen < PARITY_HDR) return;
+    st->par_rx_ts = w->current | 1;                 /* rcv_hole_hopeless: FEC is at work */
     base = extend24(dec24(&p), st->rcv_nxt);
     k = dec8(&p);
     m = dec8(&p);
@@ -4017,6 +4057,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             uint32_t una24, ts_echo, n, i, span = 0;
             uint16_t echo16;
             if (end - p < ACK_FIX - 1) return ANL_EFORMAT;
+            w->ack_rx_ts = w->current | 1;          /* the peer receives from us: write_echo */
             b1 = dec8(&p);
             una24 = dec24(&p);
             wnd = dec16(&p);
@@ -4098,6 +4139,21 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
                 st = stream_for_input(w, sid, &urgent);
                 if (st) handle_report(w, st, p, ts);
+            } else if (sub == CTRL_ECHO && blen >= ECHO_BODY && w->updated) {
+                /* our datagram's ts back, less the time it waited at the peer:
+                   an RTT sample where we only receive (write_echo) */
+                const char *q = p;
+                uint16_t e16 = dec16(&q);
+                uint32_t sent = w->current - (uint16_t)((uint16_t)w->current - e16);
+                int32_t rtt = tdiff(w->current, sent) - (int32_t)(uint8_t)*q;
+                /* kept apart from srtt / min_rtt: they pace and time what we
+                   send, and a receiver's report interval follows srtt - the
+                   media tuning saw receivers without samples (RTO_DEF) */
+                if (rtt >= 0 && rtt <= (int32_t)RTO_MAX &&
+                    (w->echo_rtt == 0 || (uint32_t)rtt <= w->echo_rtt || tdiff(w->current, w->echo_rtt_ts) > ECHO_RTT_WIN)) {
+                    w->echo_rtt = umax32((uint32_t)rtt, 1);
+                    w->echo_rtt_ts = w->current;
+                }
             }
             p += blen;                      /* unknown subtypes are skipped */
         }
@@ -4807,6 +4863,27 @@ static void semi_drop_check(anl_t *w, anl_stream *st)
     w->tx_unsent += w->purged_unsent - unsent0;
 }
 
+/* The hole at rcv_nxt is past saving: a retransmission of it - sent once our
+ * ACK has shown the hole to the sender, about a round trip after the data was
+ * sent, and half a round trip on its way - would arrive when the data is
+ * older than its lifetime (max_age here). Waiting for it then only holds back
+ * the frames behind it (head of line: real network, 170 ms RTT, FEC off,
+ * audio max_age 200 - each loss delayed the next ~4 packets past a 150 ms
+ * budget, audio on time 75..89% at 3..5% loss where SRT, which drops at its
+ * latency, had 95..97%). From the path's RTT (min_rtt, or what CTRL_ECHO
+ * gives a receive-only peer; not srtt: a noisy one would skip holes a
+ * retransmission still fills). Not while parities arrive: FEC may rebuild it
+ * sooner. rcv_deadline still bounds the wait as before (DESIGN 7.5) */
+static int rcv_hole_hopeless(const anl_t *w, const anl_stream *st)
+{
+    uint32_t rtt = w->min_rtt > 0 ? w->min_rtt : w->echo_rtt;   /* a receiver only: from CTRL_ECHO */
+    if (rtt == 0 || st->max_age_ms == 0) return 0;
+    if (st->par_rx_ts && tdiff(w->current, st->par_rx_ts) < (int32_t)(FEC_BLOCK_MAX_MS + rtt)) return 0;
+    /* + the sender's RACK window (min_rtt / REO_DIV on a semi stream) and
+       our ACK's wait for a flush; the sender resends as the ACK comes in */
+    return rtt * 3 / 2 + rtt / REO_DIV + (uint32_t)w->interval > (uint32_t)st->max_age_ms;
+}
+
 /* receiver-side deadline (DESIGN 7.5) */
 static void semi_deadline_check(anl_t *w, anl_stream *st)
 {
@@ -4815,7 +4892,7 @@ static void semi_deadline_check(anl_t *w, anl_stream *st)
     head = qfirst_seg(&st->rcv_buf);
     if (head == NULL || tdiff(head->sn, st->rcv_nxt) <= 0) { st->blocked = 0; return; }
     if (!st->blocked) { st->blocked = 1; st->block_since = w->current; return; }
-    if (tdiff(w->current, st->block_since) < st->rcv_deadline_ms) return;
+    if (tdiff(w->current, st->block_since) < st->rcv_deadline_ms && !rcv_hole_hopeless(w, st)) return;
     {
         anl_node *pos;
         for (pos = st->rcv_buf.next; pos != &st->rcv_buf; pos = pos->next) {
