@@ -795,6 +795,9 @@ struct anl_s {
     anl_stream **stab;                  /* sid -> stream: hash chains (hnext) */
     uint32_t stab_mask, stab_n;
     anl_node slist;                     /* every stream struct */
+    uint32_t nslist;                    /* ... how many */
+    anl_stream **ford, **fbkt;          /* a flush's streams in slist order, and by priority bucket */
+    uint32_t ford_cap;                  /* their size, kept >= nslist by sput: a flush allocates nothing */
     anl_node ctl_list;                  /* streams with control output pending (flush_control) */
     uint32_t npeer_streams, max_peer_streams;
     uint32_t next_sid;                  /* sids are never reused: client 2,4,6.. server 1,3,5.. */
@@ -907,6 +910,11 @@ static void free_seg_list(anl_node *head)
 /* iterate w->slist; the current stream may be unlinked inside the body */
 #define FOR_EACH_STREAM(w, st, n, nx) \
     for ((n) = (w)->slist.next; (n) != &(w)->slist && ((st) = STREAM_OF(n), (nx) = (n)->next, 1); (n) = (nx))
+/* within a flush (anl_flush_internal): its streams in slist order, and those
+   of one priority bucket (0: strict, 1 + prio otherwise) in the same order -
+   a pass per priority visits its own streams instead of all of them */
+#define FOR_ORD(w, ns, i, st) for ((i) = 0; (i) < (ns) && ((st) = (w)->ford[i], 1); (i)++)
+#define FOR_BUCKET(w, bo, b, i, st) for ((i) = (bo)[b]; (i) < (bo)[(b) + 1] && ((st) = (w)->fbkt[i], 1); (i)++)
 
 /* stream table: hash chains, grown (x2) when there are more streams than chains */
 static uint32_t sid_hash(uint32_t sid) { return (sid * 0x9E3779B1u) ^ (sid >> 15); }
@@ -943,6 +951,14 @@ static int stab_grow(anl_t *w)
 static int sput(anl_t *w, anl_stream *st)
 {
     anl_stream **head;
+    if (w->nslist + 1 > w->ford_cap) {
+        uint32_t cap = w->ford_cap ? w->ford_cap * 2 : 16;
+        anl_stream **a = (anl_stream **)anl_malloc(sizeof(anl_stream *) * cap);
+        anl_stream **b = (anl_stream **)anl_malloc(sizeof(anl_stream *) * cap);
+        if (a == NULL || b == NULL) { anl_free(a); anl_free(b); return ANL_ENOMEM; }
+        anl_free(w->ford); anl_free(w->fbkt);
+        w->ford = a; w->fbkt = b; w->ford_cap = cap;
+    }
     if ((w->stab == NULL || w->stab_n >= w->stab_mask + 1) && stab_grow(w) != 0 && w->stab == NULL)
         return ANL_ENOMEM;                  /* a failed growth only lengthens the chains */
     head = &w->stab[sid_hash((uint32_t)st->sid) & w->stab_mask];
@@ -950,6 +966,7 @@ static int sput(anl_t *w, anl_stream *st)
     *head = st;
     w->stab_n++;
     qadd_tail(&st->lnode, &w->slist);
+    w->nslist++;
     return 0;
 }
 
@@ -1864,6 +1881,7 @@ static void stream_free(anl_t *w, anl_stream *st)
     if (st->cnode.next) qdel(&st->cnode);
     if (!st->app_released) return;
     qdel(&st->lnode);
+    w->nslist--;
     anl_free(st);
 }
 
@@ -4811,16 +4829,6 @@ static void semi_deadline_check(anl_t *w, anl_stream *st)
  * flush
  *-------------------------------------------------------------------*/
 /* data waiting in a send queue, window or not */
-static int has_queued_data(const anl_t *w)
-{
-    anl_node *n, *nx;
-    anl_stream *st;
-    FOR_EACH_STREAM(w, st, n, nx) {
-        if (stream_sendable(st) && st->nsnd_que > 0) return 1;
-    }
-    return 0;
-}
-
 static int has_new_data(const anl_t *w)
 {
     anl_node *n, *nx;
@@ -5373,13 +5381,20 @@ static int fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg *seg
     }
 }
 
+/* a stream the flush's passes by priority have anything to do for */
+static int flush_busy(const anl_stream *st)
+{
+    return st->nsnd_que || st->nsnd_buf || (st->fec && (st->fec_n > 0 || st->fec_out_i < st->fec_out_m));
+}
+
 static void anl_flush_internal(anl_t *w)
 {
     uint32_t current = w->current;
     uint32_t inflight = 0;
     int lost = 0;
     int64_t retrans_limit, retrans_spent = 0;
-    int rtx_capped = 0, prio;
+    int rtx_capped = 0, prio, new_data = 0, queued;
+    uint32_t ns = 0, i, bo[ANL_MAX_PRIO + 2], b;
     anl_node *n, *nx;
     anl_stream *st;
 
@@ -5392,18 +5407,42 @@ static void anl_flush_internal(anl_t *w)
     flush_control_segs(w);
     w->rx_data_since_ack = 0;
 
-    /* sender-side dropping before computing budgets */
+    /* One walk of the list: sender-side dropping before computing budgets,
+       then what is in flight - sent and not acknowledged, minus what RACK
+       declared lost and is not resent yet (BBR's pipe). With the lost
+       segments counted, a policer that dropped half of a STARTUP overshoot
+       kept DRAIN from ever ending: inflight stayed far above the BDP, the
+       drain gain slowed the retransmissions, their samples lowered btl_bw and
+       so the pace - down to 0.4 Mbps on a 10 Mbps path for 20 s (DESIGN
+       13.25). Each stream's drop check and count concern that stream only.
+       The passes below take the streams from ford / fbkt: nothing in them
+       frees a stream (control_stream, which may, ran above) */
+    memset(bo, 0, sizeof(bo));
     FOR_EACH_STREAM(w, st, n, nx) {
-        if (stream_sendable(st)) semi_drop_check(w, st);
-    }
-    /* in flight: sent and not acknowledged, minus what RACK declared lost
-       and is not resent yet (BBR's pipe). With the lost segments counted, a
-       policer that dropped half of a STARTUP overshoot kept DRAIN from ever
-       ending: inflight stayed far above the BDP, the drain gain slowed the
-       retransmissions, their samples lowered btl_bw and so the pace - down
-       to 0.4 Mbps on a 10 Mbps path for 20 s (DESIGN 13.25) */
-    FOR_EACH_STREAM(w, st, n, nx) {
+        if (stream_sendable(st)) {
+            if (st->nsnd_que || st->nsnd_buf) semi_drop_check(w, st);      /* nothing to drop otherwise */
+            if (st->nsnd_que > 0 && tdiff(st->snd_nxt, st->snd_una + umin32(st->snd_wnd, st->rmt_wnd)) < 0) new_data = 1;
+        }
         inflight += st->nsnd_buf - umin32(st->nlost, st->nsnd_buf);
+        /* the passes below are for streams sending (flush_busy) or holding
+           received parities (pcache expiry): an idle stream is not visited
+           again in this flush - for it RACK, the queue sums and the
+           passes by priority do nothing */
+        if (flush_busy(st) || st->pcache) {
+            w->ford[ns++] = st;
+            if (flush_busy(st)) bo[(st->strict ? 0 : 1 + (uint32_t)st->prio) + 1]++;
+        }
+    }
+    /* by priority bucket, stable: bucket b holds fbkt[bo[b] .. bo[b + 1]).
+       Only the streams with something to send or in flight, or an FEC block
+       or parities pending (flush_busy): for the others the passes by priority
+       (retransmissions, new data, parities) do nothing, and nothing in them
+       gives such a stream work - new data is only queued by the application */
+    for (b = 1; b < ANL_MAX_PRIO + 2; b++) bo[b] += bo[b - 1];
+    {
+        uint32_t at[ANL_MAX_PRIO + 1];
+        memcpy(at, bo, sizeof(at));
+        FOR_ORD(w, ns, i, st) if (flush_busy(st)) w->fbkt[at[st->strict ? 0 : 1 + (uint32_t)st->prio]++] = st;
     }
     w->inflight_segs = inflight;
     w->flush_budget = (int64_t)w->cwnd - (int64_t)inflight;
@@ -5412,13 +5451,13 @@ static void anl_flush_internal(anl_t *w)
        streams are visited in priority order. The retransmission state (backoff,
        resendts, lost) changes only when the segment is actually sent: a
        retransmission deferred by pacing must not be pushed back by another RTO. */
-    retrans_limit = has_new_data(w) ? (w->pace_tokens > 0 ? w->pace_tokens * 3 / 4 : 0)
-                                                : (int64_t)0x7fffffffffffLL;
-    FOR_EACH_STREAM(w, st, n, nx) {
+    retrans_limit = new_data ? (w->pace_tokens > 0 ? w->pace_tokens * 3 / 4 : 0)
+                             : (int64_t)0x7fffffffffffLL;
+    FOR_ORD(w, ns, i, st) {
         if (stream_sendable(st)) (void)rack_detect(w, st);           /* RACK timer */
     }
     for (prio = -1; prio < ANL_MAX_PRIO && !w->pace_blocked && !rtx_capped; prio++) {
-        FOR_EACH_STREAM(w, st, n, nx) {
+        FOR_BUCKET(w, bo, (uint32_t)(prio + 1), i, st) {
             anl_node *pos;
             uint32_t next_rto = current + RTO_MAX, want, found = 0;
             int rto_due;
@@ -5499,7 +5538,7 @@ static void anl_flush_internal(anl_t *w)
        in its turn: it repairs data already sent. */
     if (w->app_limited != 0 && !w->burst_open) {    /* a burst after app-limited sending (burst_on_acked) */
         uint32_t q = 0;
-        FOR_EACH_STREAM(w, st, n, nx) {
+        FOR_ORD(w, ns, i, st) {
             if (stream_sendable(st)) q += st->nsnd_que;
         }
         if (q >= 8) {
@@ -5525,7 +5564,7 @@ static void anl_flush_internal(anl_t *w)
         while (progress && w->flush_budget > 0 && !w->pace_blocked) {
             progress = 0;
             for (prio = 0; prio < ANL_MAX_PRIO && !w->pace_blocked; prio++) {
-                FOR_EACH_STREAM(w, st, n, nx) {
+                FOR_BUCKET(w, bo, (uint32_t)(prio + 1), i, st) {
                     uint32_t quota = prio_weight[prio];
                     if (w->pace_blocked) break;
                     if (st->strict || st->prio != prio || !stream_sendable(st)) continue;
@@ -5557,7 +5596,11 @@ static void anl_flush_internal(anl_t *w)
        a window of 33 segments at 390 ms) the app-limited samples are what
        lets the model climb back; held network-limited it fell further
        (bw 408 -> 117 kB/s, video 67%). */
-    if (!w->pace_blocked && w->flush_budget > 0 && !has_queued_data(w) && !(w->capacity_short && w->cs_loss && !w->cs_test_ts)) {
+    queued = 0;
+    FOR_ORD(w, ns, i, st) {
+        if (stream_sendable(st) && st->nsnd_que > 0) { queued = 1; break; }
+    }
+    if (!w->pace_blocked && w->flush_budget > 0 && !queued && !(w->capacity_short && w->cs_loss && !w->cs_test_ts)) {
         w->app_limited = (w->delivered + bbr_inflight_bytes(w)) | 1;
         w->burst_open = 0;
     }
@@ -5565,13 +5608,13 @@ static void anl_flush_internal(anl_t *w)
     /* 5: FEC: blocks that collected fec_blk_ms, parities still due (streams
        without new data), in priority order; stale parities */
     for (prio = -1; prio < ANL_MAX_PRIO; prio++) {
-        FOR_EACH_STREAM(w, st, n, nx) {
+        FOR_BUCKET(w, bo, (uint32_t)(prio + 1), i, st) {
             if (!st->fec || (prio < 0 ? !st->strict : (st->strict || st->prio != prio))) continue;
             if (st->fec_n > 0 && tdiff(current, st->fec_first_ts) >= (int32_t)st->fec_blk_ms) fec_close_block(w, st);
             if (!w->pace_blocked) fec_pump(w, st, 0);
         }
     }
-    FOR_EACH_STREAM(w, st, n, nx) {
+    FOR_ORD(w, ns, i, st) {
         if (!st->fec) continue;
         if (st->pcache) {
             uint32_t j;
@@ -5733,6 +5776,7 @@ void anl_release(anl_t *w)
         st->app_released = 1;
         stream_free(w, st);
     }
+    anl_free(w->ford); anl_free(w->fbkt);
     anl_free(w->stab);
     anl_free(w->rstq);
     anl_free(w->rst_set);
