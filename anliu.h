@@ -33,7 +33,6 @@ extern "C" {
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
 #define ANL_MAX_WND         32768   /* 24-bit sn requires wnd << 2^23; window fields are 16 bits */
 #define ANL_MAX_PRIO        4       /* prio 0 (highest) .. 3 */
-#define ANL_FEC_GROUP       8       /* 8 data + 1 parity */
 #define ANL_PSK_SIZE        32
 #define ANL_MAX_PAD         255     /* pad length is stored in one byte */
 
