@@ -42,16 +42,17 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <math.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 #ifdef REALNET_INTERNAL
 #include "anliu.h"
@@ -151,6 +152,14 @@ static uint64_t g_tx_bytes, g_tx_pkts, g_rx_bytes, g_rx_pkts, g_tx_dropped;
 static int g_clock_refresh;
 static int g_timebase; /* explicit wall/monotonic anchors for TC phase alignment */
 static uint32_t g_protocol_ms;  /* timestamp actually supplied to ep_update */
+/* REALNET_DRIVE=check: drive anl_update the way an application does - wait in
+   poll until anl_check's time (or a frame, a ping, input), update only when
+   due, before input when the millisecond moved (REALNET_CLOCK) - instead of
+   updating twice per 1 ms poll */
+static int g_drive_check;
+static uint32_t g_next_upd;
+static unsigned long long g_updates;
+static int32_t ms_diff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 static uint64_t g_clk_batches, g_clk_refreshes;
 static uint32_t g_clk_max_pkts, g_clk_max_us, g_clk_max_lag;
 static uint32_t g_clk_int_max_us;          /* largest receive batch since the last MDIAG sample */
@@ -193,6 +202,8 @@ static int g_adapt_scale = 1000;            /* per mille */
 static uint64_t g_adapt_calls, g_adapt_sum_ms, g_adapt_wsum;   /* time-weighted mean scale */
 static uint64_t g_adapt_last_us;
 static int g_adapt_min = 1000;
+static int g_adapt_max = 1000;             /* REALNET_VIDEO_MAX: the encoder's maximum, per mille of the nominal (1000..20000) */
+static int g_fixed_scale;                  /* REALNET_FIXED_SCALE: video at this per mille, no rate callback */
 static int g_rcv_deadline = -2, g_fec_rtt_auto, g_fec_ratio = -1; /* explicit policy A/B controls */
 static int g_fec_ratio_flow[3] = { -1, -1, -1 };   /* --fec-ratio-audio / --fec-ratio-video: per-flow override, [1] audio, [2] video */
 static int g_prio_flow[3] = { -1, -1, -1 };        /* --prio-audio / --prio-video: stream priority override (0..3, 0 highest), [1] audio, [2] video */
@@ -230,7 +241,7 @@ static void adapt_rate(anl_t *w, uint32_t target, void *user)
     uint64_t t = now_us();
     int64_t v = (int64_t)target - ADAPT_AUDIO;
     int sc = v <= 0 ? ADAPT_MIN : (int)(v * 1000 / ADAPT_NOMINAL_VIDEO);
-    if (sc > 1000) sc = 1000;
+    if (sc > g_adapt_max) sc = g_adapt_max;
     if (sc < ADAPT_MIN) sc = ADAPT_MIN;
     if (g_adapt_last_us && g_t0_us && t > g_adapt_last_us) {
         uint64_t d = (t - g_adapt_last_us) / 1000;
@@ -305,8 +316,9 @@ static int media_frame_size_raw(const flow *f, int key)
 static int media_frame_size(const flow *f, int key)
 {
     int n = media_frame_size_raw(f, key);
-    if (g_adapt && f->id == 2 && g_adapt_scale < 1000) {
-        n = (int)((int64_t)n * g_adapt_scale / 1000);
+    int sc = g_fixed_scale ? g_fixed_scale : g_adapt ? g_adapt_scale : 1000;
+    if (f->id == 2 && sc != 1000) {
+        n = (int)((int64_t)n * sc / 1000);
         if (n < 200) n = 200;               /* > HDR; a tiny P frame still carries headers */
     }
     return n;
@@ -391,6 +403,11 @@ static void flows_init(void)
     memset(g_fl, 0, sizeof(g_fl));
     a->name = "audio"; a->id = 1; a->semi = 1; a->prio = 0; a->wnd = 512;
     a->period_ms = 20; a->size_min = a->size_max = 160; a->max_age = 200; a->budget_ms = 150;
+    /* REALNET_AUDIO_MAX_AGE: audio max_age in ms (fec_deadline is half of it); test tool only */
+    if (getenv("REALNET_AUDIO_MAX_AGE")) {
+        int ma = atoi(getenv("REALNET_AUDIO_MAX_AGE"));
+        if (ma >= 50 && ma <= 2000) a->max_age = ma;
+    }
     a->kcp_thr = 10;
     v->name = "video"; v->id = 2; v->semi = 1; v->prio = 1; v->wnd = 512;
     v->period_ms = 33; v->gop = 30; v->key_min = 25000; v->key_max = 35000; v->size_min = 2500; v->size_max = 3500;
@@ -509,6 +526,7 @@ static void ep_update(uint32_t now)
 {
     int i;
     g_protocol_ms = now;
+    g_updates++;
     if (is_anl()) { anl_update(g_anl, now); TX_OBSERVE(g_anl); return; }
     for (i = 1; i < NFLOW; i++) if (g_kcp[i]) ikcp_update(g_kcp[i], now);
 }
@@ -590,7 +608,7 @@ static int ep_recv(int id, char *buf, int cap)
 /*--------------------------------------------------------------------
  * traffic
  *-------------------------------------------------------------------*/
-static char g_buf[1 << 18];
+static char g_buf[1 << 20];      /* a key frame at REALNET_VIDEO_MAX 8000 is ~280 KB */
 
 static void put_hdr(char *p, const flow *f, int key, uint32_t seq, uint64_t t)
 {
@@ -604,6 +622,8 @@ static void gen_media(uint64_t t, uint64_t end_us)
     int i;
     for (i = 1; i <= 2; i++) {
         flow *f = &g_fl[i];
+        /* REALNET_AUDIO_ONLY: no video frames (test tool only) */
+        if (i == 2 && getenv("REALNET_AUDIO_ONLY")) continue;
         while (t >= f->next_us && f->next_us < end_us) {
             int key = f->gop && (f->seq % (uint32_t)f->gop) == 0;
             int len = media_frame_size(f, key);
@@ -810,6 +830,8 @@ static void report_mdiag(void)
 static void report_rate(void)
 {
     size_t i;
+    if (g_fixed_scale && is_sender())
+        printf("FIXEDSCALE scale=%d (per mille of %d B/s video, encoder feedback off)\n", g_fixed_scale, ADAPT_NOMINAL_VIDEO);
     if (g_adapt && is_anl() && is_sender()) {
         uint64_t t = now_us();
         if (g_adapt_last_us && t > g_adapt_last_us) {
@@ -1085,7 +1107,16 @@ int main(int argc, char **argv)
         const char *clock_mode = getenv("REALNET_CLOCK");
         g_clock_refresh = clock_mode && atoi(clock_mode) > 0;
         g_mdiag = getenv("REALNET_MDIAG") && atoi(getenv("REALNET_MDIAG")) > 0;
+        if (getenv("REALNET_FIXED_SCALE")) {
+            g_fixed_scale = atoi(getenv("REALNET_FIXED_SCALE"));
+            if (g_fixed_scale < 1 || g_fixed_scale > 1000) { fprintf(stderr, "REALNET_FIXED_SCALE: 1..1000 per mille\n"); exit(2); }
+        }
+        if (getenv("REALNET_VIDEO_MAX")) {
+            g_adapt_max = atoi(getenv("REALNET_VIDEO_MAX"));
+            if (g_adapt_max < 1000 || g_adapt_max > 20000) { fprintf(stderr, "REALNET_VIDEO_MAX: 1000..20000 per mille\n"); exit(2); }
+        }
         g_rate_diag = getenv("REALNET_RATE") && atoi(getenv("REALNET_RATE")) > 0;
+        g_drive_check = getenv("REALNET_DRIVE") && !strcmp(getenv("REALNET_DRIVE"), "check");
     }
     flows_init();
     if (g_prio_flow[1] >= 0) g_fl[1].prio = g_prio_flow[1];
@@ -1133,10 +1164,32 @@ int main(int argc, char **argv)
         uint64_t t = now_us();
         int r;
         pfd.fd = g_fd; pfd.events = POLLIN; pfd.revents = 0;
-        r = poll(&pfd, 1, 1);
-        /* the protocols take RTT samples against the time of their last update:
-           give them the current time before the datagrams (anliu.h, anl_input) */
-        ep_update(now_ms());
+        if (g_drive_check && is_anl()) {
+            /* sleep until the protocol's next timer, the next frame or ping / hello;
+               at most 100 ms (diagnostic samples, the end of the test) */
+            uint32_t nm = now_ms();
+            int32_t to = ms_diff(g_next_upd, nm);
+            if (to > 100) to = 100;
+            if (started && is_sender()) {
+                for (i = 1; i <= 2; i++) if (flow_active(i) && g_fl[i].next_us < end_us) {
+                    int64_t d = ((int64_t)g_fl[i].next_us - (int64_t)t + 999) / 1000;
+                    if (d < to) to = (int32_t)d;
+                }
+            }
+            if (!g_server) {
+                int64_t d = ((int64_t)(last_hello_us + 200000u) - (int64_t)t + 999) / 1000;
+                if (d < to) to = (int32_t)d;
+                if (pinged < 20) { d = ((int64_t)(t0 + (uint64_t)pinged * 50000u) - (int64_t)t + 999) / 1000; if (d < to) to = (int32_t)d; }
+                if (!started) { d = ((int64_t)(t0 + 1200000u) - (int64_t)t + 999) / 1000; if (d < to) to = (int32_t)d; }
+            }
+            r = poll(&pfd, 1, to > 0 ? to : 0);
+            if (ms_diff(now_ms(), g_next_upd) >= 0) ep_update(now_ms());
+        } else {
+            r = poll(&pfd, 1, 1);
+            /* the protocols take RTT samples against the time of their last update:
+               give them the current time before the datagrams (anliu.h, anl_input) */
+            ep_update(now_ms());
+        }
         if (r > 0 && (pfd.revents & POLLIN)) {
             char in[2048];
             struct sockaddr_storage from;
@@ -1207,7 +1260,11 @@ int main(int argc, char **argv)
             if (g_test == 0 || g_test == 3) gen_media(t, end_us);
             if (g_test != 0) gen_bulk(t, end_us);
         }
-        ep_update(now_ms());
+        if (!g_drive_check || !is_anl()) ep_update(now_ms());
+        else {
+            if (ms_diff(now_ms(), g_next_upd) >= 0) ep_update(now_ms());
+            g_next_upd = anl_check(g_anl, now_ms());
+        }
         rx_frames();
 #ifdef REALNET_INTERNAL
         if (started && is_sender() && is_anl() && g_test >= 2) zwnd_sample(t, start_us);
@@ -1330,6 +1387,12 @@ int main(int argc, char **argv)
                state, (unsigned long long)g_input_errors, (unsigned long long)g_output_errors,
                (unsigned long long)g_payload_errors, (unsigned long long)g_checked_bytes, queued,
                (unsigned long long)g_bulk_sent, (unsigned long long)g_bulk_rcvd);
+        {
+            struct rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            printf("DRIVE mode=%s updates=%llu cpu_user_ms=%ld cpu_sys_ms=%ld\n", g_drive_check ? "check" : "poll1ms", g_updates,
+                   (long)ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000, (long)ru.ru_stime.tv_sec * 1000 + ru.ru_stime.tv_usec / 1000);
+        }
         if (state || g_input_errors || g_output_errors || g_payload_errors) failed = 1;
         if (is_sender() && g_test && queued) failed = 1;
 #ifdef REALNET_INTERNAL
