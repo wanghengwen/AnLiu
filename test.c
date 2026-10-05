@@ -1906,6 +1906,54 @@ static void test_receiver_skip_ack_fragments(void)
     anl_release(w);
 }
 
+/* A receiver skip (RCV_SKIP) that retires a prefix past the point a pending
+   FWD asks the peer to skip to answers the FWD, as an ACK's or a CLOSE's una
+   does: otherwise the FWD went on being resent until a later ACK. */
+static int null_output(char *buf, int len, anl_t *w, void *user)
+{
+    (void)buf; (void)len; (void)w; (void)user;
+    return 0;
+}
+
+static void test_rcv_skip_clears_fwd(void)
+{
+    anl_config cfg; anl_stream_opt opt; anl_t *w; anl_stream *st;
+    char data[200], pl[64], *p;
+    uint32_t una, retired;
+    int i, r;
+    printf("[semi: a receiver skip past a pending FWD answers it]\n");
+    anl_config_default(&cfg, ANL_ROLE_CLIENT);
+    cfg.pad_max = 0; cfg.rng = det_rng;
+    w = anl_create(7, &cfg, NULL);
+    CHECK(w != NULL, "create connection");
+    if (!w) return;
+    anl_setoutput(w, null_output);
+    anl_update(w, 1000);
+    anl_stream_opt_default(&opt, ANL_SEMI); opt.fec = 0;
+    st = (anl_stream *)anl_stream_open(w, &opt, NULL);
+    CHECK(st != NULL, "open semi stream");
+    if (!st) { anl_release(w); return; }
+    for (i = 0; i < 6; i++) {
+        memset(data, i, sizeof(data));
+        CHECK(anl_stream_send_frame((anl_stream_t *)st, 0, data, sizeof(data), NULL) >= 0, "queue frame %d", i);
+    }
+    anl_update(w, 1010);
+    anl_flush(w);
+    una = st->snd_una;
+    CHECK(tdiff(st->snd_nxt, una) >= 4, "frames in flight (%u)", st->snd_nxt - una);
+    retired = una + 3;
+    st->fwd_pending = 1; st->fwd_una = retired; st->fwd_ts = w->current + 1000;
+    p = pl;
+    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
+    p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_RCV_SKIP); p = enc_varint(p, SKIP_BODY);
+    p = enc32(p, retired);
+    r = anl_input_plain(w, pl, (long)(p - pl));
+    CHECK(r == ANL_OK, "skip input (%d)", r);
+    CHECK(st->snd_una == retired, "the skipped prefix is retired (una %u, want %u)", st->snd_una, retired);
+    CHECK(!st->fwd_pending, "the FWD it reached is answered");
+    anl_release(w);
+}
+
 /* one frame (#10) is lost; the receiver skips it by rcv_deadline */
 static void run_key_receiver(int rcv_drop, uint32_t *delivered, uint32_t *discarded, int *bad)
 {
@@ -3820,6 +3868,7 @@ int main(void)
     RUN(test_window_reopen_loss());
     RUN(test_receiver_deadline_default());
     RUN(test_receiver_skip_ack_fragments());
+    RUN(test_rcv_skip_clears_fwd());
     RUN(test_fec_rtt_default());
     RUN(test_fec_first_key());
     RUN(test_report_late_clock());

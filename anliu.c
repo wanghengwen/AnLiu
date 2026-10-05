@@ -4059,6 +4059,9 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                     shrink_buf(st);
                     w->inflight_segs -= umin32(w->inflight_segs, (uint32_t)freed);
                     acked += freed; /* opens the window, without a delivery sample */
+                    /* the peer is past the point a pending FWD asks it to skip to:
+                       as for an ACK's or a CLOSE's una, the FWD is answered */
+                    if (st->fwd_pending && tdiff(retired, st->fwd_una) >= 0) st->fwd_pending = 0;
                 }
             } else if (sub == CTRL_OPEN && blen >= OPEN_BODY) {
                 open_info oi;
