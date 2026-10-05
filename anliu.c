@@ -462,6 +462,8 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define FEC_SMALL_FAIL  1       /* ... a small block (audio, cheap to protect) or any block of a
                                    drop_until_key stream (a failure a retransmission cannot repair in
                                    time costs the rest of the GOP: 15 frames): per mille */
+#define FEC_HOLD_FAIL   30      /* a large block's RTO is held while it fails with at most this per
+                                   10000 (fec_rto_hold) */
 #define FEC_GATE_LOSS_ON  655   /* RTT auto (DESIGN 8.6): opens at this raw loss (1%, 1/65536), */
 #define FEC_GATE_LOSS_OFF 164   /* closes below this (0.25%) */
 #define FEC_GATE_HOLD_MS  2000  /* ... and switches at most this often (and stays closed this long after a
@@ -497,9 +499,10 @@ typedef struct anl_seg {
     uint32_t ts_sent;       /* time of the last transmission (RACK); receiver: the peer's send time */
     uint32_t fec_ts;        /* its FEC block's last parity goes out (first transmission only) */
     uint16_t fec_share;     /* its share of the block's parity bytes (delivery rate) */
-    uint32_t fec_base;      /* its small FEC block: first sn, data packets, parities (fec_rto_hold;
-                               m = 0: a large block, none, or the RTO was held once) */
+    uint32_t fec_base;      /* its FEC block: first sn, data packets, parities (fec_rto_hold;
+                               m = 0: none, or the RTO was held once) */
     uint8_t  fec_k, fec_m;
+    uint8_t  fec_small;     /* ... a small block (k x Lmax <= FEC_SMALL_BLOCK) */
     uint8_t  lost_cnt;      /* counted in lost_bytes (RACK marked it; undone if the original arrives) */
     uint32_t resendts;
     uint32_t rto;
@@ -4495,7 +4498,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
         s->fec_ts = last ? last : 1;
         s->fec_share = (uint16_t)umin32(share, 0xffff);
         s->fec_base = st->fec_base; s->fec_k = (uint8_t)k;
-        s->fec_m = k * lmax <= FEC_SMALL_BLOCK ? (uint8_t)m : 0;      /* fec_rto_hold: small blocks only */
+        s->fec_m = (uint8_t)m; s->fec_small = k * lmax <= FEC_SMALL_BLOCK;   /* fec_rto_hold */
         /* the RTO counts from the last parity too, as far as a
            retransmission then still makes fec_deadline (reach): a block
            collects up to fec_blk_ms, and timed from the send the RTO beat
@@ -5340,45 +5343,85 @@ static void rate_update(anl_t *w)
     }
 }
 
-/* The RTO of a first transmission in a small block (audio) that the peer can
- * almost surely rebuild. Its retransmission is held back by the deadline
- * (fec_close_block: it must still make fec_deadline), which comes before the
- * rebuild's ACK can: 94% of them reached a peer that already had the segment
- * (5 Mbit, 100 ms, 5%). The members still unacknowledged plus the parities
+/* The RTO of a first transmission that the peer can almost surely rebuild.
+ * Its retransmission is held back by the deadline (fec_close_block: it must
+ * still make fec_deadline), which comes before the rebuild's ACK can: 94% of
+ * the audio ones reached a peer that already had the segment (5 Mbit,
+ * 100 ms, 5%), 91..96% of the video ones (2 Mbit, 100..170 ms).
+ * Small block (audio): the members still unacknowledged plus the parities
  * leave the block short only if more than m of them are lost: at twice the
  * measured loss, no more than a tenth of the small-block target - hold the
- * RTO for a round trip, once; the rebuild's ACK is on its way. Not near the
- * link (a recent queue, capacity short): there losses come together and the
- * independent estimate is too low. Large blocks (video) keep the early
- * retransmission: holding theirs too cost 2 points of video at 2 Mbit 280 ms
- * and 3..5 of a cold start (review 0.4). */
-static int fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg *seg)
+ * RTO for a round trip, once. Not near the link (a recent queue, capacity
+ * short): there losses come together and the independent estimate is too low.
+ * Large block (video): the members whose ACK is overdue count as lost, the
+ * others and the parities as on their way; held until the rebuild's ACK is
+ * due, once, while the block then fails at most FEC_HOLD_FAIL in 10000 (twice
+ * the measured loss), and only while a retransmission after that still makes
+ * max_age. The queue a key frame builds is no reason against it (it is there
+ * all the time at 2 Mbit); the losses already seen are. The earlier attempt
+ * held all blocks like small ones and cost 2 points of video at 2 Mbit 280 ms
+ * and 3..5 of a cold start (review 0.4): its retransmissions came after
+ * max_age. Returns when to retransmit, 0: now. */
+static uint32_t fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg *seg)
 {
     const anl_node *pos;
-    uint32_t u = 1, n, m = seg->fec_m;
+    const uint64_t one = 1ull << 32;
+    uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
+    uint32_t u = 1, n, m = seg->fec_m, gone = 1, due, until, i;
+    uint64_t p, q, pmf, cdf;
     if (seg->xmit != 1 || m == 0 || !w->fec_loss_valid || w->capacity_short) return 0;
-    if (w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    if (seg->fec_small && w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    if (seg->fec_small) {
+        for (pos = seg->node.prev; pos != &st->snd_buf; pos = pos->prev) {
+            const anl_seg *s = QENTRY(pos, anl_seg, node);
+            if (tdiff(s->sn, seg->fec_base) < 0) break;
+            u++;
+        }
+        for (pos = seg->node.next; pos != &st->snd_buf; pos = pos->next) {
+            const anl_seg *s = QENTRY(pos, anl_seg, node);
+            if (tdiff(s->sn, seg->fec_base + seg->fec_k) >= 0) break;
+            u++;
+        }
+        n = u + m;
+        /* P(more than m of n lost) at twice the measured loss, as fec_parities_for */
+        p = umin32(2 * w->fec_loss, 32768); q = 65536u - p; pmf = one;
+        for (i = 0; i < n; i++) pmf = pmf * q >> 16;
+        cdf = pmf;
+        for (i = 0; i < m && i < n; i++) { pmf = pmf * (n - i) / (i + 1) * p / q; cdf += pmf; }
+        if (!(cdf < one && (one - cdf) * 10000 <= one * FEC_SMALL_FAIL)) return 0;
+        until = w->current + srtt;
+        return until ? until : 1;
+    }
+    /* a large block: the members whose ACK is overdue are lost (this one
+       among them, and one resent already), the rest and the parities are
+       on their way - the block fails if more than m - gone of those are */
+    due = srtt + 2u * (uint32_t)w->interval + 4u * (uint32_t)w->rx_rttval;
+    until = seg->fec_ts + due;                      /* the rebuild's ACK */
+    if (tdiff(until, w->current) <= 0) return 0;    /* overdue: FEC failed */
+    /* if FEC fails after all, the retransmission still beats max_age:
+       the frame comes late, its GOP is not lost (holding at 280 ms RTT
+       without this cost 1..3 points of video) */
+    if (st->max_age_ms && tdiff(until + srtt / 2 + 2u * (uint32_t)w->interval + 4u * (uint32_t)w->rx_rttval,
+                                seg->ts_enq + (uint32_t)st->max_age_ms) > 0) return 0;
+    u = 0;
     for (pos = seg->node.prev; pos != &st->snd_buf; pos = pos->prev) {
         const anl_seg *s = QENTRY(pos, anl_seg, node);
         if (tdiff(s->sn, seg->fec_base) < 0) break;
-        u++;
+        if (s->xmit != 1 || tdiff(w->current, s->ts_sent) >= (int32_t)due) gone++; else u++;
     }
     for (pos = seg->node.next; pos != &st->snd_buf; pos = pos->next) {
         const anl_seg *s = QENTRY(pos, anl_seg, node);
         if (tdiff(s->sn, seg->fec_base + seg->fec_k) >= 0) break;
-        u++;
+        if (s->xmit != 1 || tdiff(w->current, s->ts_sent) >= (int32_t)due) gone++; else u++;
     }
+    if (gone > m) return 0;
     n = u + m;
-    /* P(more than m of n lost) at twice the measured loss, as fec_parities_for */
-    {
-        const uint64_t one = 1ull << 32;
-        uint64_t p = umin32(2 * w->fec_loss, 32768), q = 65536u - p, pmf = one, cdf;
-        uint32_t i;
-        for (i = 0; i < n; i++) pmf = pmf * q >> 16;
-        cdf = pmf;
-        for (i = 0; i < m && i < n; i++) { pmf = pmf * (n - i) / (i + 1) * p / q; cdf += pmf; }
-        return cdf < one && (one - cdf) * 10000 <= one * FEC_SMALL_FAIL;
-    }
+    p = umin32(2 * w->fec_loss, 32768); q = 65536u - p; pmf = one;
+    for (i = 0; i < n; i++) pmf = pmf * q >> 16;
+    cdf = pmf;
+    for (i = 0; i < m - gone && i < n; i++) { pmf = pmf * (n - i) / (i + 1) * p / q; cdf += pmf; }
+    if (cdf < one && (one - cdf) * 10000 > one * FEC_HOLD_FAIL) return 0;
+    return until ? until : 1;
 }
 
 /* a stream the flush's passes by priority have anything to do for */
@@ -5474,6 +5517,7 @@ static void anl_flush_internal(anl_t *w)
             for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next) {
                 anl_seg *seg = QENTRY(pos, anl_seg, node);
                 int why = 0;                            /* 1 first, 2 timeout, 3 RACK */
+                uint32_t hold;
                 if (!rto_due && found == want) break;
                 if (seg->lost) found++;
                 if (seg->xmit == 0) why = 1;
@@ -5500,9 +5544,9 @@ static void anl_flush_internal(anl_t *w)
                 }
                 if (!pace_can_send(w)) { w->pace_blocked = 1; next_rto = current; break; }
                 if (retrans_spent >= retrans_limit) { rtx_capped = 1; next_rto = current; break; }
-                if (why == 2 && fec_rto_hold(w, st, seg)) {
+                if (why == 2 && (hold = fec_rto_hold(w, st, seg)) != 0) {
                     seg->fec_m = 0;
-                    seg->resendts = current + (uint32_t)(w->rx_srtt > 0 ? w->rx_srtt : RTO_DEF);
+                    seg->resendts = hold;
                     if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
                     continue;
                 }
