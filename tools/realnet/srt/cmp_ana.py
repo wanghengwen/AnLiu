@@ -18,7 +18,7 @@ import json, glob, re, statistics, collections, sys
 from pathlib import Path
 from cmp_checks import validate_lane
 B = Path(__import__('os').environ.get('ANL_REALNET_WORK', '.')).resolve()   # results/ of cmp_round.py
-BUDGET = {1: 150000, 2: 300000}
+BUDGET = {1: 150000, 2: 300000}    # us; a round run with --budgets records its own (meta budget_ms)
 DUR_DEFAULT = 600
 
 
@@ -65,12 +65,13 @@ def analyse(meta):
     if not anl_audio:                   # logs not fetched yet: the round is still running
         return None
     base = min(anl_audio)
+    budget = {int(k): v * 1000 for k, v in meta['budget_ms'].items()} if meta.get('budget_ms') else BUDGET
     for name, (sent, rcv) in raw.items():
         r = rows[name]
         for f, fname in ((1, 'audio'), (2, 'video')):
             keys = [k for k in sent if k[0] == f]
             ex = {k: rcv[k] - base for k in keys if k in rcv}
-            good = [k for k in keys if k in ex and ex[k] <= BUDGET[f]]
+            good = [k for k in keys if k in ex and ex[k] <= budget[f]]
             d = sorted(ex.values())
             r[fname] = dict(n=len(keys), delivered=100 * len(ex) / max(1, len(keys)), ontime=100 * len(good) / max(1, len(keys)),
                             p50=d[len(d) // 2] / 1000 if d else None, p95=d[int(.95 * (len(d) - 1))] / 1000 if d else None,
@@ -107,7 +108,8 @@ if __name__ == '__main__':
             continue
         if rows is None:
             continue
-        print(f"{m['sender']}>{m['receiver']} rtt {m['rtt_min_ms']:.1f}{' +delay %d' % m['delay_ms'] if m.get('delay_ms') else ''} rate {m['rate_kbps']} loss {m['loss_pct']}% seed {m['seed']}")
+        print(f"{m['sender']}>{m['receiver']} rtt {m['rtt_min_ms']:.1f}{' +delay %d' % m['delay_ms'] if m.get('delay_ms') else ''} rate {m['rate_kbps']} loss {m['loss_pct']}% seed {m['seed']}"
+              + (f" budget audio {m['budget_ms']['1']} / video {m['budget_ms']['2']} ms" if m.get('budget_ms') else ''))
         for name, r in rows.items():
             lf = f"{r['loss_fwd']:.2f}/{r['loss_rev']:.2f}" if r['loss_fwd'] is not None else '-'
             print(f"  {name:8} audio {r['audio']['ontime']:6.2f} ({r['audio']['delivered']:6.2f} p50 {r['audio']['p50']:6.1f}) "
@@ -116,7 +118,7 @@ if __name__ == '__main__':
             agg[(path_of(m), m['loss_pct'], name)].append(r)
     print('\npath loss proto n | audio on (delivered) | video on (delivered) | video on and decodable | keys | timely video kbps | wire kbps | audio p50 / video p95 ms')
     rank = ['anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec']
-    order = lambda n: rank.index(n) if n in rank else 0.5 if n.startswith('anl-a') else 1.5 if n.startswith('anl') else 5
+    order = lambda n: rank.index(n) if n in rank else 0.5 if n.startswith('anl-a') else 1.5 if n.startswith('anl') else 3.5 if n == 'srt-r' else 5
     for k in sorted(agg, key=lambda k: (k[0], k[1], order(k[2]), k[2])):
         xs = agg[k]; mn = lambda f: statistics.mean(f(x) for x in xs)
         print(f"{k[0]:6} {k[1]:2}% {k[2]:8} {len(xs)} | {mn(lambda x: x['audio']['ontime']):6.2f} ({mn(lambda x: x['audio']['delivered']):6.2f}) | "

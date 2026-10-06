@@ -416,6 +416,11 @@ static void flows_init(void)
     v->name = "video"; v->id = 2; v->semi = 1; v->prio = 1; v->wnd = 512;
     v->period_ms = 33; v->gop = 30; v->key_min = 25000; v->key_max = 35000; v->size_min = 2500; v->size_max = 3500;
     v->max_age = 500; v->budget_ms = 300; v->until_key = 1; v->kcp_thr = 140000 / 2 / 1376 + 1;
+    /* REALNET_VIDEO_MAX_AGE: video max_age in ms (a longer latency budget); test tool only */
+    if (getenv("REALNET_VIDEO_MAX_AGE")) {
+        int ma = atoi(getenv("REALNET_VIDEO_MAX_AGE"));
+        if (ma >= 50 && ma <= 5000) v->max_age = ma;
+    }
     b->name = "bulk"; b->id = 3; b->semi = 0; b->prio = 3; b->wnd = g_wnd; b->budget_ms = 1000000;
 }
 

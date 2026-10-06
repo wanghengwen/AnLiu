@@ -25,6 +25,13 @@ MS). Protocols:
   srt-b    SRT latency audio 120 / video 250 ms (the budgets 150 / 300 less margin)
   srt-fec  srt-b + packetfilter fec,cols:10,rows:5,layout:staircase,arq:onreq
   srt-rec  SRT latency max(120, 4 x RTT) for both (SRT's usual guidance)
+With --budgets A,V (V a number or "rec" = max(120, 4 x RTT)) the round is scored at
+A / V ms plus BUDGET_TOL (SRT delivers a few ms after its latency) instead of 150 / 300,
+and three more lanes exist:
+  srt-r    SRT latency A for audio, V for video
+  anl-nf-g AnLiu FEC off set up for the budgets as VIDEO_GUIDE.md says: max_age A + 50 /
+           V + 200, receiver gap wait A - 20 / V - 50
+  anl-nf-d the same max_age, the gap wait left at its default
 Logs and per-band tc counters go to ANL_REALNET_WORK/results/<tag>.*; analysis: cmp_ana.py."""
 import sys, os, re, json, time, subprocess, shlex, gzip, hashlib, pathlib
 from cmp_checks import recommended_latency, validate_lane
@@ -43,6 +50,11 @@ if '--anl' in argv:
 want = ['anl', 'srt-b', 'srt-fec', 'srt-rec']
 if '--protos' in argv:
     i = argv.index('--protos'); want = argv[i + 1].split(','); argv = argv[:i] + argv[i + 2:]
+budgets = None
+if '--budgets' in argv:
+    i = argv.index('--budgets'); budgets = argv[i + 1].split(','); argv = argv[:i] + argv[i + 2:]
+    if len(budgets) != 2: raise SystemExit('--budgets AUDIO_MS,VIDEO_MS|rec')
+BUDGET_TOL = 10
 drive_check = '--drive-check' in argv
 argv = [a for a in argv if a != '--drive-check']
 snd, rcv, rate, loss, seed, pbase = argv[0], argv[1], int(argv[2]), int(argv[3]), int(argv[4]), int(argv[5])
@@ -95,8 +107,16 @@ try:
     meta['validation_version'] = 1
     known = dict([('anl', 1), ('anl-nf', 0), ('srt-b', (120, 250, '')), ('srt-fec', (120, 250, 'fec,cols:10,rows:5,layout:staircase,arq:onreq')),
                   ('srt-rec', (rec_lat, rec_lat, ''))])
+    if budgets:
+        ba = int(budgets[0]); bv = rec_lat if budgets[1] == 'rec' else int(budgets[1])
+        meta['latency_ms'] = {'audio': ba, 'video': bv}
+        meta['budget_ms'] = {'1': ba + BUDGET_TOL, '2': bv + BUDGET_TOL}     # the scoring budgets (cmp_ana)
+        known['srt-r'] = (ba, bv, '')
+        known['anl-nf-g'] = dict(fec=0, rda=max(ba - 20, 1), rdv=max(bv - 50, 1), ama=ba + 50, vma=bv + 200)
+        known['anl-nf-d'] = dict(fec=0, ama=ba + 50, vma=bv + 200)
     for n in want:
         base = n.partition('@')[0]
+        if base in ('srt-r', 'anl-nf-g', 'anl-nf-d') and not budgets: raise SystemExit(f'{base} needs --budgets')
         g = re.fullmatch(r'(anl|anl-nf)-a(\d+)(?:v(\d+))?', base)
         if g: known[n] = (0 if g[1] == 'anl-nf' else 1, int(g[2]), int(g[3]) if g[3] else None)
         elif '@' in n: known[n] = known[base]
@@ -131,17 +151,19 @@ try:
         return log
 
     def anl_args(cfg):
-        fec, rda, rdv = cfg if isinstance(cfg, tuple) else (cfg, None, None)
+        if isinstance(cfg, dict): fec, rda, rdv = cfg['fec'], cfg.get('rda'), cfg.get('rdv')
+        else: fec, rda, rdv = cfg if isinstance(cfg, tuple) else (cfg, None, None)
         return (f"--proto anl --test media --dir down --dur {dur} --interval 10 --loss 0 --rx-loss 0 --seed {seed} --rcv-deadline -1 "
                 f"--init-cwnd 16 --fec-rtt-auto {fec} --adapt 0 --prio-audio 0 --prio-video 1"
                 + (f" --rcv-deadline-audio {rda}" if rda is not None else '')
                 + (f" --rcv-deadline-video {rdv}" if rdv is not None else ''))
     anl_env = 'REALNET_MDIAG=1 REALNET_TIMEBASE=1 REALNET_CLOCK=1 REALNET_FECCOST=1 REALNET_FIXED_SCALE=1000' + (' REALNET_DRIVE=check' if drive_check else '')
+    lane_env = lambda cfg: anl_env + (f" REALNET_AUDIO_MAX_AGE={cfg['ama']} REALNET_VIDEO_MAX_AGE={cfg['vma']}" if isinstance(cfg, dict) else '')
     logs = {}
     for name, cfg in protos:
         port = bands[name][0]
         if name.startswith('anl'):
-            logs[name, 'srv'] = start(S, name, 'srv', f"{RN(S, name)} server --port {port} {anl_args(cfg)}", anl_env)
+            logs[name, 'srv'] = start(S, name, 'srv', f"{RN(S, name)} server --port {port} {anl_args(cfg)}", lane_env(cfg))
         else:
             logs[name, 'srv'] = start(S, name, 'srv', f"./srtnet server --port {port} --dur {dur} --seed {seed}")
     for _ in range(40):
@@ -153,7 +175,7 @@ try:
     for name, cfg in protos:
         port = bands[name][0]
         if name.startswith('anl'):
-            logs[name, 'cli'] = start(C, name, 'cli', f"{RN(C, name)} client --host {S['ip']} --port {port} {anl_args(cfg)}", anl_env)
+            logs[name, 'cli'] = start(C, name, 'cli', f"{RN(C, name)} client --host {S['ip']} --port {port} {anl_args(cfg)}", lane_env(cfg))
         else:
             la, lv, fec = cfg
             logs[name, 'cli'] = start(C, name, 'cli', f"./srtnet client --host {S['ip']} --port {port} --lat-audio {la} --lat-video {lv} --dur {dur}"
