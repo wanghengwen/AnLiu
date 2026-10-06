@@ -143,7 +143,9 @@ typedef struct anl_stream_opt {
                                    fec_deadline_ms and the measured loss is >= 1%. One retry costs
                                    1.5 srtt + RACK window + ACK delay + paced frame send time;
                                    large frames reserve a second retry if measured loss makes
-                                   failure after the first retry exceed the parity failure target.
+                                   failure after the first retry exceed the parity failure target
+                                   (drop_until_key: 0.1% for key frames, 1% for others while the
+                                   second retry still beats max_age).
                                    Off below 3/4 of the deadline or 0.25% loss,
                                    at most one switch per 2 s.
                                    Small frames (audio, cheap): repair time plus hard loss evidence

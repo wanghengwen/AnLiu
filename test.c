@@ -2126,8 +2126,8 @@ static void test_fec_rtt_default(void)
             w->rx_srtt = 200; fec_gate_update(w, s);
             CHECK(s->fec_gate, "repair 300+ ms > 100: open");
             w->rx_srtt = 50; fec_gate_update(w, s);
-            CHECK(s->fec_gate && fec_repair_ms(w, s, 0) <= 100 && fec_repair_ms(w, s, 0) * 4 >= 300,
-                  "between 3/4 deadline and deadline: stays open (repair %u)", fec_repair_ms(w, s, 0));
+            CHECK(s->fec_gate && fec_repair_ms(w, s, 0, 0) <= 100 && fec_repair_ms(w, s, 0, 0) * 4 >= 300,
+                  "between 3/4 deadline and deadline: stays open (repair %u)", fec_repair_ms(w, s, 0, 0));
             w->rx_srtt = 20; fec_gate_update(w, s);
             CHECK(s->fec_gate, "below 3/4 deadline, but held for 2 s");
             w->current += FEC_GATE_HOLD_MS + 1; fec_gate_update(w, s);

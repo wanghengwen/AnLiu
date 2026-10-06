@@ -1090,7 +1090,7 @@ enum { FEC_SENT, FEC_LOST, FEC_LATE, FEC_SLOW };  /* fec_auto_count; SLOW: late,
 static void fec_auto_count(anl_t *w, anl_stream *st, int lost);
 static void fec_loss_add(anl_t *w, uint32_t sent, uint32_t lost, int hard);
 static uint32_t fec_parities_for(uint32_t k, uint32_t p, uint32_t fail);
-static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t bytes);
+static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t bytes, int key);
 static int fec_active(const anl_stream *st);
 
 static void dg_begin(anl_t *w)
@@ -1333,7 +1333,7 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
         if (r->frames > 0 && w->rx_srtt > 0 &&
             r->frame_delay_max_ms > r->qdelay_max_ms + (uint32_t)w->rx_srtt * 3 / 4 +
                                     (fec_active(st) ? umax32(st->fec_blk_ms, FEC_BLOCK_MS) : 0) &&
-            fec_repair_ms(w, st, st->fec_frame_avg) > st->fec_deadline)
+            fec_repair_ms(w, st, st->fec_frame_avg, 0) > st->fec_deadline)
             fec_auto_count(w, st, FEC_SLOW);
     }
     if (w->report_cb) w->report_cb(w, st, r, w->user);
@@ -3519,7 +3519,14 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                 else if (s->rack_rtx) {
                     if (!s->lost_cnt) {
                         w->lost_bytes += seg_wire(s);
-                        if (st->fec) fec_loss_add(w, 0, 1, 1);  /* an RTO loss: not marked */
+                        /* an RTO loss: not marked. Not into the estimate for a
+                           segment its block covered while the peer reports: its
+                           rebuild is in that report, and the RTO usually fires
+                           before the rebuild's ACK (counted twice, the estimate
+                           read 3.9% at 3% loss and 19.7% at 15%, simulation);
+                           still the gate's hard evidence */
+                        if (st->fec && !(st->peer_rp.valid && s->fec_ts)) fec_loss_add(w, 0, 1, 1);
+                        else if (st->fec) w->fec_loss_ts = w->current | 1;
                     }
                     /* the retransmission, not the original, was acknowledged:
                        the loss is confirmed (a RACK mark alone can be
@@ -4027,7 +4034,7 @@ static int fec_active(const anl_stream *st)
  * ACK delay (an update interval), the retransmission takes half a round trip.
  * RTT-auto large frames also reserve a second retry when measured random
  * loss makes failure of the first retry exceed the parity failure target. */
-static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t bytes)
+static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t bytes, int key)
 {
     uint32_t srtt = w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF;
     uint32_t pace = w->pace_rate ? w->pace_rate : compute_pace_rate(w);
@@ -4041,11 +4048,18 @@ static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t byt
      * reserve one more detection/round trip instead of assuming that retry
      * surely works. This covers the first repeated-loss blind spot, not an
      * arbitrary tail guarantee. Small audio keeps its bounded startup and
-     * one-repair policy; explicit FEC modes keep their existing estimate. */
+     * one-repair policy; explicit FEC modes keep their existing estimate.
+     * The stricter target of a drop_until_key stream is for its key frames:
+     * a non-key frame whose second retry still beats max_age comes late,
+     * not lost - its GOP survives - and takes the looser one (100 ms RTT,
+     * 3..5% loss: no parity for those frames, wire -8..-12%, video on time
+     * within 0.1 point, simulation). */
     if (st->fec_rtt_auto && bytes > FEC_SMALL_BLOCK / 8 &&
         w->fec_loss_valid && w->fec_loss) {
         uint32_t n = bytes / st->mss + (bytes % st->mss != 0);
-        uint32_t target = st->drop_until_key ? FEC_SMALL_FAIL : FEC_BLOCK_FAIL;
+        int strict = st->drop_until_key &&
+                     (key || !st->max_age_ms || need + srtt + detect > (uint32_t)st->max_age_ms);
+        uint32_t target = strict ? FEC_SMALL_FAIL : FEC_BLOCK_FAIL;
         uint64_t risk = (uint64_t)n * w->fec_loss * w->fec_loss / 65536;
         if (risk * 1000 > (uint64_t)target * 65536)
             need += srtt + detect;
@@ -4084,7 +4098,7 @@ static void fec_gate_update(anl_t *w, anl_stream *st)
     int startup = fec_audio_startup(w, st);
     uint32_t d = st->fec_deadline;
     if (w->rx_srtt > 0 && d != 0) {
-        uint32_t need = fec_repair_ms(w, st, st->fec_frame_avg);
+        uint32_t need = fec_repair_ms(w, st, st->fec_frame_avg, 0);
         int small = st->fec_frame_avg != 0 && st->fec_frame_avg * 8 <= FEC_SMALL_BLOCK;
         /* Beyond bounded audio startup, only while the path has lost a
            packet, with hard evidence, in the last FEC_LOSS_RECENT_MS.
@@ -4124,7 +4138,7 @@ static void fec_gate_update(anl_t *w, anl_stream *st)
 static int fec_key_gate(anl_t *w, anl_stream *st)
 {
     if (!st->drop_until_key || st->fec_deadline == 0) return 0;
-    if (w->rx_srtt > 0 && fec_repair_ms(w, st, st->fec_key_bytes) <= st->fec_deadline) return 0;
+    if (w->rx_srtt > 0 && fec_repair_ms(w, st, st->fec_key_bytes, 1) <= st->fec_deadline) return 0;
     /* before anything is known (the first key frame), or a recent loss and 1% */
     if (!w->fec_loss_valid && w->fec_loss_ts == 0) return 1;
     return w->fec_loss_ts != 0 && tdiff(w->current, w->fec_loss_ts) < FEC_LOSS_RECENT_MS && w->fec_loss >= FEC_GATE_LOSS_ON;
@@ -4188,7 +4202,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     m = x / 100;
     st->fec_carry = x % 100;
     if (st->fec_auto) {
-        uint32_t need = fec_repair_ms(w, st, key ? st->fec_key_bytes : st->fec_frame_avg);
+        uint32_t need = fec_repair_ms(w, st, key ? st->fec_key_bytes : st->fec_frame_avg, key);
         if (st->fec_rtt_auto && key && !w->fec_loss_valid) {
             m = umax32(m, umax32((k * FEC_START_RATIO + 50) / 100, 1));
         } else if (!(st->fec_deadline && need <= st->fec_deadline)) {
