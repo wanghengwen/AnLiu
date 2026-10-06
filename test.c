@@ -1081,6 +1081,24 @@ static void test_sid_once(void)
     r = anl_input(n.ep[1], old, oldlen);
     CHECK(r == ANL_ESTALE, "old datagram now outside the ts window (%d)", r);
 
+    /* one 45 s old (between half and a whole wrap of the 16-bit ts) extends
+       to a ts in the future: it must not move the window - it did, and every
+       genuine datagram after it was stale for 20 s */
+    {
+        char pl[16], *q = pl;
+        uint64_t stale0 = n.ep[1]->rx_stale;
+        q = enc32(q, 0x11223344);
+        q = enc8(q, ANL_VERSION << 6);
+        q = enc16(q, (uint16_t)(n.now - 45000));
+        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+        CHECK(r == ANL_OK, "45 s old datagram: ts extended into the future (%d)", r);
+        fill_pattern(buf, 700, 23);
+        anl_stream_send(a2, buf, 700);
+        for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b2, buf, sizeof(buf)); }
+        CHECK(r == 700 && check_pattern(buf, r, 23) && n.ep[1]->rx_stale == stale0,
+              "genuine data right after it (%d, %u stale)", r, (unsigned)(n.ep[1]->rx_stale - stale0));
+    }
+
     /* sid wire format: type(2) | L(1) | F(1) | sid[3:0] [sid >> 4 as a varint]; F with a zero
        or a non-minimal extension is not the one encoding of the sid and drops the datagram */
     {

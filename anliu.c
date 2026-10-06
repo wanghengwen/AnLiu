@@ -3671,7 +3671,7 @@ static anl_stream *stream_for_open(anl_t *w, int sid, const open_info *oi, int *
 static int anl_input_plain(anl_t *w, const char *plain, long size)
 {
     const char *p, *end;
-    uint32_t conv, ts;
+    uint32_t conv, ts, ref;
     uint16_t ts16, echo_prev = 0;
     uint8_t flg;
     int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0, echo_prev_ok = 0;
@@ -3694,17 +3694,25 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
     /* the 16-bit ts, extended around where the peer's clock should be now:
        the last ts plus the time since here - a pause longer than the 65 s wrap
        does not make every later datagram look old (DESIGN 4.2) */
-    if (!w->peer_ts_valid) ts = ts16;
+    if (!w->peer_ts_valid) ts = ref = ts16;
     else {
         int32_t since = tdiff(w->current, w->peer_ts_at);
-        uint32_t ref = w->peer_ts + (uint32_t)(since > 0 ? since : 0);
+        ref = w->peer_ts + (uint32_t)(since > 0 ? since : 0);
         ts = ref + (uint32_t)(int32_t)(int16_t)(uint16_t)(ts16 - (uint16_t)ref);
     }
     if (w->peer_ts_valid && tdiff(ts, w->peer_ts) < -(int32_t)w->ts_window) {
         w->rx_stale++;
         return ANL_ESTALE;
     }
-    if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) { w->peer_ts = ts; w->peer_ts_at = w->current; }
+    /* peer_ts never passes ref: a replayed datagram 33..65 s old extends to
+       a ts in the future, and taken as is it moved peer_ts that far ahead -
+       every genuine datagram after it was stale until the clock caught up
+       (up to 32 s; one replay stalled the connection). A genuine one is
+       never meaningfully ahead of ref */
+    if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) {
+        w->peer_ts = w->peer_ts_valid && tdiff(ts, ref) > 0 ? ref : ts;
+        w->peer_ts_at = w->current;
+    }
     w->peer_ts_valid = 1;
     /* A delivery gap can release buffered ACKs together on resumption.
        Ordinary, continuously arriving ACKs must still measure queue delay. */
