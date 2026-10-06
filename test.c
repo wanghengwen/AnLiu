@@ -1676,7 +1676,7 @@ static void test_receiver_deadline_default(void)
         ca.pad_max = cb.pad_max = 0;
         net_start(&n, &ca, &cb);
         anl_stream_opt_default(&o, ANL_SEMI);
-        CHECK(o.rcv_deadline_ms == -1, "semi defaults to the local frame lifetime");
+        CHECK(o.rcv_deadline_ms == -1, "semi defaults to a share of the local frame lifetime");
         o.fec = 0; o.max_age_ms = 10000;
         op = o; op.max_age_ms = 40;
         if (policy >= 0) op.rcv_deadline_ms = policy ? 20 : 0;
@@ -1715,7 +1715,7 @@ static void test_receiver_deadline_default(void)
         }
         if (policy == 0) CHECK(r == ANL_EAGAIN, "explicit zero keeps waiting");
         else {
-            int deadline = policy == -1 ? 40 : 20;
+            int deadline = policy == -1 ? 40 * RCV_WAIT_PCT / 100 : 20;     /* -1: 3/5 of max_age */
             CHECK(r == (int)sizeof(buf) && fi.frame_no == 1 && fi.lost_before == 1 &&
                   check_pattern(buf, sizeof(buf), 1), "skip missing frame, preserve next frame and loss count");
             CHECK(received_at - start >= (uint32_t)(1 + deadline) &&
@@ -1838,6 +1838,10 @@ static void run_hole(int delay, int *late, int *got, uint32_t *echo_rtt)
     anl_stream_opt_default(&o, ANL_SEMI);
     o.max_age_ms = 200;
     o.fec = 0;
+    /* the whole lifetime, as before the default became 3/5 of it: this is
+       about the hopeless-hole rule, not the default wait (which at 60 ms RTT
+       gives up on some second retransmissions: test_receiver_deadline_default) */
+    o.rcv_deadline_ms = o.max_age_ms;
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
     n.loss_pct = 5;

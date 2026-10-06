@@ -174,7 +174,7 @@ typedef struct anl_stream_opt {
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
     int drop_until_key;         /* semi only: 0 */
-    int rcv_deadline_ms;        /* semi only: -1 (default) = local max_age_ms, 0 = off,
+    int rcv_deadline_ms;        /* semi only: -1 (default) = 3/5 of the local max_age_ms, 0 = off,
                                    >0 = max gap wait after later data reveals a missing segment.
                                    Skips to a later frame without waiting for sender FWD;
                                    checked on update/flush, not absolute sender frame age.

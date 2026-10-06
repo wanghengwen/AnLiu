@@ -405,6 +405,10 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define ACK_F_DELTA     0x20    /* ts_echo is a zigzag varint delta from the datagram's previous ACK */
 #define SACK_REPEAT     3       /* every received segment is reported in at least 3 ACKs */
 #define REO_DIV         16      /* RACK reordering window starts at min_rtt / 16 */
+#define RCV_WAIT_PCT    60      /* rcv_deadline_ms -1: a gap is waited for this % of the local max_age
+                                   (DESIGN 7.5); all of it held the frames behind an unfillable gap past
+                                   any playout budget shorter than max_age (FEC off, 2 Mbit, 60..300 ms,
+                                   3..15%: video on time +2.6, audio +0.55 points on average) */
 #define REO_MULT_MAX    16      /* and grows up to min_rtt */
 #define REO_DECAY       16      /* round trips without a spurious retransmission before it shrinks */
 #define PARITY_HDR      6       /* base(3) k(1) m(1) j(1), after type|sid sub len */
@@ -5813,7 +5817,7 @@ static int stream_apply_local(anl_t *w, anl_stream *st, const anl_stream_opt *op
         st->max_age_ms = opt->max_age_ms > 0 ? opt->max_age_ms : 0;
         st->max_bytes = opt->max_bytes > 0 ? opt->max_bytes : 0;
         st->drop_until_key = opt->drop_until_key;
-        st->rcv_deadline_ms = opt->rcv_deadline_ms == -1 ? st->max_age_ms : opt->rcv_deadline_ms;
+        st->rcv_deadline_ms = opt->rcv_deadline_ms == -1 ? st->max_age_ms * RCV_WAIT_PCT / 100 : opt->rcv_deadline_ms;
         st->rcv_drop_until_key = opt->rcv_drop_until_key != 0;
     }
     /* FEC changes only before anything was segmented (mss depends on it) */

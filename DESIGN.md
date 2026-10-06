@@ -559,7 +559,9 @@ target_rate 为全部流合计的可用载荷字节/秒，每 200 ms 更新。�
 5. 继续把 rcv_buf 中连续的分片移入 rcv_queue；
 6. 排一个 ACK。
 
-**接收端截止时间（`rcv_deadline_ms`）**：半可靠流默认 -1，继承接收端本地 `max_age_ms`；0 显式关闭，正数使用独立期限。接收参数不随 OPEN 传递，应用应在 accept 回调设置本地期限；未设置时沿用本地 500 ms 默认值。
+**接收端截止时间（`rcv_deadline_ms`）**：半可靠流默认 -1，取接收端本地 `max_age_ms` 的 3/5（`RCV_WAIT_PCT`，默认 500 ms 时为 300 ms，音频常用的 200 ms 时为 120 ms）；0 显式关闭，正数使用独立期限。接收参数不随 OPEN 传递，应用应在 accept 回调设置本地期限。
+
+默认值曾是整个 `max_age_ms`。应用的播放预算通常短于 max_age（发送端多留余量），等满 max_age 时，补不上的缺口会把后面没有丢包的帧也拖过预算。仿真（关闭 FEC，2 Mbit、60..300 ms RTT、3..15% 丢包，3 个种子，音频 / 视频 max_age 200 / 500 ms，按 150 / 300 ms 预算计）比较了 1/2、3/5、2/3、3/4 与整个 max_age：3/5 平均音频 +0.55、视频 +2.6、关键帧 +0.95 个百分点，没有明显变差的场景；1/2 视频最好（+3.4），但 100 ms RTT 时音频变差（3% 丢包 99.4 → 98.9）。开启自动 FEC 时 3/5 与原默认值持平。代价：RTT 很短、两次重传仍赶得上 max_age 时，第二次重传可能被放弃（60 ms RTT、5% 丢包音频收到比例约 −0.2 个百分点）。实网（关闭 FEC，音频 / 视频等待 130 / 250 ms，与本默认相近）见 COMPARISON.md 2.5。
 
 - 触发条件：`rcv_nxt` 处有空洞，且 rcv_buf 中空洞之后已有数据，这种阻塞状态持续超过 `rcv_deadline_ms`。计时从空洞出现时开始，只有 `rcv_nxt` 前进才重新计时；
 - 处理方式：接收端主动跳到空洞之后第一个带 HAS_FRAME 的分片，并立即排一个 ACK；
@@ -740,7 +742,7 @@ k 个数据分片与 m 个校验包中任意至多 m 个丢失可恢复，前提
 | max_age_ms / max_bytes | 不使用 | 500 / 0（不限字节） |
 | latency_rtt | 不使用 | 0（关闭；N：FEC 期限至少 N × min_rtt，8.6） |
 | drop_until_key / rcv_drop_until_key | 不使用 | 0 / 0 |
-| rcv_deadline_ms / report | 0 / 0 | -1（继承本地 max_age）/ 1 |
+| rcv_deadline_ms / report | 0 / 0 | -1（本地 max_age 的 3/5）/ 1 |
 
 配置先调用 default，再覆盖需要的字段。PSK、非零 conv 及不同端的 role 由应用提供。接收端本地期限与 FEC 设置通过 accept 配置，不随 OPEN 自动交换。
 

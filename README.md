@@ -66,7 +66,7 @@ REALNET_CLOCK=1 ./build/bench/realnet server --proto anlauto --test media --dir 
 - `anl_stream_send_frame` / `anl_stream_recv_frame`：帧号由协议分配，接收端拿到 `frame_no` 和 `lost_before`（前面跳过了几帧），可以直接驱动解码器；
 - **发送端丢帧**：帧在队列里超过 `max_age_ms` 就整帧丢弃；已经发出但超时的帧不再重传，改发 FWD 通知接收端跳过；
 - **关键帧依赖**：`drop_until_key` 在发送端丢到下一个关键帧为止（已在途的依赖帧一并清除）；`rcv_drop_until_key` 在接收端丢弃无法解码的 P 帧；
-- **接收端 deadline**：后续数据揭示缺口后，等待超过本地 `rcv_deadline_ms` 可跳到后面的帧；期限不是发送端帧年龄；
+- **接收端 deadline**：后续数据揭示缺口后，等待超过本地 `rcv_deadline_ms`（默认为本地 `max_age_ms` 的 3/5）可跳到后面的帧；期限不是发送端帧年龄；
 - **FEC**：见第 3 节。
 
 ### 带宽估计

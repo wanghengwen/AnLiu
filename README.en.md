@@ -68,7 +68,7 @@ So AnLiu builds frames into the protocol:
 - `anl_stream_send_frame` / `anl_stream_recv_frame`: frame numbers are assigned by the protocol; the receiver gets `frame_no` and `lost_before` (how many frames were skipped before this one) and can drive the decoder directly;
 - **Sender-side frame dropping**: a frame that stays in the queue longer than `max_age_ms` is dropped as a whole; frames already sent but expired are not retransmitted — a FWD tells the receiver to skip them instead;
 - **Key-frame dependencies**: `drop_until_key` drops on the sender until the next key frame (dependent frames already in flight are cleared too); `rcv_drop_until_key` discards undecodable P-frames on the receiver;
-- **Receiver deadline**: once later data reveals a gap and the wait exceeds the local `rcv_deadline_ms`, the receiver can skip ahead to later frames; the deadline is not the sender-side frame age;
+- **Receiver deadline**: once later data reveals a gap and the wait exceeds the local `rcv_deadline_ms` (by default 3/5 of the local `max_age_ms`), the receiver can skip ahead to later frames; the deadline is not the sender-side frame age;
 - **FEC**: see section 3.
 
 ### Bandwidth estimation
