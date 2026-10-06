@@ -324,7 +324,7 @@ anl_stream_close(video);                      /* 关闭后句柄失效 */
 anl_release(w);
 ```
 
-完整 API 见 `anliu.h`，协议细节见 [DESIGN.md](DESIGN.md)。
+完整 API 见 `anliu.h`，协议细节见 [DESIGN.md](DESIGN.md)。音视频应用什么时候用 FEC、各参数怎么设，见 [VIDEO_GUIDE.md](VIDEO_GUIDE.md)。
 
 ## 许可
 
