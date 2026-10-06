@@ -62,6 +62,7 @@ static void trace_pace_refill(const anl_t *, uint32_t, uint64_t, uint64_t);
 static void trace_tx_output(const anl_t *, uint32_t, int);
 static void trace_media_tx_output(const anl_t *, uint32_t, int);
 static void trace_seg_commit(const anl_t *, uint32_t, int);
+static void trace_seg_trim(const anl_t *, uint32_t);
 static void trace_data_seg(const anl_t *, const anl_stream_t *, uint32_t, int);
 static void trace_parity_seg(const anl_t *, int, uint32_t);
 static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t);
@@ -70,6 +71,7 @@ static void trace_lt_begin(const anl_t *);
 #define ANL_PACE_REFILL_TRACE trace_pace_refill
 #define ANL_TX_OUTPUT_TRACE trace_media_tx_output
 #define ANL_SEG_COMMIT_TRACE trace_seg_commit
+#define ANL_SEG_TRIM_TRACE trace_seg_trim
 #define ANL_DATA_SEG_TRACE trace_data_seg
 #define ANL_PARITY_SEG_TRACE trace_parity_seg
 #define ANL_FEC_BLOCK_TRACE trace_fec_block
@@ -83,6 +85,7 @@ static void trace_lt_begin(const anl_t *);
 #undef ANL_PACE_REFILL_TRACE
 #undef ANL_TX_OUTPUT_TRACE
 #undef ANL_SEG_COMMIT_TRACE
+#undef ANL_SEG_TRIM_TRACE
 #undef ANL_DATA_SEG_TRACE
 #undef ANL_PARITY_SEG_TRACE
 #undef ANL_FEC_BLOCK_TRACE
@@ -1209,7 +1212,13 @@ int main(int argc, char **argv)
                 bn++;
                 g_rx_bytes += (uint64_t)n + 28;
                 g_rx_pkts++;
-                if (g_server && g_peerlen == 0) { memcpy(&g_peer, &from, fl); g_peerlen = fl; }
+                if (g_server && g_peerlen == 0) {
+                    memcpy(&g_peer, &from, fl); g_peerlen = fl;
+                    /* a server that waited for its first client longer than the
+                       idle timeout (30 s, SERVER default) is dead before the test
+                       starts (anl_stream_open fails ANL_EDEAD): start it over */
+                    if (is_anl() && anl_state(g_anl) < 0) { anl_release(g_anl); ep_create(); }
+                }
                 last_rx_us = now_us();
                 if (rx_emulated_drop(in)) {
                     fl = sizeof(from);

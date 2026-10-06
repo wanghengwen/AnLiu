@@ -32,7 +32,7 @@ proto_bytes = first_seg_bytes + retrans_seg_bytes + parity_seg_bytes
             + control_seg_bytes + overhead_bytes
 ```
 
-合并数据报的头部不会重复算到各段，变长段头和 padding 按实际长度计数。`parity_seg_bytes / first_seg_bytes` 是实际段字节冗余率，与名义 `fec_ratio`、按包数估算的 m/k 不同，也没有包含 parity 对应的数据报头。当前实现每个 PARITY 独占一个数据报，因此纯 FEC 的完整协议成本直接看 `parity_proto_bytes`；IPv4 输出尝试量加封装估算则为 `parity_proto_bytes + 29 × parity_datagrams`。完整成本应报告总 `proto_bytes`，同时列出生成与准时交付的媒体字节。
+合并数据报的头部不会重复算到各段，变长段头和 padding 按实际长度计数。末段设置 `SEG_L` 省略长度字段时，从该段的 DATA/重传/PARITY/控制分类中扣除相应字节；公共头始终为 19 字节。`parity_seg_bytes / first_seg_bytes` 是实际段字节冗余率，与名义 `fec_ratio`、按包数估算的 m/k 不同，也没有包含 parity 对应的数据报头。PARITY 可与 DATA 或 ECHO 同包，`parity_proto_bytes` 只统计纯 PARITY 数据报，不能代表全部 FEC 成本；IPv4 输出尝试量加封装估算则为 `parity_proto_bytes + 29 × parity_datagrams`。完整成本应报告总 `proto_bytes`，同时列出生成与准时交付的媒体字节。
 
 `proto_bytes + 29 × datagrams` 可给出本工具 IPv4 的“协议输出尝试量加 mux/IP/UDP 估算”，但不是 NIC 成功发送量：output 之后仍会模拟丢包、sendto 失败或被 TC 丢弃；HELLO/ping 等工具自身报文也不经过协议分类。原有 `wire_kbps` 只累计成功 sendto 并加估算头部。保留两种口径交叉核对，不能直接相除当作同一批成功发包的开销率。
 

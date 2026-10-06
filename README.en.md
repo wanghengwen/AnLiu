@@ -2,20 +2,20 @@
 
 [中文](README.md) | English
 
-**AnLiu** (暗流, "undercurrent"): *An* (暗, "hidden") means every datagram is authenticated and encrypted as a whole — conv, version, segment type and sequence numbers all live inside the encrypted region. *Liu* (流, "stream") means one connection carries several independent streams at once — control signaling, audio, video, files — sharing the bandwidth while each keeps its own reliability and priority. Calm on the surface, currents meeting underneath: that is where the name comes from.
+**AnLiu** (暗流, "undercurrent"): *An* (暗, "hidden") means every datagram is authenticated, and the version, segment type, sequence numbers and payload after conv are encrypted; conv itself is only reversibly masked. *Liu* (流, "stream") means one connection carries several independent streams at once — control signaling, audio, video, files — sharing the bandwidth while each keeps its own reliability and priority. Calm on the surface, currents meeting underneath: that is where the name comes from.
 
 AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp](https://github.com/skywind3000/kcp): just two files, `anliu.h` / `anliu.c`, no external dependencies, no direct socket handling (packets go out through a callback and come in through `anl_input`), and an application-driven clock. On top of the ikcp model it adds capabilities aimed at real-time audio and video:
 
 | Capability | Description |
 |---|---|
-| Encryption and anti-fingerprinting | SIV construction from ChaCha20 + SipHash-2-4; whole-datagram authenticated encryption, per-direction keys, random padding |
-| Multiple streams | Stream IDs are never reused (29 bits); up to 8192 concurrent peer streams (`max_peer_streams`, default 4096); either side can open / close at any time, reliable streams support half-close; shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
+| Encryption and anti-fingerprinting | SIV construction from ChaCha20 + SipHash-2-4; whole-datagram authentication, encryption after conv, per-direction keys, random padding |
+| Multiple streams | Stream IDs are never reused (25 bits); up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); either side can open at any time, a close is local (the peer is not told; its next data gets RST); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
 | Semi-reliable frame delivery | Data is sent as "frames"; whole frames are dropped when they expire or back up; key-frame dependency handling; receiver-side frame skipping |
-| Per-stream FEC | Reed-Solomon forward error correction enabled per stream: fixed redundancy (default ratio 25%) or conditional adaptive mode; blocks up to 100 ms; any m losses within a block are recoverable |
+| Per-stream FEC | Reed-Solomon forward error correction enabled per stream: fixed redundancy (default ratio 25%) or conditional adaptive mode; fixed blocks of 100 ms, adaptive blocks up to 400 ms; any m losses within a block are recoverable |
 | Congestion control and bandwidth estimation | BBRv2 (with BBRv3-style four-phase bandwidth probing): sends according to the measured bottleneck bandwidth and propagation delay without filling the bottleneck queue; the bandwidth estimate is exposed to the application through `anl_get_stats()` for bitrate control |
 | Smooth sending | Connection-level token-bucket pacing (rate = gain × bandwidth estimate); large frames are never sent as a full-window burst |
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
-| Compact headers | 21-byte datagram header (including 12-byte authentication tag), 7~8-byte base DATA segment header; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
+| Compact headers | 19-byte datagram header (including 12-byte authentication tag), 6~7-byte base DATA segment header at the default MTU, or 5 bytes when the last segment omits its length; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
 See [DESIGN.md](DESIGN.md) for the detailed design and [performance.md](performance.md) for performance data; comparison tools are in `bench/`. (Both documents are currently in Chinese.)
 
@@ -122,10 +122,10 @@ Running several instances over the same link has a few fundamental problems:
 AnLiu's approach:
 
 - Multiple streams in one connection **share** RTT estimation, the congestion window and the pacing token bucket; data and ACKs from all streams can go into the same datagram;
-- **The default stream (sid 0) has strict priority**, suitable for control signaling; other streams have 4 priority levels with **8 : 4 : 2 : 1** weighted round-robin, and low priorities keep a minimum share so they never starve;
+- **The default stream (sid 0) has strict priority**, suitable for control signaling; other streams have 4 priority levels with per-stream DATA quotas of **8 : 4 : 2 : 1**, retained across flushes. Lower priorities make progress while connection/stream windows permit and the default stream does not continuously consume all sending capacity; these are segment quotas, not wire-byte shares;
 - Retransmissions go before new data, in priority order; retransmissions use at most 3/4 of the sending tokens, so a large lossy stream cannot crowd out new data of real-time streams;
 - Loss detection (RACK) uses delivery evidence from the whole connection: a low-rate control stream with no later fragments of its own can still detect loss promptly from video deliveries;
-- Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing a reliable stream is orderly like TCP, delivering all data; closing a semi-reliable stream is an abort, and frames in flight are dropped.
+- Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing any stream immediately frees local queued, unacknowledged and unread data. To ensure reliable delivery, the application must wait for `anl_stream_waitsnd` to reach zero before closing; the peer application closes its own handle separately.
 
 If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate. Priority and mixed-stream test results are in [performance.md](performance.md).
 
@@ -140,8 +140,8 @@ In real-time scenarios, retransmission is usually too late: a loss costs "loss d
 **Main parameter of fixed redundancy: the ratio** `fec_ratio` (parity packets per 100 data packets, default 25):
 
 - A block collects for at most 100 ms (or 64 packets) before it is sealed; the fixed ratio allocates parity by accumulating the remainder of `k × ratio`, at most 16 parity packets per block; a block can span multiple frames, and actual recovery also depends on pacing, scheduling and network delay;
-- Each parity packet is sent in its own datagram, one every 5 ms, to reduce the chance of falling into the same burst loss as the data;
-- For packets covered by parity, the sender's RACK wait starts from the send time of the block's last parity packet, while RTO is not delayed, giving FEC time to recover.
+- Subsequent parity packets are spaced at least 5 ms apart; actual timing depends on flushes, pacing and scheduling. Small-block parity can ride with data from the same stream’s next block; other parity is sent separately (possibly with ECHO);
+- For packets covered by parity, the sender's RACK wait starts from the send time of the block's last parity packet, RTO can also be delayed, subject to frame deadlines and whether a retry can still arrive in time (DESIGN 8.2).
 
 **Adaptive redundancy** (`opt.fec_ratio = 0`, DESIGN 8.5): the nominal ratio is adjusted according to losses that were not recovered in time, and the actual parity count is decided together with the connection loss estimate, block size and redundancy budget. In adaptive mode the nominal ratio varies between 10% and 100%; the parity count is further limited by the per-block cap, the retransmission capability at low latency, and the capacity-shortage state. Ratio and latency comparisons are in [performance.md](performance.md).
 
@@ -157,13 +157,13 @@ Test conditions and historical data for simulated networks, real UDP paths, thro
 
 ## 5. Encryption and "no fingerprint"
 
-**Construction**: `tag = SipHash-2-4-128(k_mac, P)` truncated to 12 bytes, which also serves as the ChaCha20 nonce for encrypting the whole datagram `P` (header included): `wire = tag || ChaCha20(k_enc, tag, P)`. This is the SIV (synthetic IV) approach: no nonce counter has to be maintained, the same plaintext encrypts to the same output, and retransmissions after loss reveal no nonce pattern.
+**Construction**: `tag = SipHash-2-4-128(k_mac, P)` truncated to 12 bytes, which also serves as the ChaCha20 nonce for encrypting the part after conv: `wire = tag || convx || ChaCha20(k_enc, tag, P[4..])`. The tag authenticates all of `P`, including conv; `convx` masks conv by XOR with public tag bytes. This is the SIV (synthetic IV) approach: no nonce counter has to be maintained, the same plaintext encrypts to the same output, and retransmissions after loss reveal no nonce pattern.
 
 - **Per-direction keys**: both ends derive two independent key sets, "client→server" and "server→client", from a 32-byte PSK, so reflecting a peer's packet back to it fails authentication;
 - **Never respond to authentication failures**: `anl_input` returns `ANL_EAUTH` and the caller must drop the packet silently, so active probing gets no response at all;
-- **No plaintext features on the wire**: even conv, version, packet type and sequence numbers are inside the ciphertext; the wire shows only a random-looking 12-byte tag and random ciphertext;
-- **Random padding**: by default 1~32 bytes of random padding are appended to each datagram, so even pure ACK packets have variable length;
-- **Replay**: a time window on the datagram ts (default 1 s) rejects packets that lingered too long; duplicates within the window are removed by sequence number;
+- **conv is visible**: version, packet type, sequence numbers and payload are encrypted. Anyone knowing the masking algorithm can recover conv without a key and correlate packets from the same connection; masking provides no confidentiality;
+- **Random padding**: by default datagrams without DATA/PARITY get 1~32 random padding bytes, limited by available MTU space. DATA/PARITY datagrams are not padded; keepalives are always padded;
+- **Replay**: the datagram timestamp window (default 1 s) and sequence window filter old data. The 16-bit timestamp wraps every 65.5 s, so this is not complete replay protection (DESIGN 4.2);
 - **Forgery**: success probability per attempt is 2⁻⁹⁶.
 
 **Known limitations** (evaluate before use):
@@ -200,7 +200,7 @@ Coverage:
 | Semi-reliable streams | 0% / 5% loss, with and without FEC, 1 Mbps congestion; frame numbers, `lost_before` accounting closes |
 | FEC | Specific datagram drops (last fragment of a frame, 3 scattered, 4 consecutive) must be recovered by RS within one RTT; adaptive redundancy (falls to the floor without loss, rises on late losses, does not rise when retransmission is in time); audio + video streams adapting simultaneously; PARITY segment fuzzing |
 | Key frames | Sender clears dependent frames in flight; receiver discards undecodable P-frames |
-| Stream lifecycle | Open-send-close; semi-reliable abort; reliable half-close; 100 streams opened on each side (with 10% loss); stream ID limit and no sid reuse; handle lifetime; accept callback and limit |
+| Stream lifecycle | Local close and the peer's RST; semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit and no sid reuse; handle lifetime; accept callback |
 | Scheduling and congestion control | Priority (5 combinations × BBR / BBR + rate cap); pacing burst cap; fragment size; links with RTT under 2 ms |
 | Application interface | `target_rate`: an encoder following it climbs to the link rate and keeps up after a bandwidth drop; delay reports: measured on the receiver, received by the sender |
 | Robustness | Recovery after a 5 s outage; protocol violation (RST); fuzzing with 20000 randomly mutated datagrams |

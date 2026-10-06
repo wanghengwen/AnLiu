@@ -62,6 +62,13 @@ if(BUILD_TESTING)
         target_link_libraries(test_fec_diag PRIVATE m)
     endif()
     add_test(NAME anliu.fec_accounting COMMAND test_fec_diag)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME anliu.comparison_validation
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/realnet/srt/test_cmp_checks.py)
+        set_tests_properties(anliu.comparison_validation PROPERTIES TIMEOUT 30)
+    endif()
 endif()
 
 if(UNIX AND (ANLIU_BUILD_BENCHMARKS OR

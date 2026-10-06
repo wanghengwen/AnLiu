@@ -13,6 +13,7 @@ latency after it was sent (TSBPD), so subtracting its own minimum would hide
 that latency; this base does not."""
 import json, glob, re, statistics, collections, sys
 from pathlib import Path
+from cmp_checks import validate_lane
 B = Path(__import__('os').environ.get('ANL_REALNET_WORK', '.')).resolve()   # results/ of cmp_round.py
 BUDGET = {1: 150000, 2: 300000}
 DUR_DEFAULT = 600
@@ -52,9 +53,15 @@ def analyse(meta):
     for name in meta['protocols']:
         srv = (B / 'results' / f'{tag}.{name}.srv').read_text(errors='replace')
         cli = (B / 'results' / f'{tag}.{name}.cli').read_text(errors='replace')
+        errors = validate_lane(name, dur, srv, cli, require_exit=bool(meta.get('validation_version')))
+        if errors:
+            raise ValueError(f'{tag} {name}: ' + '; '.join(errors))
         raw[name] = (anl_delays if name.startswith('anl') else srt_delays)(srv, cli)
         rows[name] = {'srt_stats': [l for l in srv.splitlines() + cli.splitlines() if l.startswith('SRTSTAT')]}
-    base = min(d for n in raw if n.startswith('anl') for (f, s), d in raw[n][1].items() if f == 1)
+    anl_audio = [d for n in raw if n.startswith('anl') for (f, s), d in raw[n][1].items() if f == 1]
+    if not anl_audio:                   # logs not fetched yet: the round is still running
+        return None
+    base = min(anl_audio)
     for name, (sent, rcv) in raw.items():
         r = rows[name]
         for f, fname in ((1, 'audio'), (2, 'video')):
@@ -79,14 +86,20 @@ def analyse(meta):
 
 if __name__ == '__main__':
     path_of = lambda m: ('LAN' if m['rtt_min_ms'] < 10 else '~100ms' if m['rtt_min_ms'] < 135 else '~170ms' if m['rtt_min_ms'] < 220
-                         else f"{m['rtt_min_ms']:.0f}ms")
+                         else f"{m['rtt_min_ms']:.0f}ms") + (f"+{m['delay_ms']}" if m.get('delay_ms') else '')
     agg = collections.defaultdict(list)
     for f in sorted(glob.glob(str(B / 'results' / 'cmp_*.json'))):
         m = json.load(open(f))
         if not m.get('valid'):
             continue
-        rows = analyse(m)
-        print(f"{m['sender']}>{m['receiver']} rtt {m['rtt_min_ms']:.1f} rate {m['rate_kbps']} loss {m['loss_pct']}% seed {m['seed']}")
+        try:
+            rows = analyse(m)
+        except (OSError, ValueError) as e:
+            print(f'SKIP invalid comparison: {e}', file=sys.stderr)
+            continue
+        if rows is None:
+            continue
+        print(f"{m['sender']}>{m['receiver']} rtt {m['rtt_min_ms']:.1f}{' +delay %d' % m['delay_ms'] if m.get('delay_ms') else ''} rate {m['rate_kbps']} loss {m['loss_pct']}% seed {m['seed']}")
         for name, r in rows.items():
             lf = f"{r['loss_fwd']:.2f}/{r['loss_rev']:.2f}" if r['loss_fwd'] is not None else '-'
             print(f"  {name:8} audio {r['audio']['ontime']:6.2f} ({r['audio']['delivered']:6.2f} p50 {r['audio']['p50']:6.1f}) "

@@ -31,9 +31,13 @@
 #include "../anliu.h"
 static void loss_data(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void loss_parity(const anl_t *, int, uint32_t);
+static void loss_commit(const anl_t *, uint32_t, int);
+static void loss_trim(const anl_t *, uint32_t);
 static void loss_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
 #define ANL_DATA_SEG_TRACE(w, st, bytes, first) loss_data(w, st, seg, bytes, first)
 #define ANL_PARITY_SEG_TRACE loss_parity
+#define ANL_SEG_COMMIT_TRACE loss_commit
+#define ANL_SEG_TRIM_TRACE loss_trim
 #define ANL_FEC_BLOCK_TRACE(w, st, k, m) loss_block(w, st, k, m, lmax, key)
 static void loss_rtx(const anl_t *, const anl_stream_t *, const void *, int);
 static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t);
@@ -51,6 +55,16 @@ static gcc_t g_gcc;
 
 static const anl_t *owner;
 static uint64_t first_bytes[2], retry_bytes[2], parity_bytes[2];
+static uint64_t *last_cost;
+static void loss_commit(const anl_t *w, uint32_t bytes, int data)
+{
+    (void)bytes; (void)data;
+    if (w == owner) last_cost = NULL;
+}
+static void loss_trim(const anl_t *w, uint32_t bytes)
+{
+    if (w == owner && last_cost) *last_cost -= bytes;
+}
 static unsigned max_xmit[2][30001], latency_ms[2][30001], frame_bytes[2][30001];
 static unsigned sent_ms[2][30001], received_ms[2][30001];
 static unsigned blocks[2], small_blocks[2];
@@ -121,12 +135,16 @@ static void loss_data(const anl_t *w, const anl_stream_t *st, const void *p, uin
     int id = st->tag;
     if (w != owner || id < 0 || id > 1) return;
     if (first) first_bytes[id] += bytes; else retry_bytes[id] += bytes;
+    last_cost = first ? &first_bytes[id] : &retry_bytes[id];
     if (seg->frame_no < 30001 && max_xmit[id][seg->frame_no] < seg->xmit + 1)
         max_xmit[id][seg->frame_no] = seg->xmit + 1;
 }
 static void loss_parity(const anl_t *w, int sid, uint32_t bytes)
 {
-    if (w == owner && sget(w, sid)->tag <= 1) parity_bytes[sget(w, sid)->tag] += bytes;
+    if (w == owner && sget(w, sid)->tag <= 1) {
+        last_cost = &parity_bytes[sget(w, sid)->tag];
+        *last_cost += bytes;
+    }
 }
 static void loss_adapt(anl_t *w, uint32_t target, void *user)
 {

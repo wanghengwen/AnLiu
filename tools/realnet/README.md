@@ -57,3 +57,9 @@ python3 tools/realnet/srt/cmp_ana.py
 ```
 
 `cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；统计口径见 COMPARISON.md 2.1。
+
+`--delay MS` 只增加发送方向的时延，因此 `srt-rec` 的延迟取 `max(120, ceil(4 × (ping RTT + MS)))` 毫秒。结果记录原始 `rtt_min_ms` 和包含人工延迟的 `effective_rtt_ms`。
+
+有效轮次要求两端正常退出、运行时长完整、末尾 HEALTH 正常、发送端音频/视频序号分别覆盖 `duration × 50/30` 帧，并具备接收记录和 TC 字节计数。丢帧和 SRT 发送失败仍计入质量结果，不能仅因到达率低而排除轮次。脚本将退出码和运行秒数写入日志末尾的 `CMP_EXIT`；分析脚本重新检查完整性，旧日志没有该标记时仍检查 HEALTH 与完整发送序列。
+
+离线验证无需主机表或 libsrt：`python3 tools/realnet/srt/test_cmp_checks.py`；本地有 Python3 时 CTest 也会运行。

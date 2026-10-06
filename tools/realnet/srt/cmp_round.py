@@ -6,13 +6,15 @@ directions done by tc (multi_tc.py --loss: gact on the sender's egress filter
 and on its ingress for the peer's datagrams) - no in-application drop.
 
 Usage: cmp_round.py SENDER RECEIVER RATE_KBPS LOSS SEED PORTBASE [--dur S] [--anl VARIANT]
-                    [--protos NAME,...] [--drive-check]
+                    [--protos NAME,...] [--drive-check] [--delay MS]
 Hosts from ANL_REALNET_HOSTS (../hosts.py). --anl names the AnLiu variant
 deployed with ../deploy.py (default main); srtnet is expected at
 base/ANL_REALNET_REMOTE_DIR/srt/srtnet on both hosts (deploy_srt.py).
 --protos picks the protocols run side by side (default anl,srt-b,srt-fec,srt-rec;
 ports PORTBASE+0.. in that order); --drive-check drives AnLiu by anl_check
-(REALNET_DRIVE=check) instead of 1 ms polling. Protocols:
+(REALNET_DRIVE=check) instead of 1 ms polling; --delay adds MS of one-way
+delay (tc netem under each band's TBF, sender to receiver: the RTT grows by
+MS). Protocols:
   anl      realnet --proto anl, RTT-auto FEC, fixed video scale 1000 (no encoder feedback)
   anl-nf   the same with FEC off (--fec-rtt-auto 0): retransmission only
   anl-nf-aN  anl-nf with the audio receiver gap wait at N ms (--rcv-deadline-audio N)
@@ -22,12 +24,15 @@ ports PORTBASE+0.. in that order); --drive-check drives AnLiu by anl_check
   srt-rec  SRT latency max(120, 4 x RTT) for both (SRT's usual guidance)
 Logs and per-band tc counters go to ANL_REALNET_WORK/results/<tag>.*; analysis: cmp_ana.py."""
 import sys, os, re, json, time, subprocess, shlex, gzip, hashlib, pathlib
+from cmp_checks import recommended_latency, validate_lane
 B = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(B.parent))
 import hosts as H
 HOSTS = H.load()
 argv = sys.argv[1:]
-dur = 600; anl_variant = 'main'
+dur = 600; anl_variant = 'main'; delay = 0
+if '--delay' in argv:
+    i = argv.index('--delay'); delay = int(argv[i + 1]); argv = argv[:i] + argv[i + 2:]
 if '--dur' in argv:
     i = argv.index('--dur'); dur = int(argv[i + 1]); argv = argv[:i] + argv[i + 2:]
 if '--anl' in argv:
@@ -44,7 +49,9 @@ q = shlex.quote
 tag = f'cmp_{snd}{rcv}_{rate}_l{loss}_seed{seed}_{time.time_ns()}'
 RES = H.WORK / 'results'; RES.mkdir(exist_ok=True)
 SSH = ['ssh', '-x', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', '-o', 'ServerAliveInterval=10',
-       '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/anliu-cmp-%C', '-o', 'ControlPersist=900']
+       # one control master per lane (port base): two lanes racing to create the same master
+       # stalled an ssh for 30 s, long enough for a waiting AnLiu server to die of idleness
+       '-o', 'ControlMaster=auto', '-o', f'ControlPath=/tmp/anliu-cmp-%C-{pbase}', '-o', 'ControlPersist=900']
 
 
 def ssh(h, cmd, check=True, timeout=120):
@@ -80,7 +87,9 @@ try:
         if ping is not None: break
     if ping is None: raise RuntimeError('no ping: ' + out)
     meta['rtt_min_ms'] = ping
-    rec_lat = max(120, int(4 * ping))
+    rec_lat = recommended_latency(ping, delay)
+    meta['effective_rtt_ms'] = ping + delay
+    meta['validation_version'] = 1
     known = dict([('anl', 1), ('anl-nf', 0), ('srt-b', (120, 250, '')), ('srt-fec', (120, 250, 'fec,cols:10,rows:5,layout:staircase,arq:onreq')),
                   ('srt-rec', (rec_lat, rec_lat, ''))])
     for n in want:
@@ -89,6 +98,7 @@ try:
         elif '@' in n: known[n] = known[base]
     protos = [(n, known[n]) for n in want]
     meta['drive'] = 'check' if drive_check else 'poll1ms'
+    meta['delay_ms'] = delay
     subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(B.parent / 'multi_tc.py'),
                     S['ssh'] + ':' + CMP(S) + '/multi_tc.py'], check=True, timeout=120)
     for k, (name, cfg) in enumerate(protos):
@@ -96,17 +106,23 @@ try:
         busy = ssh(S, f"ss -uan | grep -E '[:.]{port}[[:space:]]' || true").stdout.strip()
         if busy: raise RuntimeError(f'port {port} busy')
         state = CMP(S) + f'/mtc-state-{tag}-{name}.json'
-        o = ssh(S, f"python3 {CMP(S)}/multi_tc.py setup --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()
+        o = ssh(S, f"python3 {CMP(S)}/multi_tc.py setup --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --delay {delay} --state {state}").stdout.decode()
         band = int(o.split('band')[-1].split()[0])
         bands[name] = (port, band, state)
-        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 900} </dev/null > {CMP(S)}/logs/deadman_{port}.log 2>&1 &")
+        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 2700} </dev/null > {CMP(S)}/logs/deadman_{port}.log 2>&1 &")
         meta['protocols'][name] = dict(port=port, band=band, cfg=cfg)
         if name.startswith('anl'):
             meta['protocols'][name]['revision'] = json.loads((H.WORK / lane_variant(name) / 'deployment-manifest.json').read_text())['revision']
 
     def start(h, name, role, cmd, env=''):
         rel = f"logs/{tag}.{name}.{role}"; log = f"{CMP(h)}/{rel}"
-        ssh(h, f"cd $HOME/{CMP(h)} || exit 1; {env} setsid nohup {cmd} > {rel} 2>&1 < /dev/null & echo $! > $HOME/{log}.pid")
+        # The detached shell records the child's exit, including a crash. Its
+        # process group is retained for cleanup if the command does not finish.
+        wrapped = ('cmp_begin=$(date +%s); ' + cmd + '; cmp_rc=$?; '
+                   'cmp_end=$(date +%s); '
+                   'printf "CMP_EXIT rc=%s elapsed_s=%s\\n" "$cmp_rc" "$((cmp_end-cmp_begin))"; '
+                   'exit "$cmp_rc"')
+        ssh(h, f"cd $HOME/{CMP(h)} || exit 1; {env} setsid nohup sh -c {q(wrapped)} > {rel} 2>&1 < /dev/null & echo $! > $HOME/{log}.pid")
         procs.append((h, log))
         return log
 
@@ -150,18 +166,29 @@ try:
     for name, (port, band, state) in bands.items():
         qd = [x for x in tcj if x.get('handle') == f'{0x6b0 + band:x}:']
         meta['protocols'][name]['tc'] = {k: qd[0].get(k) for k in ('bytes', 'packets', 'drops', 'overlimits')} if qd else None
+        if not qd or qd[0].get('bytes') is None:
+            raise RuntimeError(f'{name}: missing tc byte counter')
+    fetched = {}
     for (name, role), log in logs.items():
         h = S if role == 'srv' else C
         data = gzip.decompress(ssh(h, 'gzip -c ' + q(log), timeout=300).stdout)
         (RES / f'{tag}.{name}.{role}').write_bytes(data)
+        fetched[name, role] = data.decode(errors='replace')
         meta['protocols'][name][role + '_sha256'] = hashlib.sha256(data).hexdigest()
+    for name, _ in protos:
+        errors = validate_lane(name, dur, fetched[name, 'srv'], fetched[name, 'cli'])
+        if errors:
+            raise RuntimeError(f'{name}: ' + '; '.join(errors))
     meta['valid'] = True
 except Exception as e:
     meta['errors'] = [str(e)]
     print('CMP_FAILURE', e, flush=True)
 finally:
     for h, log in procs:
-        ssh(h, f"kill $(cat {log}.pid) 2>/dev/null; true", check=False)
+        try:
+            ssh(h, f"kill -- -$(cat {log}.pid) 2>/dev/null; true", check=False)
+        except Exception as e:
+            meta.setdefault('errors', []).append('stop ' + str(e)); meta['valid'] = False
     for name, (port, band, state) in bands.items():
         try:
             o = ssh(S, f"python3 {CMP(S)}/multi_tc.py clear --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()

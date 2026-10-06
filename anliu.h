@@ -5,11 +5,14 @@
  * See DESIGN.md for the wire format and protocol rules.
  *
  * Threading: like ikcp, all calls on one anl_t must be serialised by the
- * caller. Different anl_t instances share no state (except anl_allocator).
+ * caller. Different anl_t instances share only immutable GF tables and the
+ * allocator hooks. Set anl_allocator before creating any connections; do not
+ * change hooks while allocated objects remain alive or calls run concurrently.
  *
- * Re-entrancy: anl_flush, anl_send_frame (flush_on_send) and anl_input
- * (immediate ACKs) may invoke the output callback synchronously. The output
- * callback must not call any anl_* function.
+ * Re-entrancy: anl_flush, anl_update, anl_input (immediate ACKs),
+ * anl_stream_open (the OPEN announcement) and the send calls of a stream
+ * with flush_on_send may invoke the output callback synchronously. The
+ * output callback must not call any anl_* function.
  */
 #ifndef ANLIU_H
 #define ANLIU_H
@@ -29,7 +32,8 @@ extern "C" {
 #define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
                                                varint extension (DESIGN 5); never reused: about
                                                2^24 opens per side */
-#define ANL_MAX_STREAMS     8192    /* upper bound of max_peer_streams (streams open at once) */
+#define ANL_MAX_STREAMS     64      /* streams on a connection at once, both sides' and the
+                                       default stream included (DESIGN 6.1) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
 #define ANL_MAX_WND         32768   /* 24-bit sn requires wnd << 2^23; window fields are 16 bits */
 #define ANL_MAX_PRIO        4       /* prio 0 (highest) .. 3 */
@@ -57,11 +61,11 @@ extern "C" {
 #define ANL_ECONV          -9       /* conv mismatch */
 #define ANL_EFORMAT       -10       /* malformed packet */
 #define ANL_ENOMEM        -11       /* allocation failed */
-#define ANL_ECLOSED       -13       /* stream closed (by either side) or reset by the peer */
+#define ANL_ECLOSED       -13       /* stream reset: the peer does not have it (any more) */
 #define ANL_ESTALE        -14       /* datagram ts outside time window, dropped */
 #define ANL_EDEAD         -15       /* connection is dead (dead_link / idle timeout) */
-#define ANL_EBUSY         -16       /* no free sid (ANL_MAX_SID reached), or SID_WIN (8192) sids
-                                       opened that the peer has not heard of yet: retry later */
+#define ANL_EBUSY         -16       /* no free sid (ANL_MAX_SID reached); or, retry later: ANL_MAX_STREAMS
+                                       streams on the connection */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -85,8 +89,7 @@ extern "C" {
 /* stream states as reported by anl_stream_get_stats */
 #define ANL_STREAM_OPENING  0       /* opened here, nothing heard from the peer yet (data is sent anyway) */
 #define ANL_STREAM_OPEN     1
-#define ANL_STREAM_CLOSING  2       /* close requested; draining snd_buf / waiting peer CLOSE */
-#define ANL_STREAM_CLOSED   3       /* incl. streams reset by the peer */
+#define ANL_STREAM_CLOSED   2       /* reset: refused or dropped by the peer, or a rule broken */
 
 /*---------------------------------------------------------------------
  * configuration
@@ -105,15 +108,14 @@ typedef struct anl_config {
     int interval;               /* 20 ms (ikcp default is 100) */
     int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
                                   also seeds pacing before the first bandwidth sample */
-    int dead_link;              /* 20 retransmissions (data / FWD / CLOSE, not OPEN) */
+    int dead_link;              /* 20: reliable DATA dies at xmit >= dead_link (first send
+                                   included); FWD at retries > dead_link; OPEN excluded */
     int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2) */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
     int idle_timeout_ms;        /* SERVER default 30000, CLIENT default 0 */
     int pace_rate;              /* bytes/s; 0 = BBR alone (gain * bandwidth estimate), > 0 = upper
                                    bound on the BBR rate (e.g. an uplink quota) */
     int pace_burst;             /* token bucket size in bytes; 0 = 4 * mtu */
-    int rcv_limit_bytes;        /* connection-wide receive buffer cap; 16 MB, 0 = unlimited */
-    int max_peer_streams;       /* streams the peer may have open at once; 4096, <= ANL_MAX_STREAMS */
     int default_snd_wnd;        /* default stream (sid 0) send window, 4096 */
     int default_rcv_wnd;        /* default stream (sid 0) receive window, 4096 */
     int start_rate;             /* bytes/s; 0 (default) = off. The rate the path is expected to
@@ -144,16 +146,17 @@ typedef struct anl_stream_opt {
                                    failure after the first retry exceed the parity failure target.
                                    Off below 3/4 of the deadline or 0.25% loss,
                                    at most one switch per 2 s.
-                                   Small frames (audio, cheap): on the repair time alone unless the
-                                   path never lost a packet; with drop_until_key key frames are
+                                   Small frames (audio, cheap): repair time plus hard loss evidence
+                                   within 30 s; a one-time startup allowance lasts at most
+                                   2 srtt (capped at 1 s). With drop_until_key key frames are
                                    judged on their own send time and protected while the loss is
                                    unknown (the first key frame).
                                    Auto reserves FEC buffers/MSS from open, so it can switch
                                    without resegmenting queued data. Enable at both ends. */
     int fec_ratio;              /* FEC redundancy, parities per 100 data packets 1..100, default 25:
-                                   Reed-Solomon over blocks of up to 100 ms (DESIGN 8); exact on
-                                   average, the rounding remainder carries to the next block (a
-                                   block may get none); 0 = adaptive 10..100, from the losses the
+                                   Reed-Solomon: fixed blocks 100 ms, adaptive up to 400 ms
+                                   (DESIGN 8). The rounding remainder carries to the next block
+                                   (a block may get none), subject to the 16-parity block cap; 0 = adaptive 10..100, from the losses the
                                    peer reports FEC did not repair (8.5), with a loss floor within
                                    a parity budget (8.6). ANL_FEC_RTT_AUTO always uses adaptive. */
     int fec_deadline_ms;        /* adaptive FEC: a loss whose estimated recovery arrives within this
@@ -205,7 +208,8 @@ typedef struct anl_stats {
     uint32_t pace_rate;                 /* effective pacing rate, bytes/s */
     uint32_t target_rate;               /* payload bytes/s the application may send over all streams:
                                            bw_estimate less headers, FEC parities, retransmissions and
-                                           a 10% margin; grows 10%/s while app-limited (DESIGN 6.10) */
+                                           a 10% margin; ordinary growth at most 25%/s,
+                                           including app-limited probing (DESIGN 6.10) */
     uint32_t rcv_bytes;                 /* bytes held in all receive buffers */
     uint64_t tx_datagrams, rx_datagrams;
     uint64_t rx_auth_fail, rx_stale;    /* ANL_EAUTH / ANL_ESTALE drops */
@@ -265,7 +269,8 @@ typedef int (*anl_output_fn)(char *buf, int len, anl_t *w, void *user);
  * rcv_wnd, and the callback may change any local option except those four.
  * Return 0 to accept (the application then owns s and must anl_stream_close
  * it), < 0 to refuse (s is freed, the peer gets an RST). Like the output
- * callback it must not call any anl_* function, except anl_stream_set_user. */
+ * callback it may only call anl_stream_set_user and the read-only stream
+ * metadata getters (id, tag, conn, get_user). */
 typedef int (*anl_accept_fn)(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user);
 
 /* Called from anl_update / anl_input / anl_flush when stats.target_rate
@@ -315,7 +320,8 @@ void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
 int      anl_input(anl_t *w, const char *data, long size);
 
 /* Drive timers; current is a monotonic millisecond clock. anl_check also
- * accounts for pacing: drive a timer from its return value (1..5 ms
+ * accounts for pacing, keepalive (when output is set), and idle timeout:
+ * drive a timer from its return value (1..5 ms
  * resolution recommended for real-time streams) to get smooth output. */
 void     anl_update(anl_t *w, uint32_t current);
 uint32_t anl_check(const anl_t *w, uint32_t current);
@@ -341,36 +347,28 @@ anl_stream_t *anl_default_stream(anl_t *w);
 /*---------------------------------------------------------------------
  * streams (handles)
  *
- * Lifetime follows sockets: a handle is valid from anl_stream_open (or the
- * accept callback) until the application calls anl_stream_close on it (or
- * anl_release). A stream closed or reset by the peer keeps its handle; calls
- * then return ANL_ECLOSED and the application still has to close it.
+ * A handle is valid from anl_stream_open (or the accept callback) until the
+ * application calls anl_stream_close on it (or anl_release). Closing is
+ * local: nothing tells the peer, which keeps its end until its own
+ * application closes it. A stream the peer resets (it has no stream for a
+ * segment of ours: closed there, refused) keeps its handle; calls then
+ * return ANL_ECLOSED and the application still has to close it.
  *---------------------------------------------------------------------*/
 /* Opens a stream with an automatically allocated sid (client even from 2,
  * server odd). There is no handshake: the first segments carry the stream
  * parameters and the peer creates the stream on arrival.
  * Returns NULL on failure with the reason in *err (optional):
- * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (no free sid) / ANL_ENOMEM. */
+ * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (ANL_MAX_STREAMS open, or no free sid) / ANL_ENOMEM. */
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
-/* Close and release the handle. Reliable: orderly, unsent data is still
- * delivered; the peer's direction is closed too (its sends return
- * ANL_ECLOSED, what it queued before is still delivered and discarded here).
- * Semi-reliable: abort, frames in flight are dropped on both sides. Unread
- * received data is discarded. Afterwards the handle must not be used. The
- * default stream cannot be closed (ANL_EINVAL). */
+/* Release the stream here and the handle: unsent, unacknowledged and unread
+ * data is dropped, the place in the sid table is free at once. Nothing is
+ * sent: a stream whose data must arrive is closed once anl_stream_waitsnd is
+ * 0. Afterwards the handle must not be used. The default stream cannot be
+ * closed (ANL_EINVAL). */
 int      anl_stream_close(anl_stream_t *s);
 
-/* Reliable only: half-close (TCP shutdown(SHUT_WR)). No more sending (sends
- * return ANL_ECLOSED), what was sent is still delivered and the peer reads
- * end of stream after it; receiving goes on until the peer closes or shuts
- * down its direction. The handle stays valid: release it with
- * anl_stream_close. ANL_EMODE on a semi-reliable stream, ANL_EINVAL on the
- * default stream. */
-int      anl_stream_shutdown(anl_stream_t *s);
-
-/* reliable stream: ikcp semantics. recv returns ANL_ECLOSED once the peer has
- * closed the stream and everything has been read (end of stream). */
+/* reliable stream: ikcp semantics; ANL_ECLOSED once reset */
 int      anl_stream_send(anl_stream_t *s, const char *buf, int len);
 int      anl_stream_recv(anl_stream_t *s, char *buf, int len);
 
@@ -380,7 +378,7 @@ int      anl_stream_send_frame(anl_stream_t *s, int flags, const char *buf, int 
                                uint32_t *frame_no);
 int      anl_stream_recv_frame(anl_stream_t *s, char *buf, int len, anl_frame_info *info);
 
-/* size of the next message / frame; ANL_EAGAIN if none, ANL_ECLOSED at end */
+/* size of the next message / frame; ANL_EAGAIN if none, ANL_ECLOSED once reset */
 int      anl_stream_peeksize(const anl_stream_t *s);
 /* segments waiting to be sent or acknowledged */
 int      anl_stream_waitsnd(const anl_stream_t *s);
@@ -392,8 +390,8 @@ anl_t   *anl_stream_conn(const anl_stream_t *s);
 void     anl_stream_set_user(anl_stream_t *s, void *user);
 void    *anl_stream_get_user(const anl_stream_t *s);
 
-/* Streams owned by the application that can be read now (data, end of
- * stream or error). Writes up to max handles, returns the total count. */
+/* Streams that can be read now (data, or reset). Writes up to max handles,
+ * returns the total count. */
 int      anl_readable(anl_t *w, anl_stream_t **out, int max);
 
 #ifdef __cplusplus

@@ -117,7 +117,6 @@ int main(int argc, char **argv)
         anl_config_default(&c[i], i);
         memset(c[i].psk, 7, sizeof(c[i].psk));
         c[i].interval = 10;
-        c[i].rcv_limit_bytes = 0;
     }
     g_now = 1000;
     for (i = 0; i < 2; i++) {
