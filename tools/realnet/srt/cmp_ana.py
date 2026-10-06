@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Analysis of cmp_round.py rounds. Per round and protocol: audio / video /
 key frames on time (extra one-way delay within 150 / 300 ms), delivered at
-all, extra delay p50 / p95, timely video kbps, wire kbps (tc band bytes) and
-the tc loss actually applied.
+all, video frames on time and decodable (dec: the frame and every earlier
+frame of its GOP on time - an IPPP decoder cannot use a P frame after a lost
+or late one; SRT still delivers those on time, AnLiu's drop_until_key does
+not), extra delay p50 / p95, timely video kbps, wire kbps (tc band bytes)
+and the tc loss actually applied.
 
 One-way delays are absolute (CLOCK_REALTIME): srtnet stamps both ends with
 it; realnet's monotonic stamps are converted with each host's TIMEBASE
@@ -75,6 +78,11 @@ def analyse(meta):
             if f == 2:
                 kk = [k for k in keys if sent[k][1] == 1]      # sent: (len, key)
                 r['keys'] = 100 * sum(k in good for k in kk) / max(1, len(kk))
+                ok, dec, on = False, 0, set(good)
+                for k in sorted(keys):
+                    ok = (k in on) and (ok or sent[k][1] == 1)   # a key frame starts a GOP
+                    dec += ok
+                r['dec'] = 100 * dec / max(1, len(keys))
         tc = meta['protocols'][name].get('tc') or {}
         r['wire_kbps'] = (tc.get('bytes') or 0) * 8 / dur / 1000
         r['tc_drops'] = tc.get('drops')
@@ -103,13 +111,14 @@ if __name__ == '__main__':
         for name, r in rows.items():
             lf = f"{r['loss_fwd']:.2f}/{r['loss_rev']:.2f}" if r['loss_fwd'] is not None else '-'
             print(f"  {name:8} audio {r['audio']['ontime']:6.2f} ({r['audio']['delivered']:6.2f} p50 {r['audio']['p50']:6.1f}) "
-                  f"video {r['video']['ontime']:6.2f} ({r['video']['delivered']:6.2f} p95 {r['video']['p95']:6.1f}) keys {r['keys']:5.1f} "
+                  f"video {r['video']['ontime']:6.2f} ({r['video']['delivered']:6.2f} p95 {r['video']['p95']:6.1f}) dec {r['dec']:6.2f} keys {r['keys']:5.1f} "
                   f"tvk {r['video']['timely_kbps']:6.1f} wire {r['wire_kbps']:6.1f} loss {lf}")
             agg[(path_of(m), m['loss_pct'], name)].append(r)
-    print('\npath loss proto n | audio on (delivered) | video on (delivered) | keys | timely video kbps | wire kbps | audio p50 / video p95 ms')
-    order = lambda n: ['anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec'].index(n) if n in ('anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec') else 1.5
+    print('\npath loss proto n | audio on (delivered) | video on (delivered) | video on and decodable | keys | timely video kbps | wire kbps | audio p50 / video p95 ms')
+    rank = ['anl', 'anl-nf', 'srt-b', 'srt-fec', 'srt-rec']
+    order = lambda n: rank.index(n) if n in rank else 0.5 if n.startswith('anl-a') else 1.5 if n.startswith('anl') else 5
     for k in sorted(agg, key=lambda k: (k[0], k[1], order(k[2]), k[2])):
         xs = agg[k]; mn = lambda f: statistics.mean(f(x) for x in xs)
         print(f"{k[0]:6} {k[1]:2}% {k[2]:8} {len(xs)} | {mn(lambda x: x['audio']['ontime']):6.2f} ({mn(lambda x: x['audio']['delivered']):6.2f}) | "
-              f"{mn(lambda x: x['video']['ontime']):6.2f} ({mn(lambda x: x['video']['delivered']):6.2f}) | {mn(lambda x: x['keys']):5.1f} | "
+              f"{mn(lambda x: x['video']['ontime']):6.2f} ({mn(lambda x: x['video']['delivered']):6.2f}) | {mn(lambda x: x['dec']):6.2f} | {mn(lambda x: x['keys']):5.1f} | "
               f"{mn(lambda x: x['video']['timely_kbps']):6.1f} | {mn(lambda x: x['wire_kbps']):6.1f} | {mn(lambda x: x['audio']['p50']):6.1f} / {mn(lambda x: x['video']['p95']):6.1f}")

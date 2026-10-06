@@ -18,6 +18,9 @@ MS). Protocols:
   anl      realnet --proto anl, RTT-auto FEC, fixed video scale 1000 (no encoder feedback)
   anl-nf   the same with FEC off (--fec-rtt-auto 0): retransmission only
   anl-nf-aN  anl-nf with the audio receiver gap wait at N ms (--rcv-deadline-audio N)
+  anl-aNvM, anl-nf-aNvM  anl / anl-nf with the receiver gap wait at N ms for audio and M ms
+           for video (--rcv-deadline-audio N --rcv-deadline-video M): a hole is given up
+           near the playout budget, as SRT's latency does, instead of at max_age
   NAME@VARIANT  an AnLiu lane run from another deployed variant (e.g. anl-nf@cand)
   srt-b    SRT latency audio 120 / video 250 ms (the budgets 150 / 300 less margin)
   srt-fec  srt-b + packetfilter fec,cols:10,rows:5,layout:staircase,arq:onreq
@@ -94,7 +97,8 @@ try:
                   ('srt-rec', (rec_lat, rec_lat, ''))])
     for n in want:
         base = n.partition('@')[0]
-        if base.startswith('anl-nf-a'): known[n] = (0, int(base[8:]))
+        g = re.fullmatch(r'(anl|anl-nf)-a(\d+)(?:v(\d+))?', base)
+        if g: known[n] = (0 if g[1] == 'anl-nf' else 1, int(g[2]), int(g[3]) if g[3] else None)
         elif '@' in n: known[n] = known[base]
     protos = [(n, known[n]) for n in want]
     meta['drive'] = 'check' if drive_check else 'poll1ms'
@@ -127,10 +131,11 @@ try:
         return log
 
     def anl_args(cfg):
-        fec, rda = cfg if isinstance(cfg, tuple) else (cfg, None)
+        fec, rda, rdv = cfg if isinstance(cfg, tuple) else (cfg, None, None)
         return (f"--proto anl --test media --dir down --dur {dur} --interval 10 --loss 0 --rx-loss 0 --seed {seed} --rcv-deadline -1 "
                 f"--init-cwnd 16 --fec-rtt-auto {fec} --adapt 0 --prio-audio 0 --prio-video 1"
-                + (f" --rcv-deadline-audio {rda}" if rda is not None else ''))
+                + (f" --rcv-deadline-audio {rda}" if rda is not None else '')
+                + (f" --rcv-deadline-video {rdv}" if rdv is not None else ''))
     anl_env = 'REALNET_MDIAG=1 REALNET_TIMEBASE=1 REALNET_CLOCK=1 REALNET_FECCOST=1 REALNET_FIXED_SCALE=1000' + (' REALNET_DRIVE=check' if drive_check else '')
     logs = {}
     for name, cfg in protos:

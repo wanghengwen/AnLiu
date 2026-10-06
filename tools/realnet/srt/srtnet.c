@@ -187,9 +187,13 @@ static int client(const char *host, int port, int lat_a, int lat_v, const char *
     if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) die("host");
     for (i = 1; i <= 2; i++) {
         const char *sid = i == 1 ? "audio" : "video";
-        int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR, no = 0;
+        int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR, no = 0, conn_ms = 20000;
         s[i] = srt_create_socket();
         srt_setsockflag(s[i], SRTO_LATENCY, &lats[i], sizeof(lats[i]));
+        /* the default 3 s is too short for the handshake at 15% loss each way
+           plus 100..200 ms of delay: the client gave up and the server waited
+           for ever (two of two 15% rounds); the tests start within seconds */
+        srt_setsockflag(s[i], SRTO_CONNTIMEO, &conn_ms, sizeof(conn_ms));
         srt_setsockflag(s[i], SRTO_STREAMID, sid, (int)strlen(sid));
         if (fec && *fec && srt_setsockflag(s[i], SRTO_PACKETFILTER, fec, (int)strlen(fec)) == SRT_ERROR) die("packetfilter");
         if (srt_connect(s[i], (struct sockaddr *)&sa, sizeof(sa)) == SRT_ERROR) die("connect");
