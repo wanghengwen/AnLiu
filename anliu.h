@@ -61,11 +61,12 @@ extern "C" {
 #define ANL_ECONV          -9       /* conv mismatch */
 #define ANL_EFORMAT       -10       /* malformed packet */
 #define ANL_ENOMEM        -11       /* allocation failed */
-#define ANL_ECLOSED       -13       /* stream reset: the peer does not have it (any more) */
+#define ANL_ECLOSED       -13       /* stream over: the peer closed it or does not have it (any more) */
 #define ANL_ESTALE        -14       /* datagram ts outside time window, dropped */
 #define ANL_EDEAD         -15       /* connection is dead (dead_link / idle timeout) */
 #define ANL_EBUSY         -16       /* no free sid (ANL_MAX_SID reached); or, retry later: ANL_MAX_STREAMS
-                                       streams on the connection */
+                                       streams on the connection (closed ones the peer has not
+                                       confirmed yet included) */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -89,7 +90,7 @@ extern "C" {
 /* stream states as reported by anl_stream_get_stats */
 #define ANL_STREAM_OPENING  0       /* opened here, nothing heard from the peer yet (data is sent anyway) */
 #define ANL_STREAM_OPEN     1
-#define ANL_STREAM_CLOSED   2       /* reset: refused or dropped by the peer, or a rule broken */
+#define ANL_STREAM_CLOSED   2       /* closed or refused by the peer, reset, or a rule broken */
 
 /*---------------------------------------------------------------------
  * configuration
@@ -218,6 +219,10 @@ typedef struct anl_stats {
     int capacity_short;                 /* 1: the bottleneck is slower than the media - the path delivers
                                            well under what is sent, or frames expire unsent; adaptive FEC
                                            sends no parity meanwhile (DESIGN 8.6) */
+    uint32_t streams;                   /* streams holding a sid here, both sides' and the default one */
+    uint32_t streams_closing;           /* closed here, the peer's confirmation not in yet (DESIGN 6.1);
+                                           an open fails with ANL_EBUSY once streams + streams_closing
+                                           reaches ANL_MAX_STREAMS */
 } anl_stats;
 
 /* delay seen by a stream's receiver (DESIGN 6.9). Delays are relative to the
@@ -350,11 +355,11 @@ anl_stream_t *anl_default_stream(anl_t *w);
  * streams (handles)
  *
  * A handle is valid from anl_stream_open (or the accept callback) until the
- * application calls anl_stream_close on it (or anl_release). Closing is
- * local: nothing tells the peer, which keeps its end until its own
- * application closes it. A stream the peer resets (it has no stream for a
- * segment of ours: closed there, refused) keeps its handle; calls then
- * return ANL_ECLOSED and the application still has to close it.
+ * application calls anl_stream_close on it (or anl_release). Closing tells
+ * the peer, whose end is then over too. A stream the peer closes, refuses or
+ * resets keeps its handle: what arrived in order before the peer's close
+ * can still be read, then calls return ANL_ECLOSED, and the application
+ * still has to close it.
  *---------------------------------------------------------------------*/
 /* Opens a stream with an automatically allocated sid (client even from 2,
  * server odd). There is no handshake: the first segments carry the stream
@@ -364,13 +369,16 @@ anl_stream_t *anl_default_stream(anl_t *w);
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
 /* Release the stream here and the handle: unsent, unacknowledged and unread
- * data is dropped, the place in the sid table is free at once. Nothing is
- * sent: a stream whose data must arrive is closed once anl_stream_waitsnd is
- * 0. Afterwards the handle must not be used. The default stream cannot be
- * closed (ANL_EINVAL). */
+ * data is dropped; a stream whose data must arrive is closed once
+ * anl_stream_waitsnd is 0. The peer is told (CLOSE, repeated until it
+ * confirms): its end is over, reads there return the data that had arrived
+ * in order and then ANL_ECLOSED. Until the confirmation, about a round
+ * trip, the place counts against anl_stream_open here, not against the
+ * peer's opens. Afterwards the handle must not be used. The default stream
+ * cannot be closed (ANL_EINVAL). */
 int      anl_stream_close(anl_stream_t *s);
 
-/* reliable stream: ikcp semantics; ANL_ECLOSED once reset */
+/* reliable stream: ikcp semantics; ANL_ECLOSED once over (closed by the peer, reset) */
 int      anl_stream_send(anl_stream_t *s, const char *buf, int len);
 int      anl_stream_recv(anl_stream_t *s, char *buf, int len);
 
@@ -380,7 +388,7 @@ int      anl_stream_send_frame(anl_stream_t *s, int flags, const char *buf, int 
                                uint32_t *frame_no);
 int      anl_stream_recv_frame(anl_stream_t *s, char *buf, int len, anl_frame_info *info);
 
-/* size of the next message / frame; ANL_EAGAIN if none, ANL_ECLOSED once reset */
+/* size of the next message / frame; ANL_EAGAIN if none, ANL_ECLOSED once over and read */
 int      anl_stream_peeksize(const anl_stream_t *s);
 /* segments waiting to be sent or acknowledged */
 int      anl_stream_waitsnd(const anl_stream_t *s);
@@ -392,7 +400,7 @@ anl_t   *anl_stream_conn(const anl_stream_t *s);
 void     anl_stream_set_user(anl_stream_t *s, void *user);
 void    *anl_stream_get_user(const anl_stream_t *s);
 
-/* Streams that can be read now (data, or reset). Writes up to max handles,
+/* Streams that can be read now (data, or over). Writes up to max handles,
  * returns the total count. */
 int      anl_readable(anl_t *w, anl_stream_t **out, int max);
 

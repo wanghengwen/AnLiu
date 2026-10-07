@@ -112,6 +112,11 @@ if(ANLIU_BUILD_BENCHMARKS)
         anliu_configure_tool(anl_wndcost)
         target_link_libraries(anl_wndcost PRIVATE anliu)
 
+        # Stream open/close churn over a real UDP path (DESIGN 6.1); includes
+        # anliu.c itself to read the closing records.
+        add_executable(anl_churn bench/churn.c)
+        anliu_configure_tool(anl_churn)
+
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(realnet bench/realnet.c)
             anliu_configure_tool(realnet)

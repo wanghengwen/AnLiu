@@ -40,6 +40,19 @@ python3 tools/realnet/multi_sched_pair.py jobs.jsonl sched-log/
 
 结果在 `$ANL_REALNET_WORK/results/<tag>.{json,srv,cli,bw}`；`analysis/` 里是 performance.md 各批次用过的成对分析脚本。
 
+## 流的打开与关闭（`churn_round.py`）
+
+`bench/churn.c` 在一条真实路径上不停地打开、关闭流，检验关闭握手（CLOSE 重发到对端回 RST，DESIGN 6.1）。两端各自保持最多 N 个本端打开的流（默认 31，两端合计 62 个加默认流不超过 64），按六种方式关闭：可靠流全部确认后关闭（对端必须读到全部消息再得到 `ANL_ECLOSED`）、半可靠流随时关闭、可靠流带在途数据关闭、接收方关闭、两端几乎同时关闭、打开后立即关闭。本端名额计入尚未确认的关闭，因此新开的流不应被对端以表满拒绝；被拒绝、消息缺失或错序、关闭未确认、结束时两端还有残留的流，都算失败。
+
+```sh
+python3 tools/realnet/churn_round.py deploy close WORKTREE g5 rb        # 构建 churn
+python3 tools/realnet/churn_round.py run g5 rb close 1 9850 --loss 5     # 600 s，31 个流，tc 双向 5% 丢包
+python3 tools/realnet/churn_round.py run g5 rb close 1 9850 --loss 5 --delay 100 --conc 12
+python3 tools/realnet/churn_ana.py                                       # 汇总 results/churn_*.json
+```
+
+服务端用 `multi_tc.py` 独占一个频段：TBF 默认 8000 kbit（只是上限），`--loss` 两个方向随机丢包，`--delay` 增加单向时延。每端输出关闭确认时间的分布（从本端关闭到收到对端 RST）、被拒绝的打开数、对端读到的数据，以及结束时的检查（`CHURN_FINAL ok=1`：两端只剩默认流、没有待确认的关闭）。
+
 ## 与 SRT 对比（`srt/`）
 
 `srt/srtnet.c` 用 SRT live 模式发送与 realnet 相同的 frame_v1 负载（音频、视频各一个连接，共用一个 UDP 端口）。仓库不包含 libsrt，需要自行获取并编译（对比使用 1.5.4，关闭加密、静态库）：

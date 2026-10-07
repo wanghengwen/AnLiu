@@ -356,6 +356,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define CTRL_REPORT     0x04    /* receiver's delay report (DESIGN 6.9) */
 #define CTRL_RCV_SKIP   0x05    /* receiver retired a prefix; not delivery credit */
 #define CTRL_ECHO       0x06    /* the peer's datagram ts back: its RTT where it gets no ACK echo */
+#define CTRL_CLOSE      0x07    /* closed here: drop the stream and answer RST (DESIGN 6.1) */
 #define REPORT_BODY     16      /* jitter qavg qmax favg fmax frames skipped fec_rec, u16 each */
 #define REPORT_MIN_MS   100     /* reports every max(srtt, this) while data arrives */
 #define DELAY_WIN_MS    5000    /* base transit: min over two such windows */
@@ -414,6 +415,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define PARITY_HDR      6       /* base(3) k(1) m(1) j(1), after type|sid sub len */
 
 #define SID_WIN         256     /* peer sids opened but not seen yet that are tracked (DESIGN 6.1) */
+#define CLOSE_MAX       (2 * ANL_MAX_STREAMS)   /* streams closed here awaiting the peer's RST; beyond, the oldest is forgotten */
 #define RSTQ_MAX        (2 * ANL_MAX_STREAMS)   /* stateless RSTs per flush; more wait for the peer's next segment */
 #define CANON_HDR_MAX   10      /* b1 frg_ext(varint, up to 5) frame(2) plen(2); the parser bounds
                                    frg below ANL_MAX_WND (a 2-byte extension), the size is defensive */
@@ -842,6 +844,10 @@ struct anl_s {
     anl_stream *dflt;                   /* default stream, sid 0 */
     uint32_t rstq[RSTQ_MAX];            /* pending RSTs for sids without any state, distinct */
     int nrstq;
+    /* streams closed here that the peer may still hold (DESIGN 6.1): CLOSE
+       until its RST, oldest first. Each keeps a place from our opens */
+    struct { uint32_t sid, ts, rto; } clos[CLOSE_MAX];
+    uint32_t nclos;
 
     /* datagram builder */
     char *buf;
@@ -1742,16 +1748,46 @@ static void rstq_push(anl_t *w, int sid)
     if (w->nrstq < RSTQ_MAX) w->rstq[w->nrstq++] = (uint32_t)sid;
 }
 
-/* The stream is over here (closed by the application, reset, or refused):
+static void drop_tail_incomplete(anl_t *w, anl_stream *st);
+
+/* closed here, the peer not known to have dropped it yet (DESIGN 6.1) */
+static int clos_find(const anl_t *w, int sid)
+{
+    uint32_t i;
+    for (i = 0; i < w->nclos; i++)
+        if (w->clos[i].sid == (uint32_t)sid) return (int)i;
+    return -1;
+}
+
+static void clos_drop(anl_t *w, int sid)
+{
+    int i = clos_find(w, sid);
+    if (i < 0) return;
+    w->nclos--;
+    memmove(&w->clos[i], &w->clos[i + 1], (w->nclos - (uint32_t)i) * sizeof(w->clos[0]));
+}
+
+/* CLOSE goes out at the next flush, then with backoff until the peer's RST */
+static void clos_add(anl_t *w, int sid)
+{
+    if (w->nclos == CLOSE_MAX) clos_drop(w, (int)w->clos[0].sid);
+    w->clos[w->nclos].sid = (uint32_t)sid;
+    w->clos[w->nclos].ts = w->current;
+    w->clos[w->nclos].rto = 0;
+    w->nclos++;
+}
+
+/* The stream is over here (closed by either side, reset, or refused):
  * release its buffers and its place in the sid table. The struct itself
  * lives on while the application still holds the handle (DESIGN 6.1).
- * Nothing is sent; the peer's later segments for the sid get RST. */
-static void stream_free(anl_t *w, anl_stream *st)
+ * keep_read: the peer closed it - what arrived in order stays readable. */
+static void stream_free_ex(anl_t *w, anl_stream *st, int keep_read)
 {
     if (st->state == ANL_STREAM_CLOSED) return;     /* reset earlier: nothing left to release */
     free_runs(st);
     free_rcv_list(w, &st->rcv_buf, &st->nrcv_buf);
-    free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);
+    if (keep_read && st->mode == ANL_SEMI) drop_tail_incomplete(w, st);
+    if (!keep_read) free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);
     free_seg_list(&st->snd_queue);
     free_seg_list(&st->snd_buf);
     QINIT(&st->snd_time);
@@ -1764,6 +1800,8 @@ static void stream_free(anl_t *w, anl_stream *st)
     st->state = ANL_STREAM_CLOSED;
     sdetach(w, st);
 }
+
+static void stream_free(anl_t *w, anl_stream *st) { stream_free_ex(w, st, 0); }
 
 /* the peer broke the stream's rules (wrong segment type for the mode,
  * parameter mismatch): drop it here and tell the peer */
@@ -3882,8 +3920,19 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 st = stream_for_open(w, sid, &oi, &urgent);
                 if (st) { st->probe_tell = 1; ctl_mark(st); }   /* a window ACK tells the opener we have it */
             } else if (sub == CTRL_RST) {
-                /* the peer has no stream for the sid (any more): nor do we */
+                /* the peer has no stream for the sid (any more): nor do we,
+                   and a CLOSE of ours is answered */
                 if ((st = sget(w, sid)) != NULL && st != w->dflt) stream_free(w, st);
+                clos_drop(w, sid);
+            } else if (sub == CTRL_CLOSE && sid != ANL_SID_DEFAULT) {
+                /* the peer closed the stream and dropped its end: we drop
+                   ours (what arrived in order stays readable) and answer RST,
+                   every time - an answer may be lost. Both closed: ours is
+                   answered too. Not heard of yet: the sid counts as used */
+                if ((st = sget(w, sid)) != NULL) stream_free_ex(w, st, 1);
+                else { clos_drop(w, sid); (void)peer_sid_new(w, sid); }
+                rstq_push(w, sid);
+                urgent = 1;
             } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
                 st = stream_for_input(w, sid);
                 if (st) handle_report(w, st, p, ts);
@@ -4757,6 +4806,20 @@ static void control_stream(anl_t *w, anl_stream *st)
     }
 }
 
+/* CLOSE of the streams closed here, due ones, until the peer's RST; with
+ * the STREAM_OPEN backoff, not counted towards dead_link (DESIGN 6.1) */
+static void flush_closing(anl_t *w)
+{
+    uint32_t i;
+    for (i = 0; i < w->nclos; i++) {
+        if (tdiff(w->current, w->clos[i].ts) < 0) continue;
+        write_ctrl_seg(w, (int)w->clos[i].sid, CTRL_CLOSE, NULL, 0);
+        w->clos[i].rto = w->clos[i].rto == 0 ? (w->rx_srtt > 0 ? (uint32_t)w->rx_rto : RTO_DEF)
+                                              : umin32(w->clos[i].rto * 2, OPEN_RTO_MAX);
+        w->clos[i].ts = w->current + w->clos[i].rto;
+    }
+}
+
 static void flush_rstq(anl_t *w)
 {
     int i;
@@ -4772,6 +4835,7 @@ static void flush_control_segs(anl_t *w)
     anl_node *n, *nx;
     anl_stream *st;
     FOR_EACH_STREAM(w, st, n, nx) control_stream(w, st);
+    flush_closing(w);
     flush_rstq(w);
 }
 
@@ -4785,6 +4849,7 @@ static void flush_control(anl_t *w)
     if (!w->updated || w->state < 0) return;
     dg_begin(w);
     FOR_EACH_STREAM(w, st, n, nx) if (st->ctl) control_stream(w, st);
+    flush_closing(w);
     flush_rstq(w);
     dg_seal(w);
     w->rx_data_since_ack = 0;
@@ -5632,6 +5697,7 @@ void anl_release(anl_t *w)
     while (!QEMPTY(&w->slist)) {
         anl_stream *st = STREAM_OF(w->slist.next);
         stream_free(w, st);
+        free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);    /* left readable by the peer's CLOSE */
         qdel(&st->lnode);
         anl_free(st);
     }
@@ -5758,6 +5824,8 @@ int anl_get_stats(const anl_t *w, anl_stats *out)
     out->pace_rate = w->pace_rate ? w->pace_rate : compute_pace_rate(w);
     out->target_rate = w->rate_target;
     out->capacity_short = w->capacity_short;
+    out->streams = w->nstab;
+    out->streams_closing = w->nclos;
     out->bw_estimate_age_ms = w->net_sample_ts ? (uint32_t)tdiff(w->current, w->net_sample_ts) : 0xffffffffu;
     out->rcv_bytes = w->rcv_bytes;
     out->tx_datagrams = w->tx_dg;
@@ -5877,8 +5945,10 @@ anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err)
     if ((r = stream_opt_check(opt)) != 0) goto fail;
     if (w->state < 0) { r = ANL_EDEAD; goto fail; }
     /* client even from 2, server odd; never reused within a connection. At
-       most ANL_MAX_STREAMS streams, both sides', hold a sid at once */
-    if (w->next_sid > ANL_MAX_SID || w->nstab == ANL_MAX_STREAMS) { r = ANL_EBUSY; goto fail; }
+       most ANL_MAX_STREAMS streams, both sides', hold a sid at once; one
+       closed here holds its place until the peer has dropped its end too,
+       or the open could reach a peer still full (DESIGN 6.1) */
+    if (w->next_sid > ANL_MAX_SID || w->nstab + w->nclos >= ANL_MAX_STREAMS) { r = ANL_EBUSY; goto fail; }
     st = stream_create(w, (int)w->next_sid, opt);
     if (st == NULL) { r = ANL_ENOMEM; goto fail; }
     w->next_sid += 2;
@@ -5890,18 +5960,23 @@ fail:
     return NULL;
 }
 
-/* local only (DESIGN 6.1): the buffers, the place in the sid table and the
- * handle go at once, nothing is sent - the peer learns of it from the RST
- * its next segment for the stream gets */
+/* DESIGN 6.1: the buffers and the handle go at once; the peer is told with
+ * CLOSE until its RST says it has dropped its end, and our opens count the
+ * stream meanwhile. One the peer has dropped already (reset) is not told. */
 int anl_stream_close(anl_stream_t *st)
 {
     anl_t *w;
+    int notify;
     if (st == NULL) return ANL_EINVAL;
     w = st->w;
     if (st == w->dflt) return ANL_EINVAL;
+    notify = st->state != ANL_STREAM_CLOSED && w->state >= 0;
+    if (notify) clos_add(w, st->sid);
     stream_free(w, st);
+    free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);        /* left readable by the peer's CLOSE */
     qdel(&st->lnode);
     anl_free(st);
+    if (notify) flush_control(w);           /* tell the peer at once */
     return ANL_OK;
 }
 

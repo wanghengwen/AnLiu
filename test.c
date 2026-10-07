@@ -42,6 +42,7 @@ typedef struct net {
     int loss_pct, dup_pct, min_delay, max_delay;
     int reflect;                    /* send packets back to the sender */
     uint32_t drop_at[4];            /* != 0: drop the datagrams with these n->sent numbers */
+    int block[2];                   /* drop everything this side sends (a one-way outage) */
     int reorder;                    /* 1 = jitter may reorder datagrams; 0 = FIFO path */
     uint32_t last_at[2];            /* last scheduled delivery per direction (FIFO) */
     int bandwidth_bps;              /* 0 = unlimited; otherwise a bottleneck queue */
@@ -83,6 +84,7 @@ static int net_output(char *buf, int len, anl_t *w, void *user)
         for (d = 0; d < 4; d++)
             if (n->drop_at[d] != 0 && (uint32_t)n->sent == n->drop_at[d]) { n->lost++; return 0; }
     }
+    if (n->block[from]) { n->lost++; return 0; }
     /* burst measurement over a 5 ms window */
     if ((int32_t)(n->now - n->burst_window_start[from]) >= 5) { n->burst_window_start[from] = n->now; n->burst_window_bytes[from] = 0; }
     n->burst_window_bytes[from] += (uint32_t)len;
@@ -676,51 +678,160 @@ static void test_seg_size(void)
 /* close is local (DESIGN 6.1): the opener sends, waits until everything is
  * acknowledged and closes. Nothing goes to the peer, which keeps its end; its
  * next segment for the stream gets RST */
-static void test_local_close(int loss)
+/* a closed stream's peer is told (DESIGN 6.1): its end is over, the data it
+ * had received in order stays readable, then ECLOSED; the closer's place is
+ * held until the peer's RST confirms */
+static void test_close_notify(int loss)
 {
-    net n; anl_config ca, cb; anl_stream_opt o;
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stats st;
     char buf[5000];
-    int i, got = 0, r = 0;
-    anl_stream_t *a, *b = NULL;
-    printf("[local close: the peer keeps its end, its next segment gets RST, loss=%d%%]\n", loss);
+    int i, got = 0, r = 0, t_close;
+    anl_stream_t *a, *b;
+    printf("[close: the peer is told, unread data stays readable, loss=%d%%]\n", loss);
     net_init(&n, &ca, &cb);
     n.loss_pct = loss;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_RELIABLE);
     o.tag = 4242;
-    a = anl_stream_open(n.ep[0], &o, NULL);
-    for (i = 0; i < 10; i++) { fill_pattern(buf, 4000, (uint32_t)i); CHECK(anl_stream_send(a, buf, 4000) == 0, "send before peer open"); }
-    for (i = 0; i < 20000 && (anl_stream_waitsnd(a) > 0 || got < 10); i++) {
-        anl_stream_t *list[4];
-        int k, cnt;
-        net_tick(&n);
-        cnt = anl_readable(n.ep[1], list, 4);
-        for (k = 0; k < cnt && k < 4; k++) {
-            if (list[k] == anl_default_stream(n.ep[1])) continue;
-            b = list[k];
-            while ((r = anl_stream_recv(b, buf, sizeof(buf))) > 0) { CHECK(check_pattern(buf, r, (uint32_t)got), "content %d", got); got++; }
-        }
-    }
-    CHECK(b && anl_stream_tag(b) == 4242, "peer sees the tag");
-    CHECK(got == 10 && anl_stream_waitsnd(a) == 0, "peer read all 10 messages, all acknowledged (%d)", got);
-    CHECK(anl_stream_close(a) == 0 && stream_count(n.ep[0], NULL) == 0, "closed and freed at once");
-    for (i = 0; i < 2000; i++) net_tick(&n);
-    CHECK(b && stream_state(b) == ANL_STREAM_OPEN && anl_stream_recv(b, buf, sizeof(buf)) == ANL_EAGAIN,
-          "the peer is not told: its end stays open (%d)", b ? stream_state(b) : -1);
-    CHECK(b && anl_stream_send(b, "x", 1) == 0, "the peer sends on it");
-    for (i = 0; i < 10000 && b && stream_state(b) != ANL_STREAM_CLOSED; i++) net_tick(&n);
-    CHECK(b && stream_state(b) == ANL_STREAM_CLOSED, "RST to its data (%d ms)", i);
-    CHECK(b && anl_stream_recv(b, buf, sizeof(buf)) == ANL_ECLOSED && anl_stream_send(b, "y", 1) == ANL_ECLOSED, "reset: ECLOSED");
-    CHECK(b && stream_count(n.ep[1], NULL) == 1 && b->state == ANL_STREAM_CLOSED, "handle kept, place in the sid table freed");
-    if (b) anl_stream_close(b);
-    CHECK(stream_count(n.ep[1], NULL) == 0, "freed after close");
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 10; i++) { fill_pattern(buf, 4000, (uint32_t)i); CHECK(anl_stream_send(a, buf, 4000) == 0, "send"); }
+    for (i = 0; i < 20000 && anl_stream_waitsnd(a) > 0; i++) net_tick(&n);
+    CHECK(anl_stream_waitsnd(a) == 0 && anl_stream_tag(b) == 4242, "all 10 messages acknowledged, none read yet");
+    t_close = (int)n.now;
+    CHECK(anl_stream_close(a) == 0 && stream_count(n.ep[0], NULL) == 0, "closed, handle gone at once");
+    anl_get_stats(n.ep[0], &st);
+    CHECK(st.streams == 1 && st.streams_closing == 1, "the place is held until the peer confirms (%u / %u)",
+          st.streams, st.streams_closing);
+    for (i = 0; i < 20000 && (stream_state(b) != ANL_STREAM_CLOSED || n.ep[0]->nclos > 0); i++) net_tick(&n);
+    CHECK(stream_state(b) == ANL_STREAM_CLOSED, "the peer's end is over (%d)", stream_state(b));
+    CHECK(n.ep[0]->nclos == 0, "the peer's RST confirmed it, %d ms after the close", (int)n.now - t_close);
+    CHECK(n.ep[1]->nstab == 1 && stream_count(n.ep[1], NULL) == 1, "the peer's place is free, its handle kept");
+    CHECK(anl_stream_send(b, "y", 1) == ANL_ECLOSED, "send: ECLOSED");
+    while ((r = anl_stream_recv(b, buf, sizeof(buf))) > 0) { CHECK(r == 4000 && check_pattern(buf, r, (uint32_t)got), "content %d", got); got++; }
+    CHECK(got == 10 && r == ANL_ECLOSED, "the 10 messages read after the close, then ECLOSED (%d, %d)", got, r);
+    CHECK(anl_stream_peeksize(b) == ANL_ECLOSED, "peeksize: ECLOSED");
+    anl_stream_close(b);                    /* over already: nothing to tell */
+    CHECK(stream_count(n.ep[1], NULL) == 0 && n.ep[1]->nclos == 0, "freed after close, no CLOSE of its own");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    printf("  confirmed %d ms after the close\n", (int)n.now - t_close);
     net_stop(&n);
 }
 
-/* a semi-reliable stream closed by its sender: the frames stop, the receiver
- * is not told and keeps its end. Closed by its receiver: the sender's next
- * frames get RST and its sends return ANL_ECLOSED (DESIGN 6.1) */
+/* the CLOSE handshake under one-way outages (DESIGN 6.1): the closer holds
+ * its place until the peer's RST, so an open after a close never reaches a
+ * peer still full; a lost CLOSE or RST is repeated; a stream closed before
+ * the peer heard of it is never created there; both sides closing at once */
+static void test_close_confirm(int loss)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stats st;
+    anl_stream_t *mine[ANL_MAX_STREAMS], *s, *x;
+    char buf[64];
+    int i, k, nopen = 0, err, sid, acc;
+    uint32_t rto0;
+    printf("[close confirmed by the peer's RST, one-way outages, loss=%d%%]\n", loss);
+    net_init(&n, &ca, &cb);
+    n.loss_pct = loss;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.snd_wnd = 4; o.rcv_wnd = 4;
+
+    /* a full table on both sides, all opened here */
+    while ((s = anl_stream_open(n.ep[0], &o, &err)) != NULL) {
+        mine[nopen++] = s;
+        anl_stream_send(s, "m", 1);
+    }
+    for (i = 0; i < 20000; i++) {
+        net_tick(&n);
+        for (k = 0; k < nopen && g_peer[1][mine[k]->sid] && mine[k]->state == ANL_STREAM_OPEN && mine[k]->peer_opened; k++) ;
+        if (k == nopen) break;
+    }
+    CHECK(nopen == ANL_MAX_STREAMS - 1 && n.ep[1]->nstab == ANL_MAX_STREAMS, "both tables full (%d / %u)", nopen, n.ep[1]->nstab);
+
+    /* 1. the CLOSE is lost for 3 s: the place stays taken here */
+    n.block[0] = 1;
+    sid = anl_stream_id(mine[0]);
+    anl_stream_close(mine[0]);
+    mine[0] = NULL;
+    rto0 = 0;
+    for (i = 0; i < 3000; i++) { net_tick(&n); if (i == 0) rto0 = n.ep[0]->clos[0].rto; }
+    anl_get_stats(n.ep[0], &st);
+    CHECK(st.streams == ANL_MAX_STREAMS - 1 && st.streams_closing == 1, "closing: %u streams + %u closing", st.streams, st.streams_closing);
+    CHECK(anl_stream_open(n.ep[0], &o, &err) == NULL && err == ANL_EBUSY, "no open while the peer may still be full (%d)", err);
+    CHECK(n.ep[0]->clos[0].rto > rto0 && n.ep[0]->clos[0].rto <= 5000, "CLOSE resent with backoff (rto %u -> %u)",
+          rto0, n.ep[0]->clos[0].rto);
+    CHECK(g_peer[1][sid] && stream_state(g_peer[1][sid]) == ANL_STREAM_OPEN, "the peer has not heard");
+    n.block[0] = 0;
+    for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
+    CHECK(n.ep[0]->nclos == 0 && stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
+          "confirmed %d ms after the path came back, the peer's place free (%u)", i, n.ep[1]->nstab);
+    anl_stream_close(g_peer[1][sid]);
+    x = anl_stream_open(n.ep[0], &o, &err);
+    CHECK(x != NULL, "the place is free again (%d)", err);
+    if (x) anl_stream_send(x, "n", 1);
+    for (i = 0; i < 20000 && x && (stream_state(x) != ANL_STREAM_OPEN || !g_peer[1][anl_stream_id(x)]); i++) net_tick(&n);
+    CHECK(x && stream_state(x) == ANL_STREAM_OPEN && g_peer[1][anl_stream_id(x)], "and the peer accepts it (%d)",
+          x ? stream_state(x) : -1);
+    mine[0] = x;
+
+    /* 2. the RST is lost: the peer's end is over, ours waits, CLOSE answered again later */
+    n.block[1] = 1;
+    sid = anl_stream_id(mine[1]);
+    anl_stream_close(mine[1]);
+    mine[1] = NULL;
+    for (i = 0; i < 20000 && (!g_peer[1][sid] || stream_state(g_peer[1][sid]) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    for (i = 0; i < 2000; i++) net_tick(&n);
+    CHECK(stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && n.ep[0]->nclos == 1, "the peer dropped it, the RST lost (%u)",
+          n.ep[0]->nclos);
+    anl_stream_close(g_peer[1][sid]);       /* the handle goes; the sid stays used there */
+    n.block[1] = 0;
+    for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "a later CLOSE gets the RST from no state (%d ms)", i);
+
+    /* 3. closed before the peer heard of it: never created there */
+    n.block[0] = 1;
+    acc = g_acc[1];
+    s = anl_stream_open(n.ep[0], &o, &err);
+    CHECK(s != NULL, "open (%d)", err);
+    if (s) {
+        sid = anl_stream_id(s);
+        anl_stream_send(s, "lost", 4);
+        for (i = 0; i < 300; i++) net_tick(&n);
+        anl_stream_close(s);
+        n.block[0] = 0;
+        for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
+        CHECK(n.ep[0]->nclos == 0 && g_acc[1] == acc && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
+              "confirmed, nothing created at the peer (%d accepts)", g_acc[1] - acc);
+        CHECK(peer_sid_new(n.ep[1], sid) == 0, "the sid counts as used there");
+    }
+
+    /* 4. both ends close at once */
+    for (k = 2; k < 6; k++) {
+        sid = anl_stream_id(mine[k]);
+        anl_stream_close(g_peer[1][sid]);
+        anl_stream_close(mine[k]);
+        mine[k] = NULL;
+    }
+    CHECK(n.ep[0]->nclos == 4 && n.ep[1]->nclos == 4, "4 closing on each side");
+    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); i++) net_tick(&n);
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "each one's CLOSE confirms the other's (%d ms)", i);
+
+    for (k = 0; k < nopen; k++) {
+        if (!mine[k]) continue;
+        sid = anl_stream_id(mine[k]);
+        if (g_peer[1][sid]) anl_stream_close(g_peer[1][sid]);
+        anl_stream_close(mine[k]);
+    }
+    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos || n.ep[1]->nstab > 1); i++) net_tick(&n);
+    CHECK(n.ep[0]->nstab == 1 && n.ep[1]->nstab == 1 && n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "all freed and confirmed");
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    (void)buf;
+    net_stop(&n);
+}
+
+/* a semi-reliable stream closed by its sender: the frames stop, the
+ * receiver's end is over. Closed by its receiver: the sender's sends return
+ * ANL_ECLOSED (DESIGN 6.1) */
 static void test_semi_close(int loss, int by_receiver)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
@@ -757,13 +868,15 @@ static void test_semi_close(int loss, int by_receiver)
     }
     CHECK(got > 0, "frames delivered before the close (%d of %d)", got, frames);
     if (by_receiver) CHECK(t_eof >= 0 && t_eof - t_close < 2000, "the sender's frames got RST %d ms after the close", t_eof - t_close);
-    else CHECK(late == 0 && b && stream_state(b) == ANL_STREAM_OPEN, "no frame after the close, the receiver not told (%d after, state %d)",
+    else CHECK(late == 0 && b && stream_state(b) == ANL_STREAM_CLOSED, "no frame after the close, the receiver's end over (%d after, state %d)",
                late, b ? stream_state(b) : -1);
     if (a) anl_stream_close(a);
     if (b) anl_stream_close(b);
+    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); i++) net_tick(&n);
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both sides freed");
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "the close confirmed");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
-    printf("  %d of %d frames delivered%s\n", got, frames, by_receiver ? "" : ", the receiver's end still open");
+    printf("  %d of %d frames delivered\n", got, frames);
     net_stop(&n);
 }
 
@@ -1015,7 +1128,9 @@ static void test_stream_lifecycle(int loss)
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all streams freed (%d / %d)",
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
     if (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)) { dump_streams("A", n.ep[0]); dump_streams("B", n.ep[1]); }
+    for (iter = 0; iter < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); iter++) net_tick(&n);
     CHECK(n.ep[0]->nstab == 1 && n.ep[1]->nstab == 1, "only the default stream holds a sid (%u / %u)", n.ep[0]->nstab, n.ep[1]->nstab);
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "every close confirmed (%u / %u)", n.ep[0]->nclos, n.ep[1]->nclos);
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  %d ms, both sides empty after the close\n", (int)(n.now - 1000));
     net_stop(&n);
@@ -1053,9 +1168,10 @@ static void test_sid_once(void)
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both sides freed right after the close");
     a2 = anl_stream_open(n.ep[0], &o, NULL);
     CHECK(a2 && anl_stream_id(a2) == 302, "sid 300 is never reused (%d)", anl_stream_id(a2));
-    anl_stream_close(a2);                           /* the OPEN went out at open; the close is not sent */
+    anl_stream_close(a2);                           /* the OPEN went out at open, the CLOSE right after */
     for (i = 0; i < 300; i++) net_tick(&n);
-    CHECK(g_peer[1][302] != NULL && anl_stream_peeksize(g_peer[1][302]) == ANL_EAGAIN, "peer got the stream, not told of the close");
+    CHECK(g_peer[1][302] == NULL || anl_stream_peeksize(g_peer[1][302]) == ANL_ECLOSED, "the peer's end, if any, is over");
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nstab == 1, "the close confirmed, nothing held on the peer");
     if (g_peer[1][302]) anl_stream_close(g_peer[1][302]);
     for (i = 0; i < 1500; i++) net_tick(&n);
 
@@ -1138,10 +1254,8 @@ static void test_handle_lifetime(void)
     anl_stream_send(b, "last words", 10);
     for (i = 0; i < 4000 && anl_stream_waitsnd(b) > 0; i++) net_tick(&n);
     anl_stream_close(b);
-    CHECK(anl_stream_recv(a, buf, sizeof(buf)) == 10 && memcmp(buf, "last words", 10) == 0, "data before the close is readable");
-    CHECK(anl_stream_recv(a, buf, sizeof(buf)) == ANL_EAGAIN, "the close is not told");
-    anl_stream_send(a, "reply", 5);                 /* gets RST: the server has no stream any more */
     for (i = 0; i < 1000 && stream_state(a) != ANL_STREAM_CLOSED; i++) net_tick(&n);
+    CHECK(anl_stream_recv(a, buf, sizeof(buf)) == 10 && memcmp(buf, "last words", 10) == 0, "data before the close is readable");
     CHECK(stream_count(n.ep[0], NULL) == 1 && a->state == ANL_STREAM_CLOSED, "handle held, sid released");
     CHECK(stream_state(a) == ANL_STREAM_CLOSED && anl_stream_recv(a, buf, sizeof(buf)) == ANL_ECLOSED, "handle still answers");
     /* the server opens the next stream while the client still holds the old handle */
@@ -1292,7 +1406,8 @@ static void test_max_streams(void)
        each one's open arrives at a full table and is refused */
     anl_stream_close(g_peer[1][anl_stream_id(mine[0])]);
     anl_stream_close(mine[0]);
-    for (iter = 0; iter < 3000 && (stream_count(n.ep[0], NULL) != nopen - 1 || stream_count(n.ep[1], NULL) != nopen - 1); iter++)
+    for (iter = 0; iter < 3000 && (stream_count(n.ep[0], NULL) != nopen - 1 || stream_count(n.ep[1], NULL) != nopen - 1 ||
+                                   n.ep[0]->nclos || n.ep[1]->nclos); iter++)
         net_tick(&n);
     CHECK(n.ep[0]->nstab == ANL_MAX_STREAMS - 1 && n.ep[1]->nstab == ANL_MAX_STREAMS - 1, "a place free (%u / %u)",
           n.ep[0]->nstab, n.ep[1]->nstab);
@@ -1306,6 +1421,7 @@ static void test_max_streams(void)
           "both refused by a full peer (%d / %d)", y ? stream_state(y) : -1, z ? stream_state(z) : -1);
     if (y) anl_stream_close(y);
     if (z) anl_stream_close(z);
+    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "refused streams are not told again");
     x = anl_stream_open(n.ep[0], &o, &err);
     CHECK(x != NULL, "the place is free again (%d)", err);
     for (i = 0; i < 300; i++) net_tick(&n);
@@ -1370,7 +1486,8 @@ static void test_sid_churn(int loss, int TOTAL)
                     anl_stream_close(list[k]);          /* the whole message is here */
                 }
             }
-            if (stream_count(n.ep[0], &left) == 0 && stream_count(n.ep[1], NULL) == 0) break;
+            if (stream_count(n.ep[0], &left) == 0 && stream_count(n.ep[1], NULL) == 0 &&
+                n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0) break;   /* every place free again */
         }
         done += nb;
     }
@@ -3782,9 +3899,11 @@ static void test_outage(void)
     printf("  audio resumed %d ms after the outage, %d frames after; reliable %d/90 messages\n", t_resume, frames_after, rel_got);
     CHECK(t_resume >= 0 && t_resume < 3000 && frames_after > 150, "semi stream resumes");
     CHECK(rel_got == 90, "reliable stream delivered everything (%d)", rel_got);
-    /* a close is local (DESIGN 6.1): gone on its side at once, the peer's end stays */
-    CHECK(stream_count(n.ep[0], NULL) == 2 && stream_state(cb2) == ANL_STREAM_OPEN,
-          "close during the outage: freed here, the peer's end open (%d / %d)", stream_count(n.ep[0], NULL), stream_state(cb2));
+    /* a close during the outage (DESIGN 6.1): gone here at once, its CLOSE
+       repeated until the path is back and the peer's RST confirms it */
+    CHECK(stream_count(n.ep[0], NULL) == 2 && stream_state(cb2) == ANL_STREAM_CLOSED && n.ep[0]->nclos == 0,
+          "close during the outage: freed here, the peer told after it, confirmed (%d / %d / %u)",
+          stream_count(n.ep[0], NULL), stream_state(cb2), n.ep[0]->nclos);
     net_stop(&n);
 }
 
@@ -3940,8 +4059,10 @@ int main(void)
     RUN(test_stale());
     RUN(test_violation());
     RUN(test_seg_size());
-    RUN(test_local_close(0));
-    RUN(test_local_close(15));
+    RUN(test_close_notify(0));
+    RUN(test_close_notify(15));
+    RUN(test_close_confirm(0));
+    RUN(test_close_confirm(10));
     RUN(test_semi_close(0, 0));
     RUN(test_semi_close(10, 0));
     RUN(test_semi_close(10, 1));

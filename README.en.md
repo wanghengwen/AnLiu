@@ -9,7 +9,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Capability | Description |
 |---|---|
 | Encryption and anti-fingerprinting | SIV construction from ChaCha20 + SipHash-2-4; whole-datagram authentication, encryption after conv, per-direction keys, random padding |
-| Multiple streams | Stream IDs are never reused (25 bits); up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); either side can open at any time, a close is local (the peer is not told; its next data gets RST); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
+| Multiple streams | Stream IDs are never reused (25 bits); up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); either side can open and close at any time, a close tells the peer (CLOSE, repeated until the peer confirms); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
 | Semi-reliable frame delivery | Data is sent as "frames"; whole frames are dropped when they expire or back up; key-frame dependency handling; receiver-side frame skipping |
 | Per-stream FEC | Reed-Solomon forward error correction enabled per stream: fixed redundancy (default ratio 25%) or conditional adaptive mode; fixed blocks of 100 ms, adaptive blocks up to 400 ms; any m losses within a block are recoverable |
 | Congestion control and bandwidth estimation | BBRv2 (with BBRv3-style four-phase bandwidth probing): sends according to the measured bottleneck bandwidth and propagation delay without filling the bottleneck queue; the bandwidth estimate is exposed to the application through `anl_get_stats()` for bitrate control |
@@ -125,7 +125,7 @@ AnLiu's approach:
 - **The default stream (sid 0) has strict priority**, suitable for control signaling; other streams have 4 priority levels with per-stream DATA quotas of **8 : 4 : 2 : 1**, retained across flushes. Lower priorities make progress while connection/stream windows permit and the default stream does not continuously consume all sending capacity; these are segment quotas, not wire-byte shares;
 - Retransmissions go before new data, in priority order; retransmissions use at most 3/4 of the sending tokens, so a large lossy stream cannot crowd out new data of real-time streams;
 - Loss detection (RACK) uses delivery evidence from the whole connection: a low-rate control stream with no later fragments of its own can still detect loss promptly from video deliveries;
-- Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing any stream immediately frees local queued, unacknowledged and unread data. To ensure reliable delivery, the application must wait for `anl_stream_waitsnd` to reach zero before closing; the peer application closes its own handle separately.
+- Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing any stream immediately frees local queued, unacknowledged and unread data and tells the peer, whose end is then over: data that had arrived in order can still be read, then calls return `ANL_ECLOSED`, and the peer application closes its own handle. To ensure reliable delivery, the application must wait for `anl_stream_waitsnd` to reach zero before closing.
 
 If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate. Priority and mixed-stream test results are in [performance.md](performance.md).
 
@@ -200,7 +200,7 @@ Coverage:
 | Semi-reliable streams | 0% / 5% loss, with and without FEC, 1 Mbps congestion; frame numbers, `lost_before` accounting closes |
 | FEC | Specific datagram drops (last fragment of a frame, 3 scattered, 4 consecutive) must be recovered by RS within one RTT; adaptive redundancy (falls to the floor without loss, rises on late losses, does not rise when retransmission is in time); audio + video streams adapting simultaneously; PARITY segment fuzzing |
 | Key frames | Sender clears dependent frames in flight; receiver discards undecodable P-frames |
-| Stream lifecycle | Local close and the peer's RST; semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit and no sid reuse; handle lifetime; accept callback |
+| Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit and no sid reuse; handle lifetime; accept callback |
 | Scheduling and congestion control | Priority (5 combinations × BBR / BBR + rate cap); pacing burst cap; fragment size; links with RTT under 2 ms |
 | Application interface | `target_rate`: an encoder following it climbs to the link rate and keeps up after a bandwidth drop; delay reports: measured on the receiver, received by the sender |
 | Robustness | Recovery after a 5 s outage; protocol violation (RST); fuzzing with 20000 randomly mutated datagrams |
