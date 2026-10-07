@@ -556,7 +556,12 @@ static void ep_input(const char *d, int len)
         if (lag > 0 && (uint32_t)lag > g_clk_max_lag) g_clk_max_lag = (uint32_t)lag;
     }
 #endif
-    if (is_anl()) { if (anl_input(g_anl, d, len) < 0) g_input_errors++; TX_OBSERVE(g_anl); return; }
+    if (is_anl()) {
+        int ir = anl_input(g_anl, d, len);
+        if (ir < 0 && ir != ANL_EREPLAY) g_input_errors++;     /* a duplicated datagram is taken once: no error */
+        TX_OBSERVE(g_anl);
+        return;
+    }
     if (len >= 24) {
         IUINT32 conv = ikcp_getconv(d);
         uint32_t id = conv - KCP_CONV0;

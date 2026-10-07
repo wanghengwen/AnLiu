@@ -9,13 +9,13 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Capability | Description |
 |---|---|
 | Encryption and anti-fingerprinting | SIV construction from ChaCha20 + SipHash-2-4; whole-datagram authentication, encryption after conv, per-direction keys, random padding |
-| Multiple streams | Stream IDs are never reused (25 bits); up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); either side can open and close at any time, a close tells the peer (CLOSE, repeated until the peer confirms); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
+| Multiple streams | Up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); a stream ID is the lowest free one, used again 2 s after its close is confirmed, with a generation number telling the two apart; either side can open and close at any time, a close tells the peer (CLOSE, repeated until the peer confirms); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
 | Semi-reliable frame delivery | Data is sent as "frames"; whole frames are dropped when they expire or back up; key-frame dependency handling; receiver-side frame skipping |
 | Per-stream FEC | Reed-Solomon forward error correction enabled per stream: fixed redundancy (default ratio 25%) or conditional adaptive mode; fixed blocks of 100 ms, adaptive blocks up to 400 ms; any m losses within a block are recoverable |
 | Congestion control and bandwidth estimation | BBRv2 (with BBRv3-style four-phase bandwidth probing): sends according to the measured bottleneck bandwidth and propagation delay without filling the bottleneck queue; the bandwidth estimate is exposed to the application through `anl_get_stats()` for bitrate control |
 | Smooth sending | Connection-level token-bucket pacing (rate = gain × bandwidth estimate); large frames are never sent as a full-window burst |
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
-| Compact headers | 19-byte datagram header (including 12-byte authentication tag), 6~7-byte base DATA segment header at the default MTU, or 5 bytes when the last segment omits its length; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
+| Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU, or 5 bytes when the last segment omits its length; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
 See [DESIGN.md](DESIGN.md) for the detailed design and [performance.md](performance.md) for performance data; comparison tools are in `bench/`. (Both documents are currently in Chinese.)
 
@@ -163,7 +163,7 @@ Test conditions and historical data for simulated networks, real UDP paths, thro
 - **Never respond to authentication failures**: `anl_input` returns `ANL_EAUTH` and the caller must drop the packet silently, so active probing gets no response at all;
 - **conv is visible**: version, packet type, sequence numbers and payload are encrypted. Anyone knowing the masking algorithm can recover conv without a key and correlate packets from the same connection; masking provides no confidentiality;
 - **Random padding**: by default datagrams without DATA/PARITY get 1~32 random padding bytes, limited by available MTU space. DATA/PARITY datagrams are not padded; keepalives are always padded;
-- **Replay**: the datagram timestamp window (default 1 s) and sequence window filter old data. The 16-bit timestamp wraps every 65.5 s, so this is not complete replay protection (DESIGN 4.2);
+- **Replay**: every datagram carries its direction's packet number and the receiver remembers the last 4096; a repeated or older datagram is dropped after authentication (`ANL_EREPLAY`) without parsing any segment (DESIGN 4.3). The timestamp window (default 1 s) still drops datagrams held up for too long and a clock that went backwards (DESIGN 4.2). A replayed datagram still costs its decryption and authentication;
 - **Forgery**: success probability per attempt is 2⁻⁹⁶.
 
 **Known limitations** (evaluate before use):
@@ -195,12 +195,12 @@ Coverage:
 
 | Category | Tests |
 |---|---|
-| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` without keys, conv masking and tamper detection); reflection attack; stale replay |
+| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` without keys, conv masking and tamper detection); reflection attack; replay (packet-number window: duplicate, reordered inside the window, below it, a jump ahead) and a stale timestamp |
 | Reliable streams | 0% / 10% loss, message mode and byte-stream mode, content and order checks |
 | Semi-reliable streams | 0% / 5% loss, with and without FEC, 1 Mbps congestion; frame numbers, `lost_before` accounting closes |
 | FEC | Specific datagram drops (last fragment of a frame, 3 scattered, 4 consecutive) must be recovered by RS within one RTT; adaptive redundancy (falls to the floor without loss, rises on late losses, does not rise when retransmission is in time); audio + video streams adapting simultaneously; PARITY segment fuzzing |
 | Key frames | Sender clears dependent frames in flight; receiver discards undecodable P-frames |
-| Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit and no sid reuse; handle lifetime; accept callback |
+| Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit; sid reuse (lowest free, 2 s hold, a late first datagram of the earlier generation gets RST, 9000 opens and closes with 10% loss and duplicates); handle lifetime; accept callback |
 | Scheduling and congestion control | Priority (5 combinations × BBR / BBR + rate cap); pacing burst cap; fragment size; links with RTT under 2 ms |
 | Application interface | `target_rate`: an encoder following it climbs to the link rate and keeps up after a bandwidth drop; delay reports: measured on the receiver, received by the sender |
 | Robustness | Recovery after a 5 s outage; protocol violation (RST); fuzzing with 20000 randomly mutated datagrams |

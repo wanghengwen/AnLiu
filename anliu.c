@@ -375,6 +375,9 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define OPEN_BODY       5       /* ob(1) rcv_wnd(2) tag(2) */
 #define OB_SEMI         0x01
 #define OB_STREAM       0x02
+#define OB_GEN_SHIFT    2       /* ob bits 7-2: the stream's generation - which use of its sid (DESIGN 6.1) */
+#define GEN_MASK        0x3f
+#define GEN_ANY         -1      /* an RST with no body: whatever generation */
 
 #define FLG_PAD         0x01
 #define FLG_VER_MASK    0xc0
@@ -414,7 +417,12 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define REO_DECAY       16      /* round trips without a spurious retransmission before it shrinks */
 #define PARITY_HDR      6       /* base(3) k(1) m(1) j(1), after type|sid sub len */
 
-#define SID_WIN         256     /* peer sids opened but not seen yet that are tracked (DESIGN 6.1) */
+#define PN_WIN          4096    /* datagram pns below the largest seen that are remembered (DESIGN 4.3); a power of 2 */
+#define SID_HOLD_MS     2000    /* a sid whose stream is gone is neither allocated nor accepted for this long (DESIGN 6.1) */
+#define SID_HOLD_LONG   0x7fffffffu /* ... or, given up on telling the peer, for as good as ever (24 days) */
+#define HELD_SLOTS      1024    /* such sids remembered, in a slot per sid (held_slot): a sid HELD_SLOTS apart
+                                   that died meanwhile takes the slot - a hold cut short only under more
+                                   than 512 streams of one side going in SID_HOLD_MS */
 #define CLOSE_MAX       (2 * ANL_MAX_STREAMS)   /* streams closed here awaiting the peer's RST; beyond, the oldest is forgotten */
 #define RSTQ_MAX        (2 * ANL_MAX_STREAMS)   /* stateless RSTs per flush; more wait for the peer's next segment */
 #define CANON_HDR_MAX   10      /* b1 frg_ext(varint, up to 5) frame(2) plen(2); the parser bounds
@@ -443,7 +451,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define BBR_LT_ROUNDS       4       /* rounds per policer-detection interval (and >= BBR_LT_MS) */
 #define BBR_LT_MS           300
 #define LT_GAP_MS           5000    /* after an input gap: its losses and backlog are no policer evidence */
-#define SEG_WIRE_OVH        30      /* per-segment share of datagram / segment headers */
+#define SEG_WIRE_OVH        34      /* per-segment share of datagram / segment headers (ANL_OVERHEAD 23 + a DATA header) */
 #define START_WND_MS    300     /* cfg.start_rate: initial window of this long at that rate */
 #define START_IPUDP     28      /* ... a wire rate: each datagram's IPv4 + UDP header counts against it */
 #define START_BURST_MTU 1       /* ... and pace_burst (unless set) in datagrams */
@@ -591,6 +599,8 @@ typedef struct anl_stream {
 
     /* open */
     int peer_opened;        /* the peer has this stream: stop sending the parameters */
+    int gen;                /* the generation of its sid (OB_GEN_SHIFT): a CLOSE or RST of another
+                               generation is about an earlier stream of the same sid */
     uint32_t open_ts, open_rto;
 
     /* semi-reliable */
@@ -796,11 +806,10 @@ struct anl_s {
     anl_stream *stab[ANL_MAX_STREAMS];  /* the streams that hold a sid, unordered (sget scans them) */
     uint32_t nstab;
     anl_node slist;                     /* every stream struct */
-    uint32_t next_sid;                  /* sids are never reused: client 2,4,6.. server 1,3,5.. */
-    /* the peer's sids seen here (a late first segment gets RST), index (sid - first) / 2:
-       every index below the floor, a bitmap for the SID_WIN above it (peer_sid_new) */
-    uint32_t peer_floor;
-    uint8_t peer_seen[SID_WIN / 8];
+    uint32_t sid_base;                  /* our sids: the lowest free one from here up (client 2,4,6.. server 1,3,5..) */
+    struct { uint32_t sid, until; int gen; } held[HELD_SLOTS];  /* sids whose stream went (sid 0: empty slot): out of
+                                                        use until then, and the generation it had (the next one of ours is gen + 1) */
+    int gen_ctr;                        /* the generation of a sid not remembered here */
     anl_accept_fn accept_cb;
     anl_rate_fn rate_cb;
     anl_report_fn report_cb;
@@ -842,11 +851,11 @@ struct anl_s {
     uint32_t rate_rtt_min, rate_rtt_old, rate_rtt_ts;  /* min srtt over 15..30 s (two windows) */
     uint32_t pay_avg_prev;              /* pay_avg a step ago: delivery trails sending by a round trip, about a step */
     anl_stream *dflt;                   /* default stream, sid 0 */
-    uint32_t rstq[RSTQ_MAX];            /* pending RSTs for sids without any state, distinct */
+    struct { uint32_t sid; int gen; } rstq[RSTQ_MAX];   /* pending RSTs for sids without any state, distinct */
     int nrstq;
     /* streams closed here that the peer may still hold (DESIGN 6.1): CLOSE
        until its RST, oldest first. Each keeps a place from our opens */
-    struct { uint32_t sid, ts, rto; } clos[CLOSE_MAX];
+    struct { uint32_t sid, ts, rto; int gen; } clos[CLOSE_MAX];
     uint32_t nclos;
 
     /* datagram builder */
@@ -867,7 +876,11 @@ struct anl_s {
 
     /* stats */
     uint32_t retrans_total;
-    uint64_t tx_dg, rx_dg, rx_auth_fail, rx_stale;
+    uint64_t tx_dg, rx_dg, rx_auth_fail, rx_stale, rx_replay;
+    uint32_t tx_pn;                     /* the next datagram's pn (DESIGN 4.3) */
+    uint32_t rx_pn_max;                 /* the largest pn authenticated and taken, and the PN_WIN below it */
+    int rx_pn_valid;
+    uint8_t rx_pn_seen[PN_WIN / 8];
 };
 
 static anl_seg *seg_new(uint32_t len)
@@ -933,35 +946,61 @@ static void sdetach(anl_t *w, anl_stream *st)
         if (w->stab[i] == st) { w->stab[i] = w->stab[--w->nstab]; break; }
 }
 
-/* sids (DESIGN 6.1): client even from 2, server odd from 1, each side's in ascending order */
+/* sids (DESIGN 6.1): client even from 2, server odd from 1 */
 static uint32_t sid_first(int role) { return role == ANL_ROLE_CLIENT ? 2u : 1u; }
+static int clos_find(const anl_t *w, int sid);
 
-#define SEEN_BIT(bits, i)   ((bits)[((i) % SID_WIN) >> 3] & (1u << ((i) & 7)))
+/* Held sids (DESIGN 6.1): a stream's sid stays out of use for SID_HOLD_MS
+ * after the stream went, on both sides - the owner does not allocate it, the
+ * peer does not accept its generation again (a late first segment of the old
+ * stream gets RST, not a new stream). The entry also remembers the generation
+ * the sid had, for as long as no other sid takes its slot (held_slot) */
+/* a slot per sid: the two parities apart, then by rank within the parity -
+   sids in use are the lowest free ones, so the slots of a side's recent
+   streams stay distinct up to 512 of them */
+static int held_slot(int sid) { return (int)((((uint32_t)sid >> 1) % (HELD_SLOTS / 2)) * 2 + ((uint32_t)sid & 1)); }
 
-/* 1: a sid of the peer's not seen before, now marked; 0: seen, or not the
- * peer's. A sid SID_WIN or more past the floor moves the window up, and what
- * it leaves behind counts as seen: nothing ever announces a stream the peer
- * closed before we heard of it */
-static int peer_sid_new(anl_t *w, int sid)
+static int held_find(const anl_t *w, int sid)
 {
-    uint32_t first = sid_first(1 - w->role), i;
-    uint8_t *bits = w->peer_seen;
-    if (sid <= 0 || ((uint32_t)sid & 1) != (first & 1)) return 0;
-    i = ((uint32_t)sid - first) / 2;
-    if (i < w->peer_floor) return 0;
-    if (i - w->peer_floor >= SID_WIN) {
-        uint32_t f = i - SID_WIN + 1;
-        if (f - w->peer_floor >= SID_WIN) memset(bits, 0, SID_WIN / 8);
-        else for (; w->peer_floor < f; w->peer_floor++) bits[(w->peer_floor % SID_WIN) >> 3] &= (uint8_t)~(1u << (w->peer_floor & 7));
-        w->peer_floor = f;
+    int i = held_slot(sid);
+    return sid > 0 && w->held[i].sid == (uint32_t)sid ? i : -1;
+}
+
+static int sid_held(const anl_t *w, int sid)
+{
+    int i = held_find(w, sid);
+    return i >= 0 && tdiff(w->current, w->held[i].until) < 0;
+}
+
+static void sid_hold(anl_t *w, int sid, int gen, uint32_t ms)
+{
+    int i;
+    if (sid <= 0) return;
+    i = held_slot(sid);
+    if (w->held[i].sid != (uint32_t)sid) {
+        w->held[i].sid = (uint32_t)sid;
+        w->held[i].until = w->current + ms;
+        w->held[i].gen = gen == GEN_ANY ? w->gen_ctr++ & GEN_MASK : gen;
+    } else {
+        if (tdiff(w->current + ms, w->held[i].until) > 0) w->held[i].until = w->current + ms;
+        if (gen != GEN_ANY) w->held[i].gen = gen;
     }
-    if (SEEN_BIT(bits, i)) return 0;
-    bits[(i % SID_WIN) >> 3] |= (uint8_t)(1u << (i & 7));
-    while (SEEN_BIT(bits, w->peer_floor)) {
-        bits[(w->peer_floor % SID_WIN) >> 3] &= (uint8_t)~(1u << (w->peer_floor & 7));
-        w->peer_floor++;
+}
+
+/* the lowest sid of our parity that no stream here holds, no close of ours
+ * awaits the peer's RST for, and no hold keeps out of use; its generation is
+ * the next after the one it had */
+static int sid_alloc(anl_t *w, int *gen)
+{
+    uint32_t sid;
+    for (sid = w->sid_base; sid <= (uint32_t)ANL_MAX_SID; sid += 2) {
+        int i;
+        if (sget(w, sid) != NULL || clos_find(w, (int)sid) >= 0) continue;
+        if ((i = held_find(w, (int)sid)) >= 0 && tdiff(w->current, w->held[i].until) < 0) continue;
+        *gen = (i >= 0 ? w->held[i].gen + 1 : w->gen_ctr++) & GEN_MASK;
+        return (int)sid;
     }
-    return 1;
+    return -1;
 }
 
 static uint32_t sid_bytes(int sid)
@@ -986,13 +1025,13 @@ static char *enc_sid(char *p, int type, int sid)
 /* stream parameters chosen by the opener (DESIGN 5.2 / 6.1) */
 static char *enc_open_body(char *p, const anl_stream *st)
 {
-    p = enc8(p, (uint8_t)((st->mode == ANL_SEMI ? OB_SEMI : 0) | (st->stream ? OB_STREAM : 0)));
+    p = enc8(p, (uint8_t)((st->mode == ANL_SEMI ? OB_SEMI : 0) | (st->stream ? OB_STREAM : 0) | (st->gen << OB_GEN_SHIFT)));
     p = enc16(p, (uint16_t)st->rcv_wnd);
     return enc16(p, (uint16_t)st->tag);
 }
 
 typedef struct open_info {
-    int mode, stream, tag;
+    int mode, stream, tag, gen;
     uint32_t rcv_wnd;
 } open_info;
 
@@ -1001,6 +1040,7 @@ static void dec_open_body(const char **p, open_info *oi)
     uint8_t ob = dec8(p);
     oi->mode = (ob & OB_SEMI) ? ANL_SEMI : ANL_RELIABLE;
     oi->stream = oi->mode == ANL_RELIABLE && (ob & OB_STREAM);
+    oi->gen = ob >> OB_GEN_SHIFT;
     oi->rcv_wnd = dec16(p);
     oi->tag = dec16(p);
 }
@@ -1181,7 +1221,8 @@ static void dg_output(anl_t *w, int force_pad)
     p = w->buf + ANL_TAG_SIZE;
     p = enc32(p, w->conv);
     p = enc8(p, flg);
-    (void)enc16(p, (uint16_t)w->current);
+    p = enc16(p, (uint16_t)w->current);
+    (void)enc32(p, w->tx_pn++);             /* every datagram its own, retransmissions too (DESIGN 4.3) */
 
     siv_seal(&w->keys, w->role, (uint8_t *)w->buf, w->ptr - ANL_TAG_SIZE);
     w->output(w->buf, (int)w->ptr, w, w->user);
@@ -1358,7 +1399,13 @@ static void write_open_seg(anl_t *w, const anl_stream *st)
 }
 
 /* RST: we have no stream for the sid (DESIGN 6.1) */
-static void write_rst_seg(anl_t *w, int sid) { write_ctrl_seg(w, sid, CTRL_RST, NULL, 0); }
+/* RST: with the generation it is about, or without one for a stream whose
+ * generation is unknown here (DATA without the parameters) */
+static void write_rst_seg(anl_t *w, int sid, int gen)
+{
+    uint8_t body = (uint8_t)gen;
+    write_ctrl_seg(w, sid, CTRL_RST, &body, gen == GEN_ANY ? 0 : 1);
+}
 
 static uint32_t wnd_unused(const anl_stream *st)
 {
@@ -1739,13 +1786,13 @@ static void free_rcv_list(anl_t *w, anl_node *head, uint32_t *count)
 }
 
 /* RST for a sid without stream state (stateless, deduped per flush) */
-static void rstq_push(anl_t *w, int sid)
+static void rstq_push(anl_t *w, int sid, int gen)
 {
     int i;
     if (sid <= 0) return;                   /* the default stream always has state */
     for (i = 0; i < w->nrstq; i++)
-        if (w->rstq[i] == (uint32_t)sid) return;
-    if (w->nrstq < RSTQ_MAX) w->rstq[w->nrstq++] = (uint32_t)sid;
+        if (w->rstq[i].sid == (uint32_t)sid) { if (w->rstq[i].gen != gen) w->rstq[i].gen = GEN_ANY; return; }
+    if (w->nrstq < RSTQ_MAX) { w->rstq[w->nrstq].sid = (uint32_t)sid; w->rstq[w->nrstq].gen = gen; w->nrstq++; }
 }
 
 static void drop_tail_incomplete(anl_t *w, anl_stream *st);
@@ -1768,12 +1815,17 @@ static void clos_drop(anl_t *w, int sid)
 }
 
 /* CLOSE goes out at the next flush, then with backoff until the peer's RST */
-static void clos_add(anl_t *w, int sid)
+static void clos_add(anl_t *w, int sid, int gen)
 {
-    if (w->nclos == CLOSE_MAX) clos_drop(w, (int)w->clos[0].sid);
+    if (w->nclos == CLOSE_MAX) {
+        /* given up on telling the peer: it may keep its end for good, the sid is not used again */
+        sid_hold(w, (int)w->clos[0].sid, w->clos[0].gen, SID_HOLD_LONG);
+        clos_drop(w, (int)w->clos[0].sid);
+    }
     w->clos[w->nclos].sid = (uint32_t)sid;
     w->clos[w->nclos].ts = w->current;
     w->clos[w->nclos].rto = 0;
+    w->clos[w->nclos].gen = gen;
     w->nclos++;
 }
 
@@ -1799,6 +1851,7 @@ static void stream_free_ex(anl_t *w, anl_stream *st, int keep_read)
     st->ack_pending = st->probe_ask = st->probe_tell = st->ctl = 0;
     st->state = ANL_STREAM_CLOSED;
     sdetach(w, st);
+    sid_hold(w, st->sid, st->gen, SID_HOLD_MS);
 }
 
 static void stream_free(anl_t *w, anl_stream *st) { stream_free_ex(w, st, 0); }
@@ -1807,7 +1860,7 @@ static void stream_free(anl_t *w, anl_stream *st) { stream_free_ex(w, st, 0); }
  * parameter mismatch): drop it here and tell the peer */
 static void stream_reset(anl_t *w, anl_stream *st)
 {
-    rstq_push(w, st->sid);
+    rstq_push(w, st->sid, st->gen);
     stream_free(w, st);
 }
 
@@ -3675,6 +3728,7 @@ static anl_stream *accept_stream(anl_t *w, int sid, const open_info *oi)
     st = stream_create(w, sid, &opt);
     if (st == NULL) return NULL;
     st->peer_opened = 1;
+    st->gen = oi->gen;
     if (w->accept_cb) {
         if (w->accept_cb(w, st, &opt, w->user) < 0) goto refuse;
         opt.mode = oi->mode;
@@ -3692,15 +3746,46 @@ refuse:
 }
 
 /* the stream a DATA / OPEN carrying the stream parameters belongs to; created
- * on first sight. A sid is used once per connection: a late first segment of
- * a stream that is already gone gets RST instead of a new stream, and so does
- * a sid of our own parity that we do not have (one of ours that is gone) */
+ * on first sight. The generation tells a new stream of a sid from a late
+ * first segment of an earlier one (DESIGN 6.1): the latter gets RST while the
+ * sid is held, so does a sid of our own parity that we do not have (one of
+ * ours that is gone), and so does one refused here (its hold keeps the
+ * opener's retries from the accept callback until its RST gets through). A
+ * new generation while we are still closing the old stream, or still hold
+ * its sid: the opener is done with that one - so are we */
+/* generation a is after b: up to half the 6-bit circle ahead */
+static int gen_after(int a, int b)
+{
+    int d = (a - b) & GEN_MASK;
+    return d != 0 && d <= GEN_MASK / 2;
+}
+
 static anl_stream *stream_for_open(anl_t *w, int sid, const open_info *oi, int *urgent)
 {
     anl_stream *st = sget(w, sid);
+    int ours = sid > 0 && ((uint32_t)sid & 1) == (sid_first(w->role) & 1);
+    /* generations are the peer's own streams': the default stream and ours
+       go by the mode check below */
+    if (st != NULL && sid != ANL_SID_DEFAULT && !ours && st->gen != oi->gen) {
+        if (!gen_after(oi->gen, st->gen)) {
+            /* a late first segment of an earlier generation: that stream is
+               over, the one here stays */
+            rstq_push(w, sid, oi->gen);
+            *urgent = 1;
+            return NULL;
+        }
+        /* the opener is on to the next generation: the one here missed its
+           CLOSE (lost, or still on its way) and is over */
+        stream_free(w, st);
+        st = NULL;
+    }
     if (st == NULL) {
-        if (w->state < 0 || !peer_sid_new(w, sid) || (st = accept_stream(w, sid, oi)) == NULL) {
-            rstq_push(w, sid);
+        int i, late;
+        if ((i = clos_find(w, sid)) >= 0 && w->clos[i].gen != oi->gen) clos_drop(w, sid);
+        late = clos_find(w, sid) >= 0 || (sid_held(w, sid) && w->held[held_find(w, sid)].gen == oi->gen);
+        if (w->state < 0 || ours || late || (st = accept_stream(w, sid, oi)) == NULL) {
+            rstq_push(w, sid, oi->gen);
+            if (!ours) sid_hold(w, sid, oi->gen, SID_HOLD_MS);
             *urgent = 1;
         }
         return st;
@@ -3714,13 +3799,44 @@ static anl_stream *stream_for_open(anl_t *w, int sid, const open_info *oi, int *
 }
 
 /*--------------------------------------------------------------------
+ * datagram pn: the replay window (DESIGN 4.3)
+ *-------------------------------------------------------------------*/
+#define PN_BIT(w, pn)   ((w)->rx_pn_seen[((pn) % PN_WIN) >> 3] & (1u << ((pn) & 7)))
+
+/* 1: taken already, or more than PN_WIN below the largest taken */
+static int pn_seen(const anl_t *w, uint32_t pn)
+{
+    if (!w->rx_pn_valid || tdiff(pn, w->rx_pn_max) > 0) return 0;
+    if (w->rx_pn_max - pn >= PN_WIN) return 1;          /* unsigned: 2^31 behind is behind too */
+    return PN_BIT(w, pn) != 0;
+}
+
+/* the datagram is taken: remember its pn; a larger one moves the window up */
+static void pn_take(anl_t *w, uint32_t pn)
+{
+    if (!w->rx_pn_valid) {
+        memset(w->rx_pn_seen, 0, sizeof(w->rx_pn_seen));
+        w->rx_pn_valid = 1;
+        w->rx_pn_max = pn;
+    } else if (tdiff(pn, w->rx_pn_max) > 0) {
+        if (tdiff(pn, w->rx_pn_max) >= PN_WIN) memset(w->rx_pn_seen, 0, sizeof(w->rx_pn_seen));
+        else {
+            uint32_t i;
+            for (i = w->rx_pn_max + 1; i != pn; i++) w->rx_pn_seen[(i % PN_WIN) >> 3] &= (uint8_t)~(1u << (i & 7));
+        }
+        w->rx_pn_max = pn;
+    }
+    w->rx_pn_seen[(pn % PN_WIN) >> 3] |= (uint8_t)(1u << (pn & 7));
+}
+
+/*--------------------------------------------------------------------
  * datagram parsing (DESIGN 3.3 step 5 onwards)
  *-------------------------------------------------------------------*/
 /* plaintext P that siv_open verified (test.c feeds crafted ones) */
 static int anl_input_plain(anl_t *w, const char *plain, long size)
 {
     const char *p, *end;
-    uint32_t conv, ts, ref;
+    uint32_t conv, ts, ref, pn;
     uint16_t ts16, echo_prev = 0;
     uint8_t flg;
     int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0, echo_prev_ok = 0;
@@ -3738,8 +3854,15 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
     conv = dec32(&p);
     flg = dec8(&p);
     ts16 = dec16(&p);
+    pn = dec32(&p);
     if ((flg & FLG_VER_MASK) != (ANL_VERSION << 6) || (flg & FLG_RSV_MASK)) return ANL_EFORMAT;
     if (conv != w->conv) return ANL_ECONV;
+    /* a pn taken already, or below the window of the last PN_WIN: a replay or
+       a datagram that late (DESIGN 4.3); nothing of it is looked at */
+    if (pn_seen(w, pn)) {
+        w->rx_replay++;
+        return ANL_EREPLAY;
+    }
     /* the 16-bit ts, extended around where the peer's clock should be now:
        the last ts plus the time since here - a pause longer than the 65 s wrap
        does not make every later datagram look old (DESIGN 4.2) */
@@ -3763,6 +3886,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
         w->peer_ts_at = w->current;
     }
     w->peer_ts_valid = 1;
+    pn_take(w, pn);
     /* A delivery gap can release buffered ACKs together on resumption.
        Ordinary, continuously arriving ACKs must still measure queue delay. */
     if (w->rx_srtt > 0 && tdiff(w->current, w->last_rx) > w->rx_rto) { w->rtt_resume = 1; w->lt_gap_ts = w->current | 1; }
@@ -3831,8 +3955,10 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 st = stream_for_open(w, sid, &oi, &urgent);
             } else if ((st = stream_for_input(w, sid)) == NULL) {
                 /* data for a stream that is not here (any more): the sender
-                   still waits for an ACK, tell it to give up */
-                rstq_push(w, sid);
+                   still waits for an ACK, tell it to give up - the generation
+                   we remember for the sid, or any */
+                int i = held_find(w, sid);
+                rstq_push(w, sid, i >= 0 ? w->held[i].gen : GEN_ANY);
                 urgent = 1;
             }
             if (st) handle_data(w, st, extend24(sn24, st->rcv_nxt), frg, flags, frame16, p, len, ts, 0);
@@ -3919,19 +4045,34 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 urgent = 1;
                 st = stream_for_open(w, sid, &oi, &urgent);
                 if (st) { st->probe_tell = 1; ctl_mark(st); }   /* a window ACK tells the opener we have it */
-            } else if (sub == CTRL_RST) {
-                /* the peer has no stream for the sid (any more): nor do we,
-                   and a CLOSE of ours is answered */
-                if ((st = sget(w, sid)) != NULL && st != w->dflt) stream_free(w, st);
-                clos_drop(w, sid);
+            } else if (sub == CTRL_RST && sid != ANL_SID_DEFAULT) {
+                /* the peer has no stream of this generation for the sid (any
+                   more): nor do we, and a CLOSE of ours is answered; the sid
+                   rests a while. Another generation's: an earlier stream of
+                   the sid, over here already - nothing of ours */
+                int gen = blen >= 1 ? (uint8_t)*p & GEN_MASK : GEN_ANY, i;
+                if ((st = sget(w, sid)) != NULL && (gen == GEN_ANY || st->gen == gen)) stream_free(w, st);
+                if ((i = clos_find(w, sid)) >= 0 && (gen == GEN_ANY || w->clos[i].gen == gen)) clos_drop(w, sid);
+                if (st == NULL) {
+                    /* answered: a hold "for good" (the close given up on, clos_add) ends 2 s from here too */
+                    int h = held_find(w, sid);
+                    if (h >= 0 && (gen == GEN_ANY || w->held[h].gen == gen)) w->held[h].until = w->current + SID_HOLD_MS;
+                    else sid_hold(w, sid, gen, SID_HOLD_MS);
+                }
             } else if (sub == CTRL_CLOSE && sid != ANL_SID_DEFAULT) {
                 /* the peer closed the stream and dropped its end: we drop
                    ours (what arrived in order stays readable) and answer RST,
                    every time - an answer may be lost. Both closed: ours is
-                   answered too. Not heard of yet: the sid counts as used */
-                if ((st = sget(w, sid)) != NULL) stream_free_ex(w, st, 1);
-                else { clos_drop(w, sid); (void)peer_sid_new(w, sid); }
-                rstq_push(w, sid);
+                   answered too. Not heard of yet: the sid rests all the same.
+                   An earlier generation's: that stream is gone here, the
+                   answer is all it wants */
+                int gen = blen >= 1 ? (uint8_t)*p & GEN_MASK : GEN_ANY, i;
+                if ((st = sget(w, sid)) != NULL && (gen == GEN_ANY || st->gen == gen)) stream_free_ex(w, st, 1);
+                else if (st == NULL) {
+                    if ((i = clos_find(w, sid)) >= 0 && (gen == GEN_ANY || w->clos[i].gen == gen)) clos_drop(w, sid);
+                    sid_hold(w, sid, gen, SID_HOLD_MS);
+                }
+                rstq_push(w, sid, gen);
                 urgent = 1;
             } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
                 st = stream_for_input(w, sid);
@@ -4813,7 +4954,10 @@ static void flush_closing(anl_t *w)
     uint32_t i;
     for (i = 0; i < w->nclos; i++) {
         if (tdiff(w->current, w->clos[i].ts) < 0) continue;
-        write_ctrl_seg(w, (int)w->clos[i].sid, CTRL_CLOSE, NULL, 0);
+        {
+            uint8_t body = (uint8_t)w->clos[i].gen;
+            write_ctrl_seg(w, (int)w->clos[i].sid, CTRL_CLOSE, &body, 1);
+        }
         w->clos[i].rto = w->clos[i].rto == 0 ? (w->rx_srtt > 0 ? (uint32_t)w->rx_rto : RTO_DEF)
                                               : umin32(w->clos[i].rto * 2, OPEN_RTO_MAX);
         w->clos[i].ts = w->current + w->clos[i].rto;
@@ -4823,9 +4967,7 @@ static void flush_closing(anl_t *w)
 static void flush_rstq(anl_t *w)
 {
     int i;
-    for (i = 0; i < w->nrstq; i++) {
-        write_rst_seg(w, w->rstq[i]);
-    }
+    for (i = 0; i < w->nrstq; i++) write_rst_seg(w, (int)w->rstq[i].sid, w->rstq[i].gen);
     w->nrstq = 0;
 }
 
@@ -5649,7 +5791,7 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
         w->init_cwnd = ubound32(w->init_cwnd, segs, ANL_MAX_WND);
         if (cfg->pace_burst <= 0) w->pace_burst = START_BURST_MTU * w->mtu;
     }
-    w->next_sid = w->role == ANL_ROLE_CLIENT ? 2 : 1;
+    w->sid_base = sid_first(w->role);
     QINIT(&w->slist);
 
     /* before the first sample: the RTO a first sample of RTO_DEF gives
@@ -5832,6 +5974,7 @@ int anl_get_stats(const anl_t *w, anl_stats *out)
     out->rx_datagrams = w->rx_dg;
     out->rx_auth_fail = w->rx_auth_fail;
     out->rx_stale = w->rx_stale;
+    out->rx_replay = w->rx_replay;
     return ANL_OK;
 }
 
@@ -5939,19 +6082,19 @@ static anl_stream *stream_create(anl_t *w, int sid, const anl_stream_opt *opt)
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err)
 {
     anl_stream *st;
-    int r;
+    int r, sid, gen;
     if (err) *err = ANL_OK;
     if (w == NULL || opt == NULL) { r = ANL_EINVAL; goto fail; }
     if ((r = stream_opt_check(opt)) != 0) goto fail;
     if (w->state < 0) { r = ANL_EDEAD; goto fail; }
-    /* client even from 2, server odd; never reused within a connection. At
-       most ANL_MAX_STREAMS streams, both sides', hold a sid at once; one
-       closed here holds its place until the peer has dropped its end too,
-       or the open could reach a peer still full (DESIGN 6.1) */
-    if (w->next_sid > ANL_MAX_SID || w->nstab + w->nclos >= ANL_MAX_STREAMS) { r = ANL_EBUSY; goto fail; }
-    st = stream_create(w, (int)w->next_sid, opt);
+    /* the lowest free sid of our parity (sid_alloc). At most ANL_MAX_STREAMS
+       streams, both sides', hold a sid at once; one closed here holds its
+       place until the peer has dropped its end too, or the open could reach
+       a peer still full (DESIGN 6.1) */
+    if (w->nstab + w->nclos >= ANL_MAX_STREAMS || (sid = sid_alloc(w, &gen)) < 0) { r = ANL_EBUSY; goto fail; }
+    st = stream_create(w, sid, opt);
     if (st == NULL) { r = ANL_ENOMEM; goto fail; }
-    w->next_sid += 2;
+    st->gen = gen;
     ctl_mark(st);
     flush_control(w);                       /* announce it at once */
     return st;
@@ -5971,7 +6114,7 @@ int anl_stream_close(anl_stream_t *st)
     w = st->w;
     if (st == w->dflt) return ANL_EINVAL;
     notify = st->state != ANL_STREAM_CLOSED && w->state >= 0;
-    if (notify) clos_add(w, st->sid);
+    if (notify) clos_add(w, st->sid, st->gen);
     stream_free(w, st);
     free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);        /* left readable by the peer's CLOSE */
     qdel(&st->lnode);

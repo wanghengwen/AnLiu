@@ -53,6 +53,8 @@ python3 tools/realnet/churn_ana.py                                       # 汇�
 
 服务端用 `multi_tc.py` 独占一个频段：TBF 默认 8000 kbit（只是上限），`--loss` 两个方向随机丢包，`--delay` 增加单向时延。每端输出关闭确认时间的分布（从本端关闭到收到对端 RST）、被拒绝的打开数、对端读到的数据，以及结束时的检查（`CHURN_FINAL ok=1`：两端只剩默认流、没有待确认的关闭）。
 
+sid 会复用（DESIGN 6.1），每条消息因此带打开方的流编号（`uid`，本端打开次数的低 16 位）：接收方记下第一条消息的编号，之后编号不同的消息是同一 sid 上一代流的数据，记为 `gen_errors`。`CHURN_OPEN max_sid` 是本端用到的最大 sid，`CHURN_NET replays` 是路径重复的数据报（`ANL_EREPLAY`，不算错误）。连接在收到握手包时才创建，启动慢的客户端不会让服务端先空闲超时。
+
 ## 与 SRT 对比（`srt/`）
 
 `srt/srtnet.c` 用 SRT live 模式发送与 realnet 相同的 frame_v1 负载（音频、视频各一个连接，共用一个 UDP 端口）。仓库不包含 libsrt，需要自行获取并编译（对比使用 1.5.4，关闭加密、静态库）：

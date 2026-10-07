@@ -30,8 +30,9 @@ extern "C" {
 #define ANL_VERSION         1       /* wire version, flg bit7-6 */
 
 #define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
-                                               varint extension (DESIGN 5); never reused: about
-                                               2^24 opens per side */
+                                               varint extension (DESIGN 5). A sid is the lowest
+                                               free one of its side's parity: one whose stream is
+                                               gone is held back 2 s, then used again (DESIGN 6.1) */
 #define ANL_MAX_STREAMS     64      /* streams on a connection at once, both sides' and the
                                        default stream included (DESIGN 6.1) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
@@ -41,8 +42,8 @@ extern "C" {
 #define ANL_MAX_PAD         255     /* pad length is stored in one byte */
 
 #define ANL_TAG_SIZE        12      /* SipHash-2-4-128 truncated, doubles as nonce */
-#define ANL_HDR_SIZE        7       /* conv(4) + flg(1) + ts(2) */
-#define ANL_OVERHEAD        (ANL_TAG_SIZE + ANL_HDR_SIZE)   /* 19 */
+#define ANL_HDR_SIZE        11      /* conv(4) + flg(1) + ts(2) + pn(4) */
+#define ANL_OVERHEAD        (ANL_TAG_SIZE + ANL_HDR_SIZE)   /* 23 */
 #define ANL_FEC_OVERHEAD    12      /* mss reduction for FEC streams */
 
 /*---------------------------------------------------------------------
@@ -64,9 +65,9 @@ extern "C" {
 #define ANL_ECLOSED       -13       /* stream over: the peer closed it or does not have it (any more) */
 #define ANL_ESTALE        -14       /* datagram ts outside time window, dropped */
 #define ANL_EDEAD         -15       /* connection is dead (dead_link / idle timeout) */
-#define ANL_EBUSY         -16       /* no free sid (ANL_MAX_SID reached); or, retry later: ANL_MAX_STREAMS
-                                       streams on the connection (closed ones the peer has not
-                                       confirmed yet included) */
+#define ANL_EBUSY         -16       /* retry later: ANL_MAX_STREAMS streams on the connection (closed
+                                       ones the peer has not confirmed yet included) */
+#define ANL_EREPLAY       -17       /* datagram pn seen already or below the replay window (DESIGN 4.3), dropped */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -216,6 +217,7 @@ typedef struct anl_stats {
     uint32_t rcv_bytes;                 /* bytes held in all receive buffers */
     uint64_t tx_datagrams, rx_datagrams;
     uint64_t rx_auth_fail, rx_stale;    /* ANL_EAUTH / ANL_ESTALE drops */
+    uint64_t rx_replay;                 /* ANL_EREPLAY drops */
     int capacity_short;                 /* 1: the bottleneck is slower than the media - the path delivers
                                            well under what is sent, or frames expire unsent; adaptive FEC
                                            sends no parity meanwhile (DESIGN 8.6) */
@@ -361,11 +363,13 @@ anl_stream_t *anl_default_stream(anl_t *w);
  * can still be read, then calls return ANL_ECLOSED, and the application
  * still has to close it.
  *---------------------------------------------------------------------*/
-/* Opens a stream with an automatically allocated sid (client even from 2,
- * server odd). There is no handshake: the first segments carry the stream
- * parameters and the peer creates the stream on arrival.
+/* Opens a stream with an automatically allocated sid: the lowest free one of
+ * this side's parity (client even from 2, server odd); a sid whose stream is
+ * gone is used again 2 s after the peer confirmed that (DESIGN 6.1). There is
+ * no handshake: the first segments carry the stream parameters and the peer
+ * creates the stream on arrival.
  * Returns NULL on failure with the reason in *err (optional):
- * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (ANL_MAX_STREAMS open, or no free sid) / ANL_ENOMEM. */
+ * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (ANL_MAX_STREAMS open) / ANL_ENOMEM. */
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
 /* Release the stream here and the handle: unsent, unacknowledged and unread

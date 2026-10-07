@@ -9,7 +9,7 @@
  * Both ends get the same options:
  *   --dur S    seconds of churn (default 600); then 30 s to drain, the check,
  *              and 15 s more answering the peer
- *   --conc N   streams of its own each side keeps open at once (default 12,
+ *   --conc N   streams of its own each side keeps open at once (default 31,
  *              at most 31: both sides' 62 and the default stream fit in 64)
  *   --seed N
  *
@@ -58,7 +58,7 @@
 #define MSG_LEN     600
 #define FRAME_LEN   400
 #define MAX_LAT     400000
-#define HDR         16          /* 'C' | plan | pad(2) | idx(4) | total(4) | sid(4) */
+#define HDR         16          /* 'C' | plan | uid(2) | idx(4) | total(4) | sid(4) */
 
 enum { P_GRACEFUL, P_SEMI, P_ABRUPT, P_PEER, P_BOTH, P_INSTANT, NPLAN };
 static const char *plan_name[NPLAN] = { "graceful", "semi", "abrupt", "peer", "both", "instant" };
@@ -67,6 +67,8 @@ static const int plan_weight[NPLAN] = { 25, 25, 15, 15, 10, 10 };
 typedef struct lst {
     anl_stream_t *s;
     int own, plan, semi, sid;
+    uint32_t uid;                   /* the opener's count of its opens (low 16 bits): sids are reused, this
+                                       tells the stream on a sid from an earlier one on the same sid */
     uint32_t t_open, t_next, t_end;
     uint32_t sent, total;           /* own: sent, the M or K of the plan */
     uint32_t got;                   /* accepted: messages / frames read */
@@ -79,7 +81,7 @@ static int g_fd, g_server, g_connected;
 static struct sockaddr_storage g_peer;
 static socklen_t g_peerlen;
 static anl_t *g_w;
-static uint32_t g_t0, g_dur = 600, g_conc = 12, g_seed = 1;
+static uint32_t g_t0, g_dur = 600, g_conc = 31, g_seed = 1;
 static uint64_t g_rng;
 
 static lst *g_own[64], *g_acc[128];
@@ -93,8 +95,9 @@ static int g_nlat[2];
 static uint64_t c_open, c_open_plan[NPLAN], c_ebusy, c_refused, c_open_fail;
 static uint64_t c_close_rec, c_close_norec, c_close_rec_bad, c_lost_pend, c_over_closed;
 static uint64_t c_acc, c_acc_over, c_acc_over_plan[NPLAN], c_acc_close, c_items, c_bytes;
-static uint64_t c_graceful_ok, c_graceful_short, c_order_err, c_pattern_err, c_peer_never;
-static uint64_t c_input_err, c_output_err, c_tx, c_rx;
+static uint64_t c_graceful_ok, c_graceful_short, c_order_err, c_pattern_err, c_gen_err, c_peer_never;
+static uint32_t c_max_sid;
+static uint64_t c_input_err, c_output_err, c_tx, c_rx, c_replay;
 static uint32_t c_max_clos, c_max_stab;
 
 static uint32_t now_ms(void)
@@ -115,23 +118,26 @@ static uint32_t rnd_in(uint32_t lo, uint32_t hi) { return lo + rnd() % (hi - lo 
 static void put32(char *p, uint32_t v) { memcpy(p, &v, 4); }
 static uint32_t get32(const char *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
-/* the payload after the header follows from sid and idx: a corrupted or
+/* the payload after the header follows from sid, uid and idx: a corrupted or
    misdelivered message is caught */
-static void fill(char *b, int len, int plan, uint32_t idx, uint32_t total, int sid)
+static void fill(char *b, int len, int plan, uint32_t idx, uint32_t total, int sid, uint32_t uid)
 {
     int i;
-    b[0] = 'C'; b[1] = (char)plan; b[2] = b[3] = 0;
+    b[0] = 'C'; b[1] = (char)plan; b[2] = (char)(uid & 0xff); b[3] = (char)((uid >> 8) & 0xff);
     put32(b + 4, idx); put32(b + 8, total); put32(b + 12, (uint32_t)sid);
-    for (i = HDR; i < len; i++) b[i] = (char)((uint32_t)sid * 31u + idx * 7u + (uint32_t)i);
+    for (i = HDR; i < len; i++) b[i] = (char)((uint32_t)sid * 31u + idx * 7u + uid * 13u + (uint32_t)i);
 }
+
+static uint32_t msg_uid(const char *b) { return (uint32_t)(uint8_t)b[2] | (uint32_t)(uint8_t)b[3] << 8; }
 
 static int check(const char *b, int len, int sid)
 {
     int i;
-    uint32_t idx;
+    uint32_t idx, uid;
     if (len < HDR || b[0] != 'C' || (int)get32(b + 12) != sid) return -1;
     idx = get32(b + 4);
-    for (i = HDR; i < len; i++) if (b[i] != (char)((uint32_t)sid * 31u + idx * 7u + (uint32_t)i)) return -1;
+    uid = msg_uid(b);
+    for (i = HDR; i < len; i++) if (b[i] != (char)((uint32_t)sid * 31u + idx * 7u + uid * 13u + (uint32_t)i)) return -1;
     return 0;
 }
 
@@ -226,6 +232,8 @@ static void open_one(uint32_t now)
         return;
     }
     l->sid = anl_stream_id(l->s);
+    l->uid = (uint32_t)c_open & 0xffff;
+    if ((uint32_t)l->sid > c_max_sid) c_max_sid = (uint32_t)l->sid;
     l->t_open = now;
     l->t_next = now;
     switch (plan) {
@@ -243,7 +251,7 @@ static int own_send(lst *l)
 {
     char b[MSG_LEN];
     int len = l->semi ? FRAME_LEN : MSG_LEN, r;
-    fill(b, len, l->plan, l->sent, l->total, l->sid);
+    fill(b, len, l->plan, l->sent, l->total, l->sid, l->uid);
     if (l->semi) r = anl_stream_send_frame(l->s, l->sent % 20 == 0 ? ANL_FRAME_KEY : 0, b, len, NULL);
     else r = anl_stream_send(l->s, b, len);
     if (r == ANL_ECLOSED) return -1;
@@ -319,7 +327,8 @@ static void acc_read(lst *l, uint32_t now)
         c_items++; c_bytes += (uint64_t)r;
         if (check(b, r, l->sid) < 0) { c_pattern_err++; continue; }
         idx = get32(b + 4);
-        if (!l->plan_known) { l->plan = b[1]; l->total = get32(b + 8); l->plan_known = 1; }
+        if (!l->plan_known) { l->plan = b[1]; l->total = get32(b + 8); l->uid = msg_uid(b); l->plan_known = 1; }
+        else if (msg_uid(b) != l->uid) { c_gen_err++; continue; }   /* an earlier stream's message on this sid */
         if (l->semi ? idx < l->got : idx != l->got) c_order_err++;
         l->got = idx + 1;
         if ((l->plan == P_PEER && l->got >= l->total) || (l->plan == P_BOTH && idx + 1 == l->total)) {
@@ -364,6 +373,21 @@ static void report_lat(const char *who, uint32_t *v, int n)
            v[(n - 1) * 90 / 100], v[(n - 1) * 99 / 100], v[(int)((n - 1) * 999LL / 1000)], v[n - 1]);
 }
 
+/* the connection starts at the hello: created earlier, the server's idle
+   timeout ran while the launcher was still starting the client */
+static void conn_create(uint32_t now)
+{
+    anl_config cfg;
+    anl_config_default(&cfg, g_server ? ANL_ROLE_SERVER : ANL_ROLE_CLIENT);
+    memset(cfg.psk, 0x5c, sizeof(cfg.psk));
+    cfg.mtu = MTU;
+    cfg.keepalive_ms = 1000;                /* the server's idle timeout outlasts the quiet end */
+    g_w = anl_create(0x5c5c0001, &cfg, NULL);
+    anl_setoutput(g_w, anl_out);
+    anl_set_accept(g_w, accept_cb);
+    anl_update(g_w, now);
+}
+
 static int run(void)
 {
     uint32_t last = 0, t_hello = 0, now, t_check = 0;
@@ -383,10 +407,13 @@ static int run(void)
                     memcpy(&g_peer, &from, fl); g_peerlen = fl;
                     udp_out('H', "", 0);
                 }
-                if (!g_connected) { g_connected = 1; g_t0 = now; printf("CONNECTED t=%u\n", now); fflush(stdout); }
+                if (!g_connected) { conn_create(now); g_connected = 1; g_t0 = now; printf("CONNECTED t=%u\n", now); fflush(stdout); }
             } else if (buf[0] == 'A' && g_connected) {
+                int ir;
                 c_rx++;
-                if (anl_input(g_w, buf + 1, (long)r - 1) < 0) c_input_err++;
+                /* a datagram the path duplicated is taken once: ANL_EREPLAY is no error */
+                if ((ir = anl_input(g_w, buf + 1, (long)r - 1)) == ANL_EREPLAY) c_replay++;
+                else if (ir < 0) c_input_err++;
             }
         }
         if (!g_connected) {
@@ -428,7 +455,6 @@ int main(int argc, char **argv)
 {
     const char *host = NULL;
     int port = 9850, i, ok, errors;
-    anl_config cfg;
     struct sockaddr_in6 a6;
     if (argc < 2 || (strcmp(argv[1], "server") && strcmp(argv[1], "client"))) {
         fprintf(stderr, "usage: churn server|client [--host H] [--port P] [--dur S] [--conc N] [--seed N]\n");
@@ -467,42 +493,36 @@ int main(int argc, char **argv)
         freeaddrinfo(res);
     }
 
-    anl_config_default(&cfg, g_server ? ANL_ROLE_SERVER : ANL_ROLE_CLIENT);
-    memset(cfg.psk, 0x5c, sizeof(cfg.psk));
-    cfg.mtu = MTU;
-    cfg.keepalive_ms = 1000;                /* the server's idle timeout outlasts the quiet end */
-    g_w = anl_create(0x5c5c0001, &cfg, NULL);
-    anl_setoutput(g_w, anl_out);
-    anl_set_accept(g_w, accept_cb);
-    anl_update(g_w, now_ms());
     printf("CHURN_CONFIG role=%s dur=%u conc=%u seed=%u\n", g_server ? "server" : "client", g_dur, g_conc, g_seed);
     printf("WORKLOAD_READY\n");
     fflush(stdout);
 
     ok = run();
+    if (g_w == NULL) { printf("HEALTH state=-1 errors=1 ok=0\n"); return 1; }
 
     {
         anl_stats st;
         anl_get_stats(g_w, &st);
-        printf("CHURN_OPEN opened=%llu ebusy=%llu open_fail=%llu refused=%llu max_streams=%u max_closing=%u",
+        printf("CHURN_OPEN opened=%llu ebusy=%llu open_fail=%llu refused=%llu max_streams=%u max_closing=%u max_sid=%u",
                (unsigned long long)c_open, (unsigned long long)c_ebusy, (unsigned long long)c_open_fail,
-               (unsigned long long)c_refused, c_max_stab, c_max_clos);
+               (unsigned long long)c_refused, c_max_stab, c_max_clos, c_max_sid);
         for (i = 0; i < NPLAN; i++) printf(" %s=%llu", plan_name[i], (unsigned long long)c_open_plan[i]);
         printf("\nCHURN_CLOSE told=%llu not_told=%llu record_errors=%llu untracked=%llu peer_closed_seen_by_opener=%llu peer_never_closed=%llu\n",
                (unsigned long long)c_close_rec, (unsigned long long)c_close_norec, (unsigned long long)c_close_rec_bad,
                (unsigned long long)c_lost_pend, (unsigned long long)c_over_closed, (unsigned long long)c_peer_never);
         report_lat("opener", g_lat[0], g_nlat[0]);
         report_lat("acceptor", g_lat[1], g_nlat[1]);
-        printf("CHURN_READ accepted=%llu over=%llu closed_by_acceptor=%llu items=%llu bytes=%llu graceful_ok=%llu graceful_short=%llu order_errors=%llu pattern_errors=%llu",
+        printf("CHURN_READ accepted=%llu over=%llu closed_by_acceptor=%llu items=%llu bytes=%llu graceful_ok=%llu graceful_short=%llu order_errors=%llu pattern_errors=%llu gen_errors=%llu",
                (unsigned long long)c_acc, (unsigned long long)c_acc_over, (unsigned long long)c_acc_close,
                (unsigned long long)c_items, (unsigned long long)c_bytes, (unsigned long long)c_graceful_ok,
-               (unsigned long long)c_graceful_short, (unsigned long long)c_order_err, (unsigned long long)c_pattern_err);
+               (unsigned long long)c_graceful_short, (unsigned long long)c_order_err, (unsigned long long)c_pattern_err,
+               (unsigned long long)c_gen_err);
         for (i = 0; i < NPLAN; i++) printf(" over_%s=%llu", plan_name[i], (unsigned long long)c_acc_over_plan[i]);
-        printf("\nCHURN_NET tx=%llu rx=%llu input_errors=%llu output_errors=%llu srtt=%u rto=%u retrans=%u state=%d\n",
-               (unsigned long long)c_tx, (unsigned long long)c_rx, (unsigned long long)c_input_err,
+        printf("\nCHURN_NET tx=%llu rx=%llu replays=%llu input_errors=%llu output_errors=%llu srtt=%u rto=%u retrans=%u state=%d\n",
+               (unsigned long long)c_tx, (unsigned long long)c_rx, (unsigned long long)c_replay, (unsigned long long)c_input_err,
                (unsigned long long)c_output_err, st.srtt, st.rto, st.retrans, anl_state(g_w));
         errors = (int)(c_refused + c_open_fail + c_close_rec_bad + c_lost_pend + c_peer_never + c_graceful_short +
-                       c_order_err + c_pattern_err + c_input_err + c_output_err) + (anl_state(g_w) < 0);
+                       c_order_err + c_pattern_err + c_gen_err + c_input_err + c_output_err) + (anl_state(g_w) < 0);
         printf("HEALTH state=%d errors=%d ok=%d\n", anl_state(g_w), errors, ok);
     }
     return errors == 0 && ok ? 0 : 1;

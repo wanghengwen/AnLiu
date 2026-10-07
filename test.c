@@ -320,6 +320,16 @@ static int check_pattern(const char *buf, int len, uint32_t seed)
     return 1;
 }
 
+/* a plaintext datagram header (DESIGN 4) as `from` would send it next: its pn
+ * (taken from it, so that its genuine datagrams after this are no replays);
+ * without a sender, from a counter of its own */
+static char *plain_hdr(char *q, anl_t *from, uint32_t conv, uint8_t flg, uint16_t ts)
+{
+    static uint32_t lone = 1000;
+    q = enc32(q, conv); q = enc8(q, flg); q = enc16(q, ts);
+    return enc32(q, from ? from->tx_pn++ : lone++);
+}
+
 /* opens a stream on side `from` and runs the network until the other side has
  * accepted it; `peer` (or `mine` when NULL) gives the accepting side's options */
 static anl_stream_t *open_pair(net *n, int from, const anl_stream_opt *mine, const anl_stream_opt *peer,
@@ -364,9 +374,16 @@ static void dump_streams(const char *who, const anl_t *w)
     for (n = w->slist.next; n != &w->slist; n = n->next) {
         const anl_stream *st = STREAM_OF(n);
         if (st->strict) continue;
-        printf("    %s sid %d state %d peer_opened %d snd que/buf %u/%u rcv_nxt %u rcvq %u ack %d\n",
-               who, st->sid, st->state, st->peer_opened, st->nsnd_que, st->nsnd_buf, st->rcv_nxt,
-               st->nrcv_que, st->ack_pending);
+        printf("    %s sid %d gen %d state %d peer_opened %d snd que/buf %u/%u snd_una/nxt %u/%u rcv_nxt %u rcvq %u ack %d\n",
+               who, st->sid, st->gen, st->state, st->peer_opened, st->nsnd_que, st->nsnd_buf, st->snd_una, st->snd_nxt,
+               st->rcv_nxt, st->nrcv_que, st->ack_pending);
+    }
+    {
+        uint32_t i;
+        for (i = 0; i < w->nclos; i++) printf("    %s closing sid %u gen %d\n", who, w->clos[i].sid, w->clos[i].gen);
+        for (i = 0; i < HELD_SLOTS; i++)
+            if (w->held[i].sid && tdiff(w->current, w->held[i].until) < 0)
+                printf("    %s held sid %u gen %d for %d ms\n", who, w->held[i].sid, w->held[i].gen, tdiff(w->held[i].until, w->current));
     }
 }
 
@@ -576,12 +593,16 @@ static void test_reflect(void)
     net_stop(&n);
 }
 
-static void test_stale(void)
+/* datagram pn (DESIGN 4.3): a datagram taken once is not taken again, nor
+ * one more than PN_WIN behind the largest; one reordered inside the window
+ * is; the ts window still drops a datagram sent long ago */
+static void test_replay(void)
 {
-    net n; anl_config ca, cb;
-    char buf[100];
+    net n; anl_config ca, cb; anl_stats st;
+    char buf[100], pl[64], *q;
     int i, r;
-    printf("[stale replay]\n");
+    uint32_t pn, pn_max;
+    printf("[replay: pn window, ts window]\n");
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = 5;
     net_start(&n, &ca, &cb);
@@ -590,14 +611,58 @@ static void test_stale(void)
     n.cap_len = 0;
     anl_send(n.ep[0], buf, 100);
     for (i = 0; i < 100; i++) net_tick(&n);
-    CHECK(n.cap_len > 0, "captured a datagram");
+    CHECK(n.cap_len > 0 && anl_recv(n.ep[1], buf, sizeof(buf)) == 100, "captured and delivered a datagram");
     r = anl_input(n.ep[1], n.cap, n.cap_len);
-    CHECK(r == ANL_OK, "replay inside window accepted as duplicate (%d)", r);
-    for (i = 0; i < 2500; i++) net_tick(&n);        /* keep traffic flowing to advance peer_ts */
+    anl_get_stats(n.ep[1], &st);
+    CHECK(r == ANL_EREPLAY && st.rx_replay == 1, "the same datagram again: a replay (%d, %llu)", r, (unsigned long long)st.rx_replay);
+    CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == ANL_EAGAIN, "nothing delivered by it");
+
+    /* a pn skipped by the sender, arriving after later ones: reordering, taken once */
+    pn = n.ep[0]->tx_pn++;
     anl_send(n.ep[0], buf, 100);
     for (i = 0; i < 100; i++) net_tick(&n);
-    r = anl_input(n.ep[1], n.cap, n.cap_len);
-    CHECK(r == ANL_ESTALE, "replay outside window rejected (%d)", r);
+    CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && tdiff(n.ep[1]->rx_pn_max, pn) > 0, "later datagrams taken first");
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_OK, "reordered inside the window: taken (%d)", r);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY, "... once (%d)", r);
+
+    /* PN_WIN or more behind the largest: dropped unseen, whatever its ts */
+    pn_max = n.ep[1]->rx_pn_max;
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn_max - PN_WIN);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY, "below the window (%d)", r);
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn_max - PN_WIN + 1);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_OK, "the oldest pn inside the window (%d)", r);
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn_max - 0x80000000u);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY, "half the pn circle behind (%d)", r);
+
+    /* a fresh pn with a ts 3 s back: the ts window (DESIGN 4.2) */
+    q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)(n.now - 3000));
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    anl_get_stats(n.ep[1], &st);
+    CHECK(r == ANL_ESTALE && st.rx_stale == 1, "old ts, new pn: stale (%d)", r);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_ESTALE, "a stale datagram's pn is not taken: stale again, not a replay (%d)", r);
+
+    /* a jump of more than PN_WIN ahead (the sender went on while nothing
+       arrived here): taken, everything behind the new window is out */
+    pn = n.ep[0]->tx_pn + 2 * PN_WIN;
+    n.ep[0]->tx_pn = pn + 1;
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_OK && n.ep[1]->rx_pn_max == pn, "a jump ahead taken (%d)", r);
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn_max + 1);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY, "what the jump left behind is out (%d)", r);
+    fill_pattern(buf, 100, 2);
+    anl_send(n.ep[0], buf, 100);
+    for (i = 0; i < 100; i++) net_tick(&n);
+    CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && check_pattern(buf, 100, 2), "the connection goes on after the jump");
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     net_stop(&n);
 }
 
@@ -614,7 +679,7 @@ static void test_violation(void)
     anl_stream_opt_default(&o, ANL_RELIABLE);
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
-    q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now);
+    q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
     q = enc_sid(q, SEG_FWD, anl_stream_id(b));
     q = enc24(q, 5);
     r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
@@ -802,7 +867,7 @@ static void test_close_confirm(int loss)
         for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
         CHECK(n.ep[0]->nclos == 0 && g_acc[1] == acc && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
               "confirmed, nothing created at the peer (%d accepts)", g_acc[1] - acc);
-        CHECK(peer_sid_new(n.ep[1], sid) == 0, "the sid counts as used there");
+        CHECK(sid_held(n.ep[1], sid), "the sid is held there");
     }
 
     /* 4. both ends close at once */
@@ -1034,12 +1099,7 @@ static void test_fuzz(void)
         int len, j;
         len = ANL_HDR_SIZE + (int)(rnd() % 300);
         for (j = 0; j < len; j++) plain[j] = (char)(uint8_t)rnd();
-        {
-            char *p = plain;
-            p = enc32(p, 0x11223344);
-            p = enc8(p, (uint8_t)((rnd() % 4 == 0) ? (rnd() & 0xff) : 0));
-            (void)enc16(p, (uint16_t)n.now);
-        }
+        (void)plain_hdr(plain, n.ep[0], 0x11223344, (uint8_t)((rnd() % 4 == 0) ? (rnd() & 0xff) : 0), (uint16_t)n.now);
         /* bias: sometimes start with a plausible segment header on a live sid */
         if (rnd() % 2) {
             static const int sids[4] = { 0, 1, 2, 4 };
@@ -1138,79 +1198,129 @@ static void test_stream_lifecycle(int loss)
 
 /* a sid is used once per connection: never handed out again after close; a
  * stale first datagram of a finished stream gets RST and creates nothing */
-static void test_sid_once(void)
+/* sids (DESIGN 6.1): the lowest free one of our parity; one whose stream
+ * went is held 2 s on both sides, then used again. A late first datagram of
+ * the old stream inside the hold gets RST, not a new stream */
+static void test_sid_reuse(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
-    char buf[2000], old[2048];
-    int sid, i, r, oldlen;
-    anl_stream_t *a, *b, *a2, *b2;
-    printf("[sid used once: no reuse after close, stale first datagram gets RST]\n");
+    char buf[2000], pl[64], *q;
+    int sid, i, r, acc, gen0;
+    anl_stream_t *a, *b, *a2, *b2, *a3, *b3;
+    printf("[sid reuse: lowest free, held 2 s after the stream went, late first datagram gets RST]\n");
     net_init(&n, &ca, &cb);
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_RELIABLE);
-    n.ep[0]->next_sid = 300;                        /* 2-byte sid encoding */
+    n.ep[0]->sid_base = 300;                        /* 2-byte sid encoding */
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
     sid = anl_stream_id(a);
+    gen0 = a->gen;
     CHECK(sid == 300, "sid 300 (%d)", sid);
-    n.cap_len = 0;
     fill_pattern(buf, 1500, 11);
-    anl_stream_send(a, buf, 1500);                  /* first data: carries the stream parameters */
+    anl_stream_send(a, buf, 1500);
     for (i = 0, r = -1; i < 500 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b, buf, sizeof(buf)); }
     CHECK(r == 1500 && check_pattern(buf, r, 11), "data (%d)", r);
-    CHECK(n.cap_len > 0, "captured the first data datagram");
-    memcpy(old, n.cap, (size_t)n.cap_len);
-    oldlen = n.cap_len;
 
     anl_stream_close(a);
+    for (i = 0; i < 1000 && (n.ep[0]->nclos || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    CHECK(n.ep[0]->nclos == 0 && stream_state(b) == ANL_STREAM_CLOSED, "closed, the peer dropped it, confirmed");
     anl_stream_close(b);
-    for (i = 0; i < 300; i++) net_tick(&n);
-    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both sides freed right after the close");
+    CHECK(sid_held(n.ep[0], 300) && sid_held(n.ep[1], 300), "sid 300 held on both sides");
     a2 = anl_stream_open(n.ep[0], &o, NULL);
-    CHECK(a2 && anl_stream_id(a2) == 302, "sid 300 is never reused (%d)", anl_stream_id(a2));
-    anl_stream_close(a2);                           /* the OPEN went out at open, the CLOSE right after */
+    CHECK(a2 && anl_stream_id(a2) == 302, "the next open passes the held sid (%d)", a2 ? anl_stream_id(a2) : -1);
     for (i = 0; i < 300; i++) net_tick(&n);
-    CHECK(g_peer[1][302] == NULL || anl_stream_peeksize(g_peer[1][302]) == ANL_ECLOSED, "the peer's end, if any, is over");
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nstab == 1, "the close confirmed, nothing held on the peer");
-    if (g_peer[1][302]) anl_stream_close(g_peer[1][302]);
-    for (i = 0; i < 1500; i++) net_tick(&n);
 
-    /* the first datagram of the finished stream (parameters included) is
-       replayed inside the ts window: RST, no new stream on either side */
+    /* the old stream's first datagram (parameters, sn 0) arriving now: RST, nothing created */
+    acc = g_acc[1];
+    q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+    q = enc_sid(q, SEG_DATA, 300); q = enc8(q, F_OPEN); q = enc24(q, 0);
+    q = enc8(q, 0); q = enc16(q, 256); q = enc16(q, 0);       /* open body: reliable, rcv_wnd 256, tag 0 */
+    q = enc_varint(q, 4); memcpy(q, "late", 4); q += 4;
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_OK && g_acc[1] == acc && sget(n.ep[1], 300) == NULL, "late first datagram inside the hold: no stream (%d, %d accepts)",
+          r, g_acc[1] - acc);
+    for (i = 0; i < 300; i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 1 && stream_count(n.ep[1], NULL) == 1 && sget(n.ep[0], 302) != NULL,
+          "only the new stream on either side (%d / %d)", stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
+
+    /* parameters with a generation on the default stream and on one of the
+       receiver's own sids: generations are the opener's, these go by the mode */
     {
-        int acc = g_acc[1];
-        r = anl_input(n.ep[1], old, oldlen);
-        CHECK(r == ANL_OK, "stale datagram inside the ts window is authenticated (%d)", r);
-        CHECK(g_acc[1] == acc, "no stream created by the stale datagram (%d -> %d)", acc, g_acc[1]);
-        for (i = 0; i < 300; i++) net_tick(&n);
-        CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "still nothing on either side");
+        anl_stream_t *own = open_pair(&n, 1, &o, NULL, &b2), *mine2 = b2;
+        q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+        q = enc_sid(q, SEG_DATA, 0); q = enc8(q, F_OPEN); q = enc24(q, (n.ep[1]->dflt->rcv_nxt - 1) & SN_MASK);
+        q = enc8(q, (uint8_t)((5 << OB_GEN_SHIFT) | OB_STREAM)); q = enc16(q, 4096); q = enc16(q, 0);
+        q = enc_varint(q, 0);                                   /* an sn behind rcv_nxt: nothing delivered */
+        q = enc_sid(q, SEG_DATA, own ? anl_stream_id(own) : 1); q = enc8(q, F_OPEN); q = enc24(q, 0);
+        q = enc8(q, (uint8_t)(9 << OB_GEN_SHIFT)); q = enc16(q, 256); q = enc16(q, 0);
+        q = enc_varint(q, 0);
+        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+        CHECK(r == ANL_OK && anl_default_stream(n.ep[1])->state != ANL_STREAM_CLOSED, "the default stream stays (%d)", r);
+        CHECK(own && stream_state(own) != ANL_STREAM_CLOSED && sget(n.ep[1], anl_stream_id(own)) == own, "our own stream stays");
+        CHECK(anl_send(n.ep[1], "dflt", 4) == 0, "send on the default stream");
+        for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_recv(n.ep[0], buf, sizeof(buf)); }
+        CHECK(r == 4, "default stream works (%d)", r);
+        if (own) anl_stream_close(own);
+        for (i = 0; i < 1000 && mine2 && stream_state(mine2) != ANL_STREAM_CLOSED; i++) net_tick(&n);
+        if (mine2) anl_stream_close(mine2);
     }
 
-    /* the next stream works normally */
-    a2 = open_pair(&n, 0, &o, NULL, &b2);
-    if (!b2) { net_stop(&n); return; }
-    CHECK(anl_stream_id(a2) == 304 && anl_stream_id(b2) == 304, "next sid 304 (%d)", anl_stream_id(a2));
+    /* the hold over: sid 300 is the lowest free one again */
+    for (i = 0; i < 2200; i++) net_tick(&n);
+    CHECK(!sid_held(n.ep[0], 300) && !sid_held(n.ep[1], 300), "hold over");
+    a3 = open_pair(&n, 0, &o, NULL, &b3);
+    CHECK(a3 && anl_stream_id(a3) == 300, "sid 300 again (%d)", a3 ? anl_stream_id(a3) : -1);
+    if (!b3) { net_stop(&n); return; }
     fill_pattern(buf, 700, 22);
-    anl_stream_send(a2, buf, 700);
-    for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b2, buf, sizeof(buf)); }
-    CHECK(r == 700 && check_pattern(buf, r, 22), "data on the next stream (%d)", r);
-    r = anl_input(n.ep[1], old, oldlen);
-    CHECK(r == ANL_ESTALE, "old datagram now outside the ts window (%d)", r);
+    anl_stream_send(a3, buf, 700);
+    for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b3, buf, sizeof(buf)); }
+    CHECK(r == 700 && check_pattern(buf, r, 22), "data on the second incarnation (%d)", r);
+    CHECK(a3 && b3->gen == a3->gen && a3->gen == ((gen0 + 1) & GEN_MASK), "the next generation (%d after %d)", a3 ? a3->gen : -1, gen0);
+
+    /* the first incarnation's first datagram arriving now, after the hold:
+       an earlier generation - RST for it, the stream here stays */
+    q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+    q = enc_sid(q, SEG_DATA, 300); q = enc8(q, F_OPEN); q = enc24(q, 0);
+    q = enc8(q, (uint8_t)(gen0 << OB_GEN_SHIFT)); q = enc16(q, 256); q = enc16(q, 0);
+    q = enc_varint(q, 4); memcpy(q, "late", 4); q += 4;
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_OK && sget(n.ep[1], 300) == b3 && stream_state(b3) == ANL_STREAM_OPEN, "an earlier generation's OPEN leaves the stream (%d)", r);
+    for (i = 0; i < 300; i++) net_tick(&n);
+    CHECK(stream_state(a3) == ANL_STREAM_OPEN && stream_state(b3) == ANL_STREAM_OPEN, "... on both sides (the RST is for the earlier one)");
+    anl_stream_send(a3, buf, 700);
+    for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b3, buf, sizeof(buf)); }
+    CHECK(r == 700, "data after it (%d)", r);
+
+    /* closed by the acceptor this time: held there from its close, here from its CLOSE */
+    anl_stream_close(b3);
+    for (i = 0; i < 1000 && (n.ep[1]->nclos || stream_state(a3) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    CHECK(n.ep[1]->nclos == 0 && stream_state(a3) == ANL_STREAM_CLOSED, "the acceptor's close confirmed");
+    CHECK(sid_held(n.ep[0], 300) && sid_held(n.ep[1], 300), "held on both sides again");
+    anl_stream_close(a3);
+    a3 = anl_stream_open(n.ep[0], &o, NULL);
+    CHECK(a3 && anl_stream_id(a3) == 304, "302 in use, 300 held: 304 (%d)", a3 ? anl_stream_id(a3) : -1);
+    if (a3) anl_stream_close(a3);              /* the OPEN went out at open, the CLOSE right after */
+    anl_stream_close(a2);
+    b2 = g_peer[1][302];
+    for (i = 0; i < 1000 && (n.ep[0]->nclos || (b2 && stream_state(b2) != ANL_STREAM_CLOSED)); i++) net_tick(&n);
+    if (b2) anl_stream_close(b2);
+    if (g_peer[1][304]) anl_stream_close(g_peer[1][304]);   /* accepted before the CLOSE came, if at all */
+    for (i = 0; i < 300; i++) net_tick(&n);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0 && n.ep[0]->nclos == 0, "all gone (%d / %d, %u closing)",
+          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL), n.ep[0]->nclos);
 
     /* one 45 s old (between half and a whole wrap of the 16-bit ts) extends
        to a ts in the future: it must not move the window - it did, and every
        genuine datagram after it was stale for 20 s */
     {
-        char pl[16], *q = pl;
         uint64_t stale0 = n.ep[1]->rx_stale;
-        q = enc32(q, 0x11223344);
-        q = enc8(q, ANL_VERSION << 6);
-        q = enc16(q, (uint16_t)(n.now - 45000));
+        q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)(n.now - 45000));
         r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
         CHECK(r == ANL_OK, "45 s old datagram: ts extended into the future (%d)", r);
         fill_pattern(buf, 700, 23);
-        anl_stream_send(a2, buf, 700);
-        for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b2, buf, sizeof(buf)); }
+        anl_send(n.ep[0], buf, 700);
+        for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_recv(n.ep[1], buf, sizeof(buf)); }
         CHECK(r == 700 && check_pattern(buf, r, 23) && n.ep[1]->rx_stale == stale0,
               "genuine data right after it (%d, %u stale)", r, (unsigned)(n.ep[1]->rx_stale - stale0));
     }
@@ -1220,10 +1330,7 @@ static void test_sid_once(void)
     {
         int k;
         for (k = 0; k < 2; k++) {
-            char pl[32], *q = pl;
-            q = enc32(q, 0x11223344);
-            q = enc8(q, ANL_VERSION << 6);
-            q = enc16(q, (uint16_t)n.now);
+            q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
             q = enc8(q, (uint8_t)((SEG_FWD << 6) | SID_F | (sid & SID_LO_MASK)));
             if (k == 0) q = enc8(q, 0);                     /* zero */
             else { q = enc8(q, (uint8_t)(0x80 | ((sid >> SID_LO_BITS) & 0x7f))); q = enc8(q, 0); }   /* padded */
@@ -1248,7 +1355,7 @@ static void test_handle_lifetime(void)
     anl_stream_opt_default(&o, ANL_RELIABLE);
     anl_stream_set_user(anl_default_stream(n.ep[0]), &n);
     CHECK(anl_stream_get_user(anl_default_stream(n.ep[0])) == &n && anl_stream_conn(anl_default_stream(n.ep[0])) == n.ep[0], "user / conn");
-    n.ep[1]->next_sid = 41;                         /* server opens sid 41 */
+    n.ep[1]->sid_base = 41;                         /* server opens sid 41 */
     b = open_pair(&n, 1, &o, NULL, &a);
     if (!a) { net_stop(&n); return; }
     anl_stream_send(b, "last words", 10);
@@ -1284,8 +1391,7 @@ static void test_wire_v1_wrap(int semi)
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = 25;
     net_start(&n, &ca, &cb);
-    n.ep[0]->next_sid = 8192;
-    n.ep[1]->peer_floor = (8192 - 2) / 2;           /* as if every lower sid had been used */
+    n.ep[0]->sid_base = 8192;
     anl_stream_opt_default(&o, semi ? ANL_SEMI : ANL_RELIABLE);
     o.fec = semi; o.fec_ratio = 100;
     if (semi) { o.max_age_ms = 5000; o.rcv_deadline_ms = 0; }
@@ -1450,8 +1556,9 @@ static void test_sid_churn(int loss, int TOTAL)
     net n; anl_config ca, cb; anl_stream_opt o;
     enum { BATCH = ANL_MAX_STREAMS - 1 };
     static anl_stream_t *a[BATCH];
-    char buf[3000], old[2048];
-    int i, j, r, done = 0, got = 0, big = 0, oldlen = 0, open_fail = 0;
+    char buf[3000];
+    int i, j, r, done = 0, got = 0, open_fail = 0;
+    uint32_t top = 0;
     printf("[sid churn: %d streams opened and closed, %d%% loss]\n", TOTAL, loss);
     net_init(&n, &ca, &cb);
     n.loss_pct = loss;
@@ -1464,8 +1571,7 @@ static void test_sid_churn(int loss, int TOTAL)
             if (!a[j]) { open_fail++; continue; }
             fill_pattern(buf, 2500, (uint32_t)anl_stream_id(a[j]));
             anl_stream_send(a[j], buf, 2500);
-            if (anl_stream_id(a[j]) >= 1 << SID_LO_BITS) big++;    /* takes the varint extension */
-            if (anl_stream_id(a[j]) == 8200) { n.cap_len = 0; }
+            top = umax32(top, (uint32_t)anl_stream_id(a[j]));
         }
         for (i = 0; i < 60000; i++) {
             int left = 0;
@@ -1474,7 +1580,6 @@ static void test_sid_churn(int loss, int TOTAL)
                receiver's RST to a retransmission reset the stream) */
             for (j = 0; j < nb; j++)
                 if (a[j] && anl_stream_waitsnd(a[j]) == 0) { anl_stream_close(a[j]); a[j] = NULL; }
-            if (oldlen == 0 && n.cap_len > 0 && done + nb > 4100) { memcpy(old, n.cap, (size_t)n.cap_len); oldlen = n.cap_len; }
             {
                 anl_stream_t *list[BATCH];
                 int k, cnt = anl_readable(n.ep[1], list, BATCH);
@@ -1489,6 +1594,11 @@ static void test_sid_churn(int loss, int TOTAL)
             if (stream_count(n.ep[0], &left) == 0 && stream_count(n.ep[1], NULL) == 0 &&
                 n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0) break;   /* every place free again */
         }
+        if (i == 60000) {
+            printf("  batch at %d timed out (%d streams delivered so far)\n", done, got);
+            dump_streams("A", n.ep[0]);
+            dump_streams("B", n.ep[1]);
+        }
         done += nb;
     }
     if (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)) {
@@ -1502,42 +1612,18 @@ static void test_sid_churn(int loss, int TOTAL)
     printf("  done after %u ms of simulated time\n", n.now - 1000);
     CHECK(open_fail == 0, "every open succeeded (%d failed)", open_fail);
     CHECK(got == TOTAL, "every stream delivered its data (%d / %d)", got, TOTAL);
-    CHECK(big == (TOTAL > 7 ? TOTAL - 7 : 0), "%d sids took the varint extension", big);
-    CHECK(n.ep[1]->peer_floor == (uint32_t)TOTAL, "every sid seen: floor at %u", n.ep[1]->peer_floor);
+    /* sids are reused once their 2 s hold is over: a batch's worth or so of
+       sids is in use or held at a time, not one per stream ever opened */
+    CHECK(top < 2u * (uint32_t)TOTAL / 3u && top >= 2u * BATCH, "sids reused: the highest was %u for %d streams", top, TOTAL);
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all freed (%d / %d)",
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
-    if (oldlen > 0 && loss == 0) {
-        int acc = g_acc[1];
-        r = anl_input(n.ep[1], old, oldlen);
-        CHECK(r == ANL_OK || r == ANL_ESTALE, "stale datagram of an extended sid (%d)", r);
-        CHECK(g_acc[1] == acc, "no stream created by it (%d -> %d)", acc, g_acc[1]);
-        for (i = 0; i < 300; i++) net_tick(&n);
-        CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "still nothing on either side");
-    }
-    /* a peer sid SID_WIN or more past the floor moves the window up: it is
-       accepted, and the sids it leaves behind count as used (a stream its
-       opener closed before we heard of it is never announced again) */
+    /* every hold over: the next open gets the lowest sid of all */
+    for (i = 0; i < SID_HOLD_MS + 200; i++) net_tick(&n);
     {
-        anl_stream_t *x, *y;
-        int acc = g_acc[1], skipped = (int)n.ep[0]->next_sid;
-        uint32_t ix;
-        n.ep[0]->next_sid += 2u * (SID_WIN + 10);
-        x = anl_stream_open(n.ep[0], &o, NULL);
-        CHECK(x != NULL, "open far ahead");
-        if (x) anl_stream_send(x, "far", 3);
-        for (i = 0; i < 3000 && x && stream_state(x) == ANL_STREAM_OPENING; i++) net_tick(&n);
-        ix = x ? ((uint32_t)anl_stream_id(x) - 2) / 2 : 0;
-        CHECK(g_acc[1] == acc + 1 && x && stream_state(x) == ANL_STREAM_OPEN, "accepted (%d)", x ? stream_state(x) : -1);
-        CHECK(n.ep[1]->peer_floor == ix - SID_WIN + 1, "window moved up: floor %u", n.ep[1]->peer_floor);
-        n.ep[0]->next_sid = (uint32_t)skipped;         /* one the window left behind */
-        y = anl_stream_open(n.ep[0], &o, NULL);
-        if (y) anl_stream_send(y, "old", 3);
-        for (i = 0; i < 3000 && y && stream_state(y) != ANL_STREAM_CLOSED; i++) net_tick(&n);
-        CHECK(y && stream_state(y) == ANL_STREAM_CLOSED && g_acc[1] == acc + 1, "a sid left behind gets RST (%d)",
-              y ? stream_state(y) : -1);
-        if (x) { anl_stream_close(g_peer[1][anl_stream_id(x)]); anl_stream_close(x); }
-        if (y) anl_stream_close(y);
+        anl_stream_t *x = anl_stream_open(n.ep[0], &o, NULL);
+        CHECK(x && anl_stream_id(x) == (int)sid_first(ANL_ROLE_CLIENT), "the lowest sid again (%d)", x ? anl_stream_id(x) : -1);
+        if (x) anl_stream_close(x);
     }
     net_stop(&n);
 }
@@ -2027,8 +2113,7 @@ static void test_rcv_skip_clears_fwd(void)
     CHECK(tdiff(st->snd_nxt, una) >= 4, "frames in flight (%u)", st->snd_nxt - una);
     retired = una + 3;
     st->fwd_pending = 1; st->fwd_una = retired; st->fwd_ts = w->current + 1000;
-    p = pl;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
+    p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
     p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_RCV_SKIP); p = enc_varint(p, SKIP_BODY);
     p = enc32(p, retired);
     r = anl_input_plain(w, pl, (long)(p - pl));
@@ -2433,9 +2518,9 @@ static void run_fec_auto(int deadline, int *ratio, int *got, int *frames)
 
 static int input_test_report(anl_t *w, anl_stream_t *st, uint32_t ts, uint16_t recovered)
 {
-    char buf[128], *p = buf;
+    char buf[128], *p;
     int i;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)ts);
+    p = plain_hdr(buf, NULL, w->conv, ANL_VERSION << 6, (uint16_t)ts);
     p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
     for (i = 0; i < 7; i++) p = enc16(p, 0);
     p = enc16(p, recovered);
@@ -3036,8 +3121,7 @@ static void test_fec_expiry(void)
         if (s) {
             w->rx_srtt = 300;                       /* a repair misses the 250 ms deadline */
             for (i = 0; i < 3; i++) {
-                p = body;
-                p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)(100u + (uint32_t)i));
+                p = plain_hdr(body, NULL, w->conv, ANL_VERSION << 6, (uint16_t)(100u + (uint32_t)i));
                 p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
                 p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0);
                 p = enc16(p, 10); p = enc16(p, (uint16_t)(i * 2)); p = enc16(p, 0);
@@ -3928,13 +4012,13 @@ static void test_rtt_stale_ack(void)
     CHECK(anl_recv(n.ep[1], received, sizeof(received)) == 8, "receive baseline sample");
     w = n.ep[0]; st = w->dflt; before = w->rx_srtt;
     CHECK(before > 0 && st->nsnd_buf == 0, "real ACK established RTT and retired baseline");
-    p = packet;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
+    p = plain_hdr(packet, n.ep[1], w->conv, ANL_VERSION << 6, (uint16_t)w->current);
     p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
     p = enc24(p, st->snd_una & SN_MASK); p = enc16(p, st->rcv_wnd);
     p = enc16(p, (uint16_t)(w->current - 5000)); p = enc_varint(p, 0);
     CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid old ACK accepted");
     CHECK(w->rx_srtt == before, "old ACK cannot pollute RTT (%d -> %d)", before, w->rx_srtt);
+    (void)plain_hdr(packet, n.ep[1], w->conv, ANL_VERSION << 6, (uint16_t)w->current);   /* the same ACK in a new datagram */
     CHECK(anl_input_plain(w, packet, p-packet) == 0, "valid duplicate ACK accepted");
     CHECK(w->rx_srtt == before, "duplicate ACK cannot pollute RTT");
     CHECK(anl_send(w, "fresh", 5) == 0, "send a genuine new segment");
@@ -3942,8 +4026,7 @@ static void test_rtt_stale_ack(void)
     echo = w->current; next = st->snd_nxt;
     n.now += 1000; anl_update(w, n.now);
     before = w->rx_srtt;
-    p = packet;
-    p = enc32(p, w->conv); p = enc8(p, ANL_VERSION << 6); p = enc16(p, (uint16_t)w->current);
+    p = plain_hdr(packet, n.ep[1], w->conv, ANL_VERSION << 6, (uint16_t)w->current);
     p = enc_sid(p, SEG_ACK, st->sid); p = enc8(p, ACK_F_FRESH);
     p = enc24(p, next & SN_MASK); p = enc16(p, st->rcv_wnd);
     p = enc16(p, (uint16_t)echo); p = enc_varint(p, 0);
@@ -4035,13 +4118,33 @@ static void test_review_gf_tables(void)
     for (a = 1; a < 256; a++) CHECK(gf_mul((uint8_t)a, gf_inv((uint8_t)a)) == 1, "GF inverse %u", a);
 }
 
+/* ANL_TEST_ONLY: substrings of test names separated by '|', any of them selects the test */
+static int test_selected(const char *name, const char *only)
+{
+    const char *p = only;
+    for (;;) {
+        const char *q = strchr(p, '|');
+        size_t n = q ? (size_t)(q - p) : strlen(p);
+        if (n > 0 && n < 128) {
+            char pat[128];
+            memcpy(pat, p, n); pat[n] = 0;
+            if (strstr(name, pat)) return 1;
+        }
+        if (!q) return 0;
+        p = q + 1;
+    }
+}
+
 int main(void)
 {
     const char *seed = getenv("ANL_TEST_SEED");    /* runs are deterministic for a given seed */
     const char *only = getenv("ANL_TEST_ONLY");     /* substring of a test name: run only those */
-#define RUN(call) do { if (!only || strstr(#call, only)) call; } while (0)
+    const char *rnd_state = getenv("ANL_TEST_RND");  /* the generator's state (hex), as ANL_TEST_TRACE prints it before a test */
+    const char *trace = getenv("ANL_TEST_TRACE");
+#define RUN(call) do { if (!only || test_selected(#call, only)) { if (trace) printf("rnd %llx before %s\n", (unsigned long long)g_seed, #call); call; } } while (0)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (seed) g_seed = 0x9E3779B97F4A7C15ULL * (strtoull(seed, NULL, 10) + 1);
+    if (rnd_state) g_seed = strtoull(rnd_state, NULL, 16);
     printf("seed %s\n", seed ? seed : "default");
     RUN(test_sid_churn(10, 4000));
     RUN(test_kat());
@@ -4056,7 +4159,7 @@ int main(void)
     RUN(test_semi(5, 1, 0));
     RUN(test_semi(2, 0, 1000));
     RUN(test_reflect());
-    RUN(test_stale());
+    RUN(test_replay());
     RUN(test_violation());
     RUN(test_seg_size());
     RUN(test_close_notify(0));
@@ -4069,7 +4172,7 @@ int main(void)
     RUN(test_pacing());
     RUN(test_stream_lifecycle(0));
     RUN(test_stream_lifecycle(10));
-    RUN(test_sid_once());
+    RUN(test_sid_reuse());
     RUN(test_handle_lifetime());
     RUN(test_wire_v1_wrap(0));
     RUN(test_wire_v1_wrap(1));

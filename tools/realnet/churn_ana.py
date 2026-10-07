@@ -31,13 +31,14 @@ def main():
             opened=tot('CHURN_OPEN', 'opened'), ebusy=tot('CHURN_OPEN', 'ebusy'), refused=tot('CHURN_OPEN', 'refused'),
             told=tot('CHURN_CLOSE', 'told'), confirmed=n, p50=p50, p99=p99, max=mx,
             graceful=f"{tot('CHURN_READ', 'graceful_ok')}/{tot('CHURN_READ', 'graceful_ok') + tot('CHURN_READ', 'graceful_short')}",
-            integrity=tot('CHURN_READ', 'order_errors') + tot('CHURN_READ', 'pattern_errors'),
+            integrity=tot('CHURN_READ', 'order_errors') + tot('CHURN_READ', 'pattern_errors') + tot('CHURN_READ', 'gen_errors'),
+            max_sid=max((e.get('CHURN_OPEN', {}).get('max_sid', 0) for e in ends), default=0),
             final='ok' if all(e.get('CHURN_FINAL', {}).get('ok') == 1 for e in ends) else 'FAIL',
             valid=m['valid'], why='; '.join(m.get('errors', []))[:80]))
     if '--json' in sys.argv:
         print(json.dumps(rows, indent=1)); return
     cols = ['path', 'loss', 'delay', 'conc', 'seed', 'tc', 'srtt', 'opened', 'ebusy', 'refused', 'told', 'confirmed',
-            'p50', 'p99', 'max', 'graceful', 'integrity', 'final', 'valid']
+            'p50', 'p99', 'max', 'graceful', 'integrity', 'max_sid', 'final', 'valid']
     print('\t'.join(cols))
     for r in rows: print('\t'.join(str(r[c]) for c in cols) + ('\t' + r['why'] if r['why'] else ''))
     v = [r for r in rows if r['valid']]

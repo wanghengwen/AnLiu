@@ -95,11 +95,11 @@ static void run_exact_cost(void)
         if (kind == 4) write_ctrl_seg(w, 0, CTRL_ECHO, parity, ECHO_BODY);
         dg_seal(w);
         CHECK(!g_fec_diag.accounting_errors && g_fec_diag.overhead == ANL_OVERHEAD, "exact encapsulation kind=%d: %llu", kind, (unsigned long long)g_fec_diag.overhead);
-        if (kind == 0) CHECK(g_fec_diag.sent[0].first == 105 && g_fec_diag.output == 124, "last DATA omits one-byte length");
-        if (kind == 1) CHECK(g_fec_diag.sent[0].retry == 105 && g_fec_diag.output == 124, "last retransmit omits length");
+        if (kind == 0) CHECK(g_fec_diag.sent[0].first == 105 && g_fec_diag.output == 105 + ANL_OVERHEAD, "last DATA omits one-byte length");
+        if (kind == 1) CHECK(g_fec_diag.sent[0].retry == 105 && g_fec_diag.output == 105 + ANL_OVERHEAD, "last retransmit omits length");
         if (kind == 2) CHECK(g_fec_diag.sent[0].first == 106 && g_fec_diag.sent[0].parity == 202 && !g_fec_diag.parity_datagrams[0], "mixed DATA/PARITY: only last segment loses length");
-        if (kind == 3) CHECK(g_fec_diag.sent[0].parity == 202 && g_fec_diag.parity_output[0] == 221 && g_fec_diag.parity_datagrams[0] == 1, "pure parity omits two-byte length");
-        if (kind == 4) CHECK(g_fec_diag.control == 5 && g_fec_diag.output == 24, "last control omits length");
+        if (kind == 3) CHECK(g_fec_diag.sent[0].parity == 202 && g_fec_diag.parity_output[0] == 202 + ANL_OVERHEAD && g_fec_diag.parity_datagrams[0] == 1, "pure parity omits two-byte length");
+        if (kind == 4) CHECK(g_fec_diag.control == 5 && g_fec_diag.output == 5 + ANL_OVERHEAD, "last control omits length");
     }
     seg_free(s); anl_release(w);
     memset(&g_fec_diag, 0, sizeof(g_fec_diag));
