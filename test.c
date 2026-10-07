@@ -381,7 +381,7 @@ static void dump_streams(const char *who, const anl_t *w)
     {
         uint32_t i;
         for (i = 0; i < w->nclos; i++) printf("    %s closing sid %u gen %d\n", who, w->clos[i].sid, w->clos[i].gen);
-        for (i = 0; i < HELD_SLOTS; i++)
+        for (i = 0; i < w->nheld; i++)
             if (w->held[i].sid && tdiff(w->current, w->held[i].until) < 0)
                 printf("    %s held sid %u gen %d for %d ms\n", who, w->held[i].sid, w->held[i].gen, tdiff(w->held[i].until, w->current));
     }
@@ -662,6 +662,29 @@ static void test_replay(void)
     anl_send(n.ep[0], buf, 100);
     for (i = 0; i < 100; i++) net_tick(&n);
     CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && check_pattern(buf, 100, 2), "the connection goes on after the jump");
+
+    /* ahead is at most PN_AHEAD up, not half the circle: past 2^31 datagrams
+       pn 0 (a replay of the first ones, or a restart) is behind, not new */
+    pn_max = n.ep[1]->rx_pn_max;
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, pn_max + PN_AHEAD + 1);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY && n.ep[1]->rx_pn_max == pn_max, "further than PN_AHEAD up: out (%d)", r);
+    n.ep[0]->tx_pn = 0x90000000u;
+    anl_send(n.ep[0], buf, 100);
+    n.ep[1]->rx_pn_max = 0x90000000u - 1;              /* as if 2.4e9 datagrams had come before */
+    for (i = 0; i < 100; i++) net_tick(&n);
+    CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && n.ep[1]->rx_pn_max == 0x90000000u, "pn past 2^31 taken");
+    q = pl; q = enc32(q, 0x11223344); q = enc8(q, ANL_VERSION << 6); q = enc16(q, (uint16_t)n.now); q = enc32(q, 0);
+    r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+    CHECK(r == ANL_EREPLAY, "pn 0 after 2^31: out (%d)", r);
+    n.ep[0]->tx_pn = 0xffffffffu;
+    n.ep[1]->rx_pn_max = 0xffffffffu - 1;
+    fill_pattern(buf, 100, 3);
+    anl_send(n.ep[0], buf, 100);
+    anl_send(n.ep[0], buf, 100);
+    for (i = 0; i < 100; i++) net_tick(&n);
+    CHECK(anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && anl_recv(n.ep[1], buf, sizeof(buf)) == 100 && n.ep[1]->rx_pn_max < 16,
+          "the pn wraps on (%u)", n.ep[1]->rx_pn_max);
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     net_stop(&n);
 }
@@ -1196,8 +1219,91 @@ static void test_stream_lifecycle(int loss)
     net_stop(&n);
 }
 
-/* a sid is used once per connection: never handed out again after close; a
- * stale first datagram of a finished stream gets RST and creates nothing */
+/* sid reuse against what a late or missing answer leaves (DESIGN 6.1): a
+ * late ACK of an earlier generation taken for the peer's answer to a new
+ * stream whose OPEN was lost; the hold follows ts_window; an RST without a
+ * generation is remembered so; a CLOSE nobody answers is given up on */
+static void test_sid_stale_proof(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    char buf[2000], pl[64], *q;
+    int sid, i, r, err;
+    anl_stream_t *a, *b, *a2, *b2;
+    printf("[sid reuse: late ACK of the earlier generation, hold and ts_window, RST without generation, CLOSE given up]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 20;
+    ca.ts_window_ms = cb.ts_window_ms = 3000;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    sid = anl_stream_id(a);
+    anl_stream_close(a);
+    for (i = 0; i < 1000 && (n.ep[0]->nclos || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    anl_stream_close(b);
+    CHECK(n.ep[0]->nclos == 0 && sid_hold_ms(n.ep[0]) == 4000, "closed and confirmed; hold %u ms with a 3 s ts window",
+          sid_hold_ms(n.ep[0]));
+    for (i = 0; i < 3500; i++) net_tick(&n);
+    CHECK(sid_held(n.ep[0], sid) && sid_held(n.ep[1], sid), "still held 3.5 s later on both sides");
+    for (i = 0; i < 600; i++) net_tick(&n);
+    CHECK(!sid_held(n.ep[0], sid) && !sid_held(n.ep[1], sid), "hold over at 4 s");
+
+    /* the new stream's OPEN and data are lost; an ACK of the earlier one,
+       held up past the hold, arrives before anything of the peer's: the
+       peer answers the data without parameters with an RST of the earlier
+       generation, which brings the parameters again */
+    g_peer[1][sid] = NULL;                      /* b's handle is gone */
+    n.block[0] = 1;
+    a2 = anl_stream_open(n.ep[0], &o, &err);
+    CHECK(a2 && anl_stream_id(a2) == sid, "sid %d again (%d)", sid, a2 ? anl_stream_id(a2) : -1);
+    if (!a2) { net_stop(&n); return; }
+    fill_pattern(buf, 500, 31);
+    anl_stream_send(a2, buf, 500);
+    for (i = 0; i < 50; i++) net_tick(&n);
+    q = plain_hdr(pl, n.ep[1], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+    q = enc_sid(q, SEG_ACK, sid); q = enc8(q, 0); q = enc24(q, 0); q = enc16(q, 256); q = enc16(q, (uint16_t)(n.now - 60));
+    q = enc_varint(q, 0);
+    r = anl_input_plain(n.ep[0], pl, (long)(q - pl));
+    CHECK(r == ANL_OK && a2->peer_opened, "the late ACK passes for the answer (%d)", r);
+    n.block[0] = 0;
+    b2 = NULL;
+    for (i = 0, r = -1; i < 5000 && r < 0; i++) {
+        net_tick(&n);
+        if ((b2 = g_peer[1][sid]) != NULL) r = anl_stream_recv(b2, buf, sizeof(buf));
+    }
+    CHECK(r == 500 && check_pattern(buf, r, 31), "the peer has the new stream and its data after %d ms (%d)", i, r);
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    if (b2) anl_stream_close(b2);
+    anl_stream_close(a2);
+    for (i = 0; i < 2000; i++) net_tick(&n);
+
+    /* an RST without a generation for a sid never seen here: held, the
+       generation not made up - the RST answering its data has none either */
+    {
+        int h, s2 = 501;
+        q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+        q = enc_sid(q, SEG_CTRL, s2); q = enc8(q, CTRL_RST); q = enc_varint(q, 0);
+        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+        h = held_find(n.ep[1], s2);
+        CHECK(r == ANL_OK && h >= 0 && sid_held(n.ep[1], s2) && n.ep[1]->held[h].gen == GEN_ANY,
+              "held with the generation unknown (%d, %d)", r, h >= 0 ? n.ep[1]->held[h].gen : -2);
+    }
+
+    /* a CLOSE never answered: given up after dead_link sends, the sid kept out of use */
+    a2 = open_pair(&n, 0, &o, NULL, &b2);
+    if (!b2) { net_stop(&n); return; }
+    sid = anl_stream_id(a2);
+    n.block[0] = 1;
+    anl_stream_close(a2);
+    for (i = 0; i < 200000 && n.ep[0]->nclos; i++) net_tick(&n);
+    CHECK(n.ep[0]->nclos == 0 && i > 60000 && i < 120000, "CLOSE given up after %d ms", i);
+    printf("  CLOSE given up after %d ms\n", i);
+    CHECK(sid_held(n.ep[0], sid) && anl_state(n.ep[0]) == 0, "sid %d kept out of use, connection alive (%d, %d)", sid,
+          sid_held(n.ep[0], sid), anl_state(n.ep[0]));
+    anl_stream_close(b2);
+    net_stop(&n);
+}
+
 /* sids (DESIGN 6.1): the lowest free one of our parity; one whose stream
  * went is held 2 s on both sides, then used again. A late first datagram of
  * the old stream inside the hold gets RST, not a new stream */
@@ -1549,8 +1655,9 @@ static void test_max_streams(void)
 }
 
 /* a proxy's pattern (DESIGN 6.1): streams opened, used and closed for good,
- * far more of them than 13-bit sids, with loss. Sids above 8191 take the
- * 2-byte extension; a stale first datagram of a finished one gets RST */
+ * thousands of them, with loss and (then) duplicated datagrams. Sids are
+ * used again after their hold, so the highest stays near what is in use or
+ * held at a time; generations keep the earlier stream's late segments out */
 static void test_sid_churn(int loss, int TOTAL)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
@@ -1559,9 +1666,10 @@ static void test_sid_churn(int loss, int TOTAL)
     char buf[3000];
     int i, j, r, done = 0, got = 0, open_fail = 0;
     uint32_t top = 0;
-    printf("[sid churn: %d streams opened and closed, %d%% loss]\n", TOTAL, loss);
+    printf("[sid churn: %d streams opened and closed, %d%% loss%s]\n", TOTAL, loss, loss ? ", 5% duplicated" : "");
     net_init(&n, &ca, &cb);
     n.loss_pct = loss;
+    n.dup_pct = loss ? 5 : 0;
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_RELIABLE);
     while (done < TOTAL) {
@@ -4173,6 +4281,7 @@ int main(void)
     RUN(test_stream_lifecycle(0));
     RUN(test_stream_lifecycle(10));
     RUN(test_sid_reuse());
+    RUN(test_sid_stale_proof());
     RUN(test_handle_lifetime());
     RUN(test_wire_v1_wrap(0));
     RUN(test_wire_v1_wrap(1));

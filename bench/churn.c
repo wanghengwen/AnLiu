@@ -37,7 +37,22 @@
  * Build:  gcc -std=gnu99 -O2 -I.. churn.c -lm -o churn
  * (includes ../anliu.c: reads the closing records of the connection)
  */
+#include <stdint.h>
+#include <stdio.h>
+struct anl_s;
+/* why the connection was declared dead (DEAD line) */
+static void trace_dead(const struct anl_s *w, const char *reason, int sid, uint32_t sn,
+                       uint32_t xmit, uint32_t enqueued, uint32_t last_sent);
+#define ANL_DEAD_TRACE trace_dead
 #include "../anliu.c"
+#undef ANL_DEAD_TRACE
+static void trace_dead(const struct anl_s *w, const char *reason, int sid, uint32_t sn,
+                       uint32_t xmit, uint32_t enqueued, uint32_t last_sent)
+{
+    printf("DEAD_REASON now=%u reason=%s sid=%d sn=%u xmit=%u enqueued=%u last_sent=%u last_rx=%u srtt=%d rto=%d\n",
+           w->current, reason, sid, sn, xmit, enqueued, last_sent, w->last_rx, w->rx_srtt, w->rx_rto);
+    fflush(stdout);
+}
 
 #include <arpa/inet.h>
 #include <errno.h>
