@@ -827,33 +827,39 @@ struct anl_s {
                                            which reordering does too (DESIGN 8.6) */
     int64_t par_tokens;                 /* parity budget (DESIGN 8.6), bytes */
     uint32_t par_rate, par_ts;          /* its rate (0xffffffff: no estimate yet), last refill */
-    uint32_t par_queue_ts;              /* recent queue evidence: limit RTT-auto parity bursts */
-    int capacity_short;                 /* the bottleneck is slower than the media: the path delivers well
-                                           under what is sent, or frames expire unsent (DESIGN 8.6) - no
-                                           adaptive parity, not app-limited */
-    uint32_t pay_avg, dlv_avg;          /* ... payload sent / delivered, bytes/s, smoothed over rate steps */
-    uint32_t off_avg, unsent_avg;       /* ... semi-reliable payload offered / of it expired unsent, bytes/s */
-    uint32_t rate_steps;                /* rate_update steps so far (the averages need a few) */
-    uint32_t cs_retry;                 /* steps without queueing before a recovery probe */
-    uint32_t cs_recover;               /* successful probe: observation deadline (| 1), 0 otherwise */
-    uint32_t cs_test_ts, cs_test_dlv;   /* bounded probe: start time and prior delivered payload rate */
-    uint32_t cs_cnt, cs_clear, cs_ts;   /* consecutive steps that read short / clear; last change or failed recovery probe (| 1) */
-    int cs_by_unsent;                   /* entered on expiring frames alone (the path delivered what was sent) */
-    int cs_net;                         /* the network shows the shortage: payload lost (a sixteenth) or a queue */
-    int cs_loss;                        /* ... the loss part alone: app-limited marking is suppressed only then */
-    uint32_t cs_calm;                   /* consecutive steps it did not: 5 of them end a state entered on expiry alone */
-    int cs_probe;                       /* such a state (or within 5 s of leaving it) with 3 calm steps: bw_lo released,
-                                           PROBE_BW probes at once and UP goes on while the estimate grows */
-    uint32_t exp_last, exp_prev;        /* the last two expiry events (steps with unsent frames expired, >= 1 s apart; | 1) */
-    uint64_t tx_unsent, rate_unsent0;   /* semi-reliable payload dropped before its first send (max_age) */
-    uint64_t delivered_pay, rate_dpay0; /* payload bytes acknowledged (repaired ones included) */
-    uint64_t purged_unsent;             /* purge_frame: payload bytes taken out of snd_queue, ever */
-    uint32_t rate_par0;                 /* sent_par at the last rate_update */
-    uint64_t rate_payload0, rate_wire0, rate_deliv0;
-    uint32_t rate_ts, rate_share;       /* payload share of the wire bytes, 1/256 */
-    uint32_t rate_target, rate_told;    /* target_rate; the value last given to rate_cb */
-    uint32_t rate_rtt_min, rate_rtt_old, rate_rtt_ts;  /* min srtt over 15..30 s (two windows) */
-    uint32_t pay_avg_prev;              /* pay_avg a step ago: delivery trails sending by a round trip, about a step */
+    /* the rate interface (DESIGN 6.10): target_rate for the application and the
+       capacity-short state, stepped by rate_update every RATE_STEP_MS from the
+       payload accounting below; read elsewhere as capacity_short, target,
+       par_queue_ts and the smoothed averages */
+    struct {
+        uint32_t par_queue_ts;              /* recent queue evidence: limit RTT-auto parity bursts */
+        int capacity_short;                 /* the bottleneck is slower than the media: the path delivers well
+                                               under what is sent, or frames expire unsent (DESIGN 8.6) - no
+                                               adaptive parity, not app-limited */
+        uint32_t pay_avg, dlv_avg;          /* ... payload sent / delivered, bytes/s, smoothed over rate steps */
+        uint32_t off_avg, unsent_avg;       /* ... semi-reliable payload offered / of it expired unsent, bytes/s */
+        uint32_t steps;                /* rate_update steps so far (the averages need a few) */
+        uint32_t cs_retry;                 /* steps without queueing before a recovery probe */
+        uint32_t cs_recover;               /* successful probe: observation deadline (| 1), 0 otherwise */
+        uint32_t cs_test_ts, cs_test_dlv;   /* bounded probe: start time and prior delivered payload rate */
+        uint32_t cs_cnt, cs_clear, cs_ts;   /* consecutive steps that read short / clear; last change or failed recovery probe (| 1) */
+        int cs_by_unsent;                   /* entered on expiring frames alone (the path delivered what was sent) */
+        int cs_net;                         /* the network shows the shortage: payload lost (a sixteenth) or a queue */
+        int cs_loss;                        /* ... the loss part alone: app-limited marking is suppressed only then */
+        uint32_t cs_calm;                   /* consecutive steps it did not: 5 of them end a state entered on expiry alone */
+        int cs_probe;                       /* such a state (or within 5 s of leaving it) with 3 calm steps: bw_lo released,
+                                               PROBE_BW probes at once and UP goes on while the estimate grows */
+        uint32_t exp_last, exp_prev;        /* the last two expiry events (steps with unsent frames expired, >= 1 s apart; | 1) */
+        uint64_t tx_unsent, unsent0;   /* semi-reliable payload dropped before its first send (max_age) */
+        uint64_t delivered_pay, dpay0; /* payload bytes acknowledged (repaired ones included) */
+        uint64_t purged_unsent;             /* purge_frame: payload bytes taken out of snd_queue, ever */
+        uint32_t par0;                 /* sent_par at the last rate_update */
+        uint64_t payload0, wire0, deliv0;
+        uint32_t ts, share;       /* payload share of the wire bytes, 1/256 */
+        uint32_t target, told;    /* target_rate; the value last given to rate_cb */
+        uint32_t rtt_min, rtt_old, rtt_ts;  /* min srtt over 15..30 s (two windows) */
+        uint32_t pay_avg_prev;              /* pay_avg a step ago: delivery trails sending by a round trip, about a step */
+    } rate;
     anl_stream *dflt;                   /* default stream, sid 0 */
     uint32_t rstq[RSTQ_MAX];            /* pending RSTs for sids without any state, distinct */
     int nrstq;
@@ -1513,7 +1519,7 @@ static uint64_t bbr_inflight_bytes(const anl_t *w);
  * what it is testing (rate_update); adaptive parity stays off meanwhile. */
 static int bbr_headroom(const anl_t *w)
 {
-    return w->cs_test_ts != 0 || (w->app_limited != 0 &&
+    return w->rate.cs_test_ts != 0 || (w->app_limited != 0 &&
            (w->net_round == 0 || tdiff(w->round_count, w->net_round) > BBR_BW_ROUNDS));
 }
 
@@ -2950,7 +2956,7 @@ static void bbr_set_phase(anl_t *w, int phase)
 static int bbr_probe_due(const anl_t *w)
 {
     uint32_t pkts = umin32(umin32((uint32_t)(bbr_bdp(w) / w->avg_seg), w->cwnd), 63);
-    return w->cs_probe || tdiff(w->current, w->probe_ts) >= 0 || tdiff(w->round_count, w->probe_round) >= (int32_t)pkts;
+    return w->rate.cs_probe || tdiff(w->current, w->probe_ts) >= 0 || tdiff(w->round_count, w->probe_round) >= (int32_t)pkts;
 }
 
 static void bbr_enter_probe_bw(anl_t *w)
@@ -3197,7 +3203,7 @@ static void bbr_update_state(anl_t *w)
             /* after a shortage the network no longer shows (cs_probe): the
                full pipe is the stale estimate's, keep going while it grows */
             if (tdiff(w->current, w->phase_ts) >= (int32_t)rtt &&
-                ((bbr_inflight_bytes(w) >= bbr_bdp(w) * BBR_UP_GAIN / BBR_UNIT && !(w->cs_probe && w->up_stall == 0)) ||
+                ((bbr_inflight_bytes(w) >= bbr_bdp(w) * BBR_UP_GAIN / BBR_UNIT && !(w->rate.cs_probe && w->up_stall == 0)) ||
                  w->up_stall >= 2))
                 bbr_set_phase(w, BBR_DOWN);
             break;
@@ -3318,7 +3324,7 @@ static void bbr_on_acked(anl_t *w, const anl_seg *s, bbr_sample *rs)
     burst_on_acked(w, s);
     w->delivered += seg_wire(s);
     w->delivered_fec += s->fec_share;
-    w->delivered_pay += s->len;
+    w->rate.delivered_pay += s->len;
     w->delivered_ts = w->current;
     if (w->inflight_segs > 0) w->inflight_segs--;
     if (rs == NULL) return;
@@ -4066,7 +4072,7 @@ static void fec_send_parity(anl_t *w, anl_stream *st) { fec_write_parity(w, st, 
 static int fec_ride(const anl_t *w, const anl_stream *st)
 {
     if (!st->fec_out_small || st->fec_out_m == 0 || st->fec_out[0].len > FEC_RIDE_MAX) return 0;
-    if (w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    if (w->rate.par_queue_ts && tdiff(w->current, w->rate.par_queue_ts) < RATE_RTT_WIN) return 0;
     return w->fec_loss < FEC_RIDE_LOSS;
 }
 
@@ -4186,10 +4192,10 @@ static void fec_gate_update(anl_t *w, anl_stream *st)
     }
     /* A startup allowance never overrides known capacity shortage or
        its reopening hold; failed delivery probes keep all adaptive FEC off. */
-    if (w->capacity_short || (w->cs_ts != 0 && tdiff(w->current, w->cs_ts) < FEC_GATE_HOLD_MS)) on = 0;
+    if (w->rate.capacity_short || (w->rate.cs_ts != 0 && tdiff(w->current, w->rate.cs_ts) < FEC_GATE_HOLD_MS)) on = 0;
     /* Opening on the first loss is not held back; subsequent changes
        retain the hold to avoid toggling around the thresholds. */
-    if (on != st->fec_gate && (st->fec_gate_ts == 0 || (!on && (w->capacity_short || (!recent && !startup))) ||
+    if (on != st->fec_gate && (st->fec_gate_ts == 0 || (!on && (w->rate.capacity_short || (!recent && !startup))) ||
                                (on && !st->fec_gate_was) ||
                                tdiff(w->current, st->fec_gate_ts) >= FEC_GATE_HOLD_MS)) {
         st->fec_gate = on;
@@ -4260,7 +4266,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     /* adaptive parity while capacity is short (rate_update, DESIGN 8.6):
        none, key frames included - a key frame's 16 parities are the burst
        that overflows the queue; a fixed ratio stays as configured */
-    if (st->fec_auto && w->capacity_short) return;
+    if (st->fec_auto && w->rate.capacity_short) return;
     for (i = 0; i < k; i++) lmax = umax32(lmax, st->fec_slot[i].len);
     x = k * (uint32_t)st->fec_ratio + st->fec_carry;
     m = x / 100;
@@ -4310,8 +4316,8 @@ static void fec_close_block(anl_t *w, anl_stream *st)
                  * gaps between key frames do not restore the burst. A
                  * larger recovered budget naturally releases this cap.
                  * The small mandatory floor remains available. */
-                if (st->fec_rtt_auto && w->par_queue_ts &&
-                    tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) {
+                if (st->fec_rtt_auto && w->rate.par_queue_ts &&
+                    tdiff(w->current, w->rate.par_queue_ts) < RATE_RTT_WIN) {
                     uint32_t burst = (uint32_t)((uint64_t)w->par_rate * FEC_BLOCK_MS / 1000 / per);
                     room = umin32(room, burst);
                 }
@@ -4463,7 +4469,7 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
            would add to it. Only while network-limited or queueing: app-
            limited, the budget follows an estimate that shows only what was
            sent, and the losses are not ours (TUNING.md 38) */
-        if (w->capacity_short || (st->fec_frame_avg * 8 > FEC_SMALL_BLOCK && w->par_rate != 0xffffffffu &&
+        if (w->rate.capacity_short || (st->fec_frame_avg * 8 > FEC_SMALL_BLOCK && w->par_rate != 0xffffffffu &&
                                   w->par_tokens * 2 < (int64_t)par_bucket(w) &&
                                   (w->app_limited == 0 || bbr_queue_signal(w)))) {
             if (st->fec_ratio > FEC_FLOOR_CAP) st->fec_ratio = FEC_FLOOR_CAP;
@@ -4595,7 +4601,7 @@ static int purge_frame(anl_stream *st, uint32_t frame_no, uint32_t *end)
         }
         first = 0;
         in_buf = 1;
-        st->w->purged_unsent += s->len;
+        st->w->rate.purged_unsent += s->len;
         qdel(&s->node);
         st->nsnd_que--;
         backlog_sub(st, s->len);
@@ -4676,7 +4682,7 @@ static void semi_drop_check(anl_t *w, anl_stream *st)
        short of capacity for it (rate_update). A frame lost in flight is
        abandoned by the retransmission path instead, and what its GOP takes
        with it is the loss's doing, not counted here */
-    uint64_t unsent0 = w->purged_unsent;
+    uint64_t unsent0 = w->rate.purged_unsent;
     if (st->mode != ANL_SEMI) return;
     if (st->max_age_ms == 0 && st->max_bytes == 0) return;
     for (;;) {
@@ -4693,7 +4699,7 @@ static void semi_drop_check(anl_t *w, anl_stream *st)
         if (head->flags & F_HAS_FRAME) drop_frame(w, st, head->frame_no);    /* never sent: no FWD */
         else abandon_through(w, st, head->frame_no);                         /* head already sent */
     }
-    w->tx_unsent += w->purged_unsent - unsent0;
+    w->rate.tx_unsent += w->rate.purged_unsent - unsent0;
 }
 
 /* The hole at rcv_nxt is past saving: a retransmission of it - sent once our
@@ -4918,7 +4924,7 @@ static uint32_t vq_ms(const anl_t *w)
 {
     uint32_t rate = umax32(bbr_bw(w), w->burst_bw);
     uint32_t srtt = srtt_or_def(w);
-    if (w->capacity_short || rate == 0) return 0;
+    if (w->rate.capacity_short || rate == 0) return 0;
     return (uint32_t)umin32((uint64_t)vq_left(w) * 1000 / rate, srtt);
 }
 
@@ -4955,25 +4961,25 @@ static void move_and_send(anl_t *w, anl_stream *st)
  *   when nothing is delivered in time. */
 static void rate_update(anl_t *w)
 {
-    int32_t dt = tdiff(w->current, w->rate_ts);
+    int32_t dt = tdiff(w->current, w->rate.ts);
     uint64_t dp, dwire, dd, dpar, base, pay_rate;
     uint32_t rmin, queue;
     int delivery_limited;
-    if (w->rate_ts != 0 && dt < RATE_STEP_MS) return;
-    dp = w->tx_payload - w->rate_payload0;
-    dwire = (uint32_t)(w->sent_wire - (uint32_t)w->rate_wire0); /* sent_wire wraps at 32 bits */
-    dd = w->delivered - w->rate_deliv0;
-    dpar = (uint32_t)(w->sent_par - w->rate_par0);
-    w->rate_par0 = w->sent_par;
-    w->rate_payload0 = w->tx_payload;
-    w->rate_wire0 = w->sent_wire;
-    w->rate_deliv0 = w->delivered;
-    w->rate_ts = w->current ? w->current : 1;
-    if (w->rate_share == 0) w->rate_share = 230;                /* 0.9 until measured */
+    if (w->rate.ts != 0 && dt < RATE_STEP_MS) return;
+    dp = w->tx_payload - w->rate.payload0;
+    dwire = (uint32_t)(w->sent_wire - (uint32_t)w->rate.wire0); /* sent_wire wraps at 32 bits */
+    dd = w->delivered - w->rate.deliv0;
+    dpar = (uint32_t)(w->sent_par - w->rate.par0);
+    w->rate.par0 = w->sent_par;
+    w->rate.payload0 = w->tx_payload;
+    w->rate.wire0 = w->sent_wire;
+    w->rate.deliv0 = w->delivered;
+    w->rate.ts = w->current ? w->current : 1;
+    if (w->rate.share == 0) w->rate.share = 230;                /* 0.9 until measured */
     if (dt <= 0 || dt > 10 * RATE_STEP_MS) return;              /* first call, or after idling */
     if (dp >= 2u * w->mss && dwire >= 4u * w->mss) {            /* not from retransmissions alone */
         uint32_t sh = ubound32(128, (uint32_t)umin32((uint32_t)(dp * 256 / dwire), 256), 256);
-        w->rate_share = (uint32_t)((int32_t)w->rate_share + ((int32_t)sh - (int32_t)w->rate_share) / 4);
+        w->rate.share = (uint32_t)((int32_t)w->rate.share + ((int32_t)sh - (int32_t)w->rate.share) / 4);
     }
     /* A small packet acknowledged before the first media flight finishes
        measures its bytes over the whole RTT, not the path's capacity. Do
@@ -4983,28 +4989,28 @@ static void rate_update(anl_t *w)
        and turns off audio repair. Wait once for the payload of a normal
        two-datagram ACK batch; BBR and pacing keep operating meanwhile. */
     if (w->btl_bw == 0 || w->rx_srtt <= 0) return;
-    if (w->rate_target == 0 && w->delivered_pay < 2u * w->mss) {
-        w->rate_dpay0 = w->delivered_pay;
-        w->rate_unsent0 = w->tx_unsent;
+    if (w->rate.target == 0 && w->rate.delivered_pay < 2u * w->mss) {
+        w->rate.dpay0 = w->rate.delivered_pay;
+        w->rate.unsent0 = w->rate.tx_unsent;
         return;
     }
     /* parity budget (DESIGN 8.6): 90% of the estimate less all else sent,
        smoothed over about 8 steps (1.6 s): a key frame fills a 200 ms
        step by itself, and a budget that read 0 for that step shrank the
        bucket and threw its tokens away */
-    if (w->rate_rtt_ts == 0 || tdiff(w->current, w->rate_rtt_ts) >= RATE_RTT_WIN) {
-        w->rate_rtt_old = w->rate_rtt_ts ? w->rate_rtt_min : (uint32_t)w->rx_srtt;
-        w->rate_rtt_min = (uint32_t)w->rx_srtt;
-        w->rate_rtt_ts = w->current ? w->current : 1;
+    if (w->rate.rtt_ts == 0 || tdiff(w->current, w->rate.rtt_ts) >= RATE_RTT_WIN) {
+        w->rate.rtt_old = w->rate.rtt_ts ? w->rate.rtt_min : (uint32_t)w->rx_srtt;
+        w->rate.rtt_min = (uint32_t)w->rx_srtt;
+        w->rate.rtt_ts = w->current ? w->current : 1;
     }
-    w->rate_rtt_min = umin32(w->rate_rtt_min, (uint32_t)w->rx_srtt);
-    rmin = umin32(w->rate_rtt_min, w->rate_rtt_old);
+    w->rate.rtt_min = umin32(w->rate.rtt_min, (uint32_t)w->rx_srtt);
+    rmin = umin32(w->rate.rtt_min, w->rate.rtt_old);
     queue = (uint32_t)w->rx_srtt - rmin;
-    if (queue > umax32(rmin / 4, 25)) w->par_queue_ts = w->current | 1;
-    base = (uint64_t)bbr_bw(w) * w->rate_share / 256 * (100 - RATE_MARGIN) / 100;
+    if (queue > umax32(rmin / 4, 25)) w->rate.par_queue_ts = w->current | 1;
+    base = (uint64_t)bbr_bw(w) * w->rate.share / 256 * (100 - RATE_MARGIN) / 100;
     pay_rate = dp * 1000 / (uint32_t)dt;
-    delivery_limited = w->rate_steps >= 5 && w->dlv_avg != 0 &&
-        (w->capacity_short || (uint64_t)w->dlv_avg * 4 < (uint64_t)w->pay_avg_prev * 3);
+    delivery_limited = w->rate.steps >= 5 && w->rate.dlv_avg != 0 &&
+        (w->rate.capacity_short || (uint64_t)w->rate.dlv_avg * 4 < (uint64_t)w->rate.pay_avg_prev * 3);
     if (queue > umax32(rmin / 2, 30)) {
         /* what the path delivers now, or - when nothing gets through in time
            - RATE_DECREASE % less per step; not below what BBR keeps going at
@@ -5015,11 +5021,11 @@ static void rate_update(anl_t *w)
            for a step, and its few acknowledgements in that step read as a
            tiny rate. A bottleneck that got slower loses what is sent and gets
            this step's rate (TUNING.md 43) */
-        uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate_share / 256;
-        uint64_t now_pay = dd * 1000 / (uint32_t)dt * w->rate_share / 256, cut;
-        if (!w->cs_loss && now_pay < w->dlv_avg) now_pay = w->dlv_avg;
+        uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate.share / 256;
+        uint64_t now_pay = dd * 1000 / (uint32_t)dt * w->rate.share / 256, cut;
+        if (!w->rate.cs_loss && now_pay < w->rate.dlv_avg) now_pay = w->rate.dlv_avg;
         cut = now_pay * (100 - RATE_MARGIN) / 100;
-        if (cut < floor) cut = (uint64_t)w->rate_target * (100 - RATE_DECREASE) / 100;
+        if (cut < floor) cut = (uint64_t)w->rate.target * (100 - RATE_DECREASE) / 100;
         if (cut < floor) cut = floor;
         if (cut < base) base = cut;
         /* A burst draining into ACKs is not new capacity: apply the same
@@ -5027,8 +5033,8 @@ static void rate_update(anl_t *w)
            already bounds the target below actual delivery (below); let
            ACKs recover from a sparse step within that ceiling instead of
            making one low sample the starting point of a long ramp. */
-        if (w->rate_target != 0 && !delivery_limited) {
-            uint64_t grow = w->rate_target + (uint64_t)w->rate_target * RATE_GROWTH * (uint32_t)dt / 100000;
+        if (w->rate.target != 0 && !delivery_limited) {
+            uint64_t grow = w->rate.target + (uint64_t)w->rate.target * RATE_GROWTH * (uint32_t)dt / 100000;
             if (base > grow) base = grow;
         }
     } else {
@@ -5037,11 +5043,11 @@ static void rate_update(anl_t *w)
            goes at the next probe) - climbing, the queue shows first. While
            app-limited without a queue, up by as much (at most 1.25 x what is
            sent): the estimate only shows what the application sent. */
-        uint64_t prev = w->rate_target ? w->rate_target : base;
+        uint64_t prev = w->rate.target ? w->rate.target : base;
         /* The bounded recovery test has to feed the path to test growth.
            The application may already send above a depressed target (its
            minimum media rate); start from that measured load, not below it. */
-        if (w->cs_test_ts && prev < w->pay_avg) prev = w->pay_avg;
+        if (w->rate.cs_test_ts && prev < w->rate.pay_avg) prev = w->rate.pay_avg;
         uint64_t grow = prev + prev * RATE_GROWTH * (uint32_t)dt / 100000;
         /* 25 ms: at a low rate srtt sits 10..20 ms above its minimum anyway
            (ACKs wait for the flush interval, key frames come in bursts) */
@@ -5062,16 +5068,16 @@ static void rate_update(anl_t *w)
     /* During the existing 1.5 s capacity test, allow the ordinary bounded
        upward ramp to produce the load whose delivery the test measures.
        Capping it at old delivery otherwise defeats the requested probe. */
-    if (delivery_limited && !w->cs_test_ts) {
-        uint64_t cap = (uint64_t)w->dlv_avg * (100 - RATE_MARGIN) / 100;
-        uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate_share / 256;
+    if (delivery_limited && !w->rate.cs_test_ts) {
+        uint64_t cap = (uint64_t)w->rate.dlv_avg * (100 - RATE_MARGIN) / 100;
+        uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate.share / 256;
         if (cap < floor) cap = floor;
         if (base > cap) base = cap;
     }
-    w->rate_target = base > 0xffffffffu ? 0xffffffffu : (uint32_t)base;
-    if (w->rate_cb && (w->rate_told == 0 || w->rate_target * 20ull >= w->rate_told * 21ull || w->rate_target * 20ull <= w->rate_told * 19ull)) {
-        w->rate_told = w->rate_target;
-        w->rate_cb(w, w->rate_target, w->user);
+    w->rate.target = base > 0xffffffffu ? 0xffffffffu : (uint32_t)base;
+    if (w->rate_cb && (w->rate.told == 0 || w->rate.target * 20ull >= w->rate.told * 21ull || w->rate.target * 20ull <= w->rate.told * 19ull)) {
+        w->rate.told = w->rate.target;
+        w->rate_cb(w, w->rate.target, w->user);
     }
     /* Capacity short (DESIGN 8.6): the bottleneck is slower than the media.
        Two signs, each smoothed over about 4 steps (a key frame's step sends
@@ -5100,18 +5106,18 @@ static void rate_update(anl_t *w)
        its queue is empty because it discarded the application's data, not
        because the application had nothing to send (TUNING.md 45). */
     {
-        uint64_t dlv_pay = (w->delivered_pay - w->rate_dpay0) * 1000 / (uint32_t)dt;
-        uint64_t dun = w->tx_unsent - w->rate_unsent0, un_rate = dun * 1000 / (uint32_t)dt, off_rate = pay_rate + un_rate;
+        uint64_t dlv_pay = (w->rate.delivered_pay - w->rate.dpay0) * 1000 / (uint32_t)dt;
+        uint64_t dun = w->rate.tx_unsent - w->rate.unsent0, un_rate = dun * 1000 / (uint32_t)dt, off_rate = pay_rate + un_rate;
         int enter, leave, repeated, retry_ok, grew;
-        w->rate_unsent0 = w->tx_unsent;
-        w->rate_dpay0 = w->delivered_pay;
-        if (dun > 0 && (w->exp_last == 0 || tdiff(w->current, w->exp_last) >= 1000)) {
-            w->exp_prev = w->exp_last;
-            w->exp_last = w->current | 1;
+        w->rate.unsent0 = w->rate.tx_unsent;
+        w->rate.dpay0 = w->rate.delivered_pay;
+        if (dun > 0 && (w->rate.exp_last == 0 || tdiff(w->current, w->rate.exp_last) >= 1000)) {
+            w->rate.exp_prev = w->rate.exp_last;
+            w->rate.exp_last = w->current | 1;
         }
-        repeated = w->exp_prev != 0 && tdiff(w->current, w->exp_prev) <= 6000;
-#define RATE_AVG(f, x) (w->f = w->f == 0 ? sat32(x) : (uint32_t)((int64_t)w->f + ((int64_t)sat32(x) - (int64_t)w->f) / 4))
-        w->pay_avg_prev = w->pay_avg;
+        repeated = w->rate.exp_prev != 0 && tdiff(w->current, w->rate.exp_prev) <= 6000;
+#define RATE_AVG(f, x) (w->rate.f = w->rate.f == 0 ? sat32(x) : (uint32_t)((int64_t)w->rate.f + ((int64_t)sat32(x) - (int64_t)w->rate.f) / 4))
+        w->rate.pay_avg_prev = w->rate.pay_avg;
         RATE_AVG(pay_avg, pay_rate);
         RATE_AVG(dlv_avg, dlv_pay);
         RATE_AVG(off_avg, off_rate);
@@ -5127,23 +5133,23 @@ static void rate_update(anl_t *w)
            bunches (a GOP at a time, every second or two) and the sender
            backs off in between; leaving at each lull let the gate reopen
            and the parity return for a few seconds at a time. */
-        if (w->rate_steps < 0xffffffffu) w->rate_steps++;
+        if (w->rate.steps < 0xffffffffu) w->rate.steps++;
         retry_ok = w->lt.state == 0 && queue < umax32(rmin / 4, 25);
         /* A failed retry is still the known shortage, not a new suspicion:
            restore suppression now instead of waiting three more steps. */
-        if (w->cs_recover && !retry_ok) {
-            w->cs_recover = 0;
-            w->capacity_short = 1; w->cs_ts = w->current | 1;
-            w->cs_by_unsent = 0;
+        if (w->rate.cs_recover && !retry_ok) {
+            w->rate.cs_recover = 0;
+            w->rate.capacity_short = 1; w->rate.cs_ts = w->current | 1;
+            w->rate.cs_by_unsent = 0;
         }
-        if (w->cs_recover && tdiff(w->current, w->cs_recover) >= 0) w->cs_recover = 0;
-        if (w->cs_test_ts && !retry_ok) {
-            w->cs_test_ts = 0;
-            w->cs_ts = w->current | 1;
+        if (w->rate.cs_recover && tdiff(w->current, w->rate.cs_recover) >= 0) w->rate.cs_recover = 0;
+        if (w->rate.cs_test_ts && !retry_ok) {
+            w->rate.cs_test_ts = 0;
+            w->rate.cs_ts = w->current | 1;
         }
-        enter = w->rate_steps >= 5 && !w->cs_recover && w->dlv_avg != 0 &&
-                ((uint64_t)w->dlv_avg * 2 < w->pay_avg || (repeated && (uint64_t)w->unsent_avg * 16 > w->off_avg));
-        leave = (uint64_t)w->dlv_avg * 4 > (uint64_t)w->pay_avg * 3 && (uint64_t)w->unsent_avg * 64 < w->off_avg;
+        enter = w->rate.steps >= 5 && !w->rate.cs_recover && w->rate.dlv_avg != 0 &&
+                ((uint64_t)w->rate.dlv_avg * 2 < w->rate.pay_avg || (repeated && (uint64_t)w->rate.unsent_avg * 16 > w->rate.off_avg));
+        leave = (uint64_t)w->rate.dlv_avg * 4 > (uint64_t)w->rate.pay_avg * 3 && (uint64_t)w->rate.unsent_avg * 64 < w->rate.off_avg;
         /* Random loss can keep delivery below the 75% exit threshold even
            after capacity returns: retransmitted payload is counted in what
            we send, and abandoned frames never acknowledge their tail. With
@@ -5160,14 +5166,14 @@ static void rate_update(anl_t *w)
            after its usual 2 s gate hold. Queueing/policer feedback cancels
            that grace immediately; a low single-step delivery ratio does
            not, since a key-frame/ACK burst also causes it on a lossy path. */
-        if (w->capacity_short && tdiff(w->current, w->cs_ts) >= 5000 &&
-            retry_ok && (uint64_t)w->dlv_avg * 2 > w->pay_avg)
-            w->cs_retry++;
-        else w->cs_retry = 0;
-        if (w->capacity_short && w->cs_retry >= 5 && !w->cs_test_ts &&
-            (uint64_t)w->dlv_avg * 16 < (uint64_t)w->pay_avg * 15) {
-            w->cs_test_ts = w->current | 1;
-            w->cs_test_dlv = w->dlv_avg;
+        if (w->rate.capacity_short && tdiff(w->current, w->rate.cs_ts) >= 5000 &&
+            retry_ok && (uint64_t)w->rate.dlv_avg * 2 > w->rate.pay_avg)
+            w->rate.cs_retry++;
+        else w->rate.cs_retry = 0;
+        if (w->rate.capacity_short && w->rate.cs_retry >= 5 && !w->rate.cs_test_ts &&
+            (uint64_t)w->rate.dlv_avg * 16 < (uint64_t)w->rate.pay_avg * 15) {
+            w->rate.cs_test_ts = w->current | 1;
+            w->rate.cs_test_dlv = w->rate.dlv_avg;
             w->bw_lo = 0;
         }
         /* The network's own signs of the shortage: payload lost (over a
@@ -5179,38 +5185,38 @@ static void rate_update(anl_t *w)
            2..3 s cycle. Not a state entered on loss (an outage, a policer):
            ending that one on calm alone let the RTT jump after an outage
            collapse the model (TUNING.md 46) */
-        w->cs_loss = (uint64_t)w->dlv_avg * 16 < (uint64_t)w->pay_avg * 15;
-        w->cs_net = w->cs_loss || queue > umax32(rmin / 4, 25);
-        w->cs_calm = w->cs_net ? 0 : w->cs_calm + 1;
+        w->rate.cs_loss = (uint64_t)w->rate.dlv_avg * 16 < (uint64_t)w->rate.pay_avg * 15;
+        w->rate.cs_net = w->rate.cs_loss || queue > umax32(rmin / 4, 25);
+        w->rate.cs_calm = w->rate.cs_net ? 0 : w->rate.cs_calm + 1;
         /* ... and meanwhile the model grows a quarter per round instead of
            per probe cycle: bw_lo (cut on the lossy rounds of the shortage)
            released, PROBE_BW due now, UP not ended by "the pipe is full" -
            the pipe is the stale estimate's - but by a round without growth
            (bbr_probe_due, bbr_update_state) */
         {
-            int probe = w->cs_test_ts != 0 || (w->cs_by_unsent && w->cs_calm >= 3 &&
-                        (w->capacity_short || (w->cs_ts != 0 && tdiff(w->current, w->cs_ts) < 5000)));
-            if (probe && !w->cs_probe) w->bw_lo = 0;
-            w->cs_probe = probe;
+            int probe = w->rate.cs_test_ts != 0 || (w->rate.cs_by_unsent && w->rate.cs_calm >= 3 &&
+                        (w->rate.capacity_short || (w->rate.cs_ts != 0 && tdiff(w->current, w->rate.cs_ts) < 5000)));
+            if (probe && !w->rate.cs_probe) w->bw_lo = 0;
+            w->rate.cs_probe = probe;
         }
-        grew = w->cs_test_ts && tdiff(w->current, w->cs_test_ts) >= 1000 &&
-               (uint64_t)w->dlv_avg * 4 > (uint64_t)w->cs_test_dlv * 5;
-        w->cs_cnt = enter ? w->cs_cnt + 1 : 0;
-        w->cs_clear = leave ? w->cs_clear + 1 : 0;
-        if (!w->capacity_short && w->cs_cnt >= 3) {
-            w->capacity_short = 1; w->cs_ts = w->current | 1;
-            w->cs_by_unsent = !((uint64_t)w->dlv_avg * 2 < w->pay_avg);
-        } else if (w->capacity_short && (w->cs_clear >= 10 || grew || (w->cs_by_unsent && w->cs_calm >= 5)) &&
-                   tdiff(w->current, w->cs_ts) >= 3000) {
-            if (w->cs_test_ts) w->cs_recover = (w->current + 4000) | 1;
-            w->capacity_short = 0; w->cs_ts = w->current | 1;
-            w->cs_cnt = 0;
+        grew = w->rate.cs_test_ts && tdiff(w->current, w->rate.cs_test_ts) >= 1000 &&
+               (uint64_t)w->rate.dlv_avg * 4 > (uint64_t)w->rate.cs_test_dlv * 5;
+        w->rate.cs_cnt = enter ? w->rate.cs_cnt + 1 : 0;
+        w->rate.cs_clear = leave ? w->rate.cs_clear + 1 : 0;
+        if (!w->rate.capacity_short && w->rate.cs_cnt >= 3) {
+            w->rate.capacity_short = 1; w->rate.cs_ts = w->current | 1;
+            w->rate.cs_by_unsent = !((uint64_t)w->rate.dlv_avg * 2 < w->rate.pay_avg);
+        } else if (w->rate.capacity_short && (w->rate.cs_clear >= 10 || grew || (w->rate.cs_by_unsent && w->rate.cs_calm >= 5)) &&
+                   tdiff(w->current, w->rate.cs_ts) >= 3000) {
+            if (w->rate.cs_test_ts) w->rate.cs_recover = (w->current + 4000) | 1;
+            w->rate.capacity_short = 0; w->rate.cs_ts = w->current | 1;
+            w->rate.cs_cnt = 0;
         }
-        if (w->cs_test_ts && (!w->capacity_short || w->lt.state != 0 ||
-            queue > umax32(rmin / 4, 25) || tdiff(w->current, w->cs_test_ts) >= 1500)) {
-            w->cs_test_ts = 0;
-            w->cs_retry = 0;
-            if (w->capacity_short) w->cs_ts = w->current | 1;
+        if (w->rate.cs_test_ts && (!w->rate.capacity_short || w->lt.state != 0 ||
+            queue > umax32(rmin / 4, 25) || tdiff(w->current, w->rate.cs_test_ts) >= 1500)) {
+            w->rate.cs_test_ts = 0;
+            w->rate.cs_retry = 0;
+            if (w->rate.capacity_short) w->rate.cs_ts = w->current | 1;
         }
         ANL_TRACE(capacity, w, enter, leave);
     }
@@ -5220,7 +5226,7 @@ static void rate_update(anl_t *w)
        threw its tokens away. Nothing while capacity is short: the estimate
        itself is what a token bucket's burst or a key frame measured, not what
        the path sustains (TUNING.md 47) */
-    if (w->capacity_short) {
+    if (w->rate.capacity_short) {
         w->par_rate = 0;
         if (w->par_tokens > 0) w->par_tokens = 0;
     } else {
@@ -5255,8 +5261,8 @@ static uint32_t fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg
     uint32_t srtt = srtt_or_def(w);
     uint32_t u = 1, n, m = seg->fec_m, gone = 1, due, until;
     uint64_t cdf;
-    if (seg->xmit != 1 || m == 0 || !w->fec_loss_valid || w->capacity_short) return 0;
-    if (seg->fec_small && w->par_queue_ts && tdiff(w->current, w->par_queue_ts) < RATE_RTT_WIN) return 0;
+    if (seg->xmit != 1 || m == 0 || !w->fec_loss_valid || w->rate.capacity_short) return 0;
+    if (seg->fec_small && w->rate.par_queue_ts && tdiff(w->current, w->rate.par_queue_ts) < RATE_RTT_WIN) return 0;
     if (seg->fec_small) {
         for (pos = seg->node.prev; pos != &st->snd_buf; pos = pos->prev) {
             const anl_seg *s = QENTRY(pos, anl_seg, node);
@@ -5525,7 +5531,7 @@ static void anl_flush_internal(anl_t *w)
     FOR_EACH_STREAM(w, st, n, nx) {
         if (stream_sendable(st) && st->nsnd_que > 0) { queued = 1; break; }
     }
-    if (!w->pace_blocked && w->flush_budget > 0 && !queued && !(w->capacity_short && w->cs_loss && !w->cs_test_ts)) {
+    if (!w->pace_blocked && w->flush_budget > 0 && !queued && !(w->rate.capacity_short && w->rate.cs_loss && !w->rate.cs_test_ts)) {
         w->app_limited = (w->delivered + bbr_inflight_bytes(w)) | 1;
         w->burst_open = 0;
     }
@@ -5698,7 +5704,7 @@ void anl_setoutput(anl_t *w, anl_output_fn output)
     if (w) w->output = output;
 }
 
-void anl_set_rate_callback(anl_t *w, anl_rate_fn fn) { if (w) { w->rate_cb = fn; w->rate_told = 0; } }
+void anl_set_rate_callback(anl_t *w, anl_rate_fn fn) { if (w) { w->rate_cb = fn; w->rate.told = 0; } }
 void anl_set_report_callback(anl_t *w, anl_report_fn fn) { if (w) w->report_cb = fn; }
 
 void anl_set_accept(anl_t *w, anl_accept_fn accept)
@@ -5808,8 +5814,8 @@ int anl_get_stats(const anl_t *w, anl_stats *out)
     FOR_EACH_STREAM(w, st, n, nx) out->inflight += st->nsnd_buf;
     out->retrans = w->retrans_total;
     out->pace_rate = w->pace_rate ? w->pace_rate : compute_pace_rate(w);
-    out->target_rate = w->rate_target;
-    out->capacity_short = w->capacity_short;
+    out->target_rate = w->rate.target;
+    out->capacity_short = w->rate.capacity_short;
     out->streams = w->nstab;
     out->streams_closing = sid_closing_count(w);
     out->bw_estimate_age_ms = w->net_sample_ts ? (uint32_t)tdiff(w->current, w->net_sample_ts) : 0xffffffffu;

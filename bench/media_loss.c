@@ -227,7 +227,7 @@ int main(int argc, char **argv)
             w->pace_rate_cfg = (uint32_t)(g_gcc.target / 8 * 2.5);
             if (!fixed_scale && s.t % 10 == 0) {
                 /* the target is for everything sent: the encoder gets the payload share */
-                int64_t video = (int64_t)(g_gcc.target / 8 * (w->rate_share ? w->rate_share : 230) / 256) - 8000;
+                int64_t video = (int64_t)(g_gcc.target / 8 * (w->rate.share ? w->rate.share : 230) / 256) - 8000;
                 scale = video <= 0 ? 100 : (int)(video * 1000 / 117500);
                 if (scale > scale_max) scale = scale_max;
                 if (scale < 100) scale = 100;
@@ -243,7 +243,7 @@ int main(int argc, char **argv)
             if (drive_check) drv_rearm(&s, 1 - k, now32(&s));
         }
         if (s.t < (uint64_t)duration * 1000) {
-            scale_sum += scale; gate_ms += s.e[0].h[1]->fec_gate; short_ms += s.e[0].anl->capacity_short;
+            scale_sum += scale; gate_ms += s.e[0].h[1]->fec_gate; short_ms += s.e[0].anl->rate.capacity_short;
             for (i = 0; i < 2; i++) if (s.t >= f[i].next_t && !(i == 1 && audio_only)) {
                 int key = i && f[i].seq % 30 == 0;
                 int len = loss_size(&f[i], key, seed);
@@ -282,14 +282,14 @@ int main(int argc, char **argv)
             printf("ENC ms=%llu scale=%d gcc_target=%.0f gcc_delay=%.0f gcc_loss=%.0f trend=%.2f thr=%.2f usage=%d\n",
                 (unsigned long long)s.t, scale, g_gcc.target, g_gcc.delay_rate, g_gcc.loss_rate, g_gcc.trend, g_gcc.thr, g_gcc.usage);
             printf("BUDGET ms=%llu srtt=%d rmin=%u bw=%u pace=%u target=%u par_rate=%u tokens=%lld pay=%u delivered=%u offered=%u unsent=%u short=%d gate=%d audio_par=%llu video_par=%llu video_retry=%llu wire=%llu drops=%llu\n",
-                (unsigned long long)s.t,w->rx_srtt,umin32(w->rate_rtt_min,w->rate_rtt_old),bbr_bw(w),w->pace_rate,
-                w->rate_target,w->par_rate,(long long)w->par_tokens,w->pay_avg,w->dlv_avg,w->off_avg,w->unsent_avg,
-                w->capacity_short,s.e[0].h[1]->fec_gate,(unsigned long long)parity_bytes[0],
+                (unsigned long long)s.t,w->rx_srtt,umin32(w->rate.rtt_min,w->rate.rtt_old),bbr_bw(w),w->pace_rate,
+                w->rate.target,w->par_rate,(long long)w->par_tokens,w->rate.pay_avg,w->rate.dlv_avg,w->rate.off_avg,w->rate.unsent_avg,
+                w->rate.capacity_short,s.e[0].h[1]->fec_gate,(unsigned long long)parity_bytes[0],
                 (unsigned long long)parity_bytes[1],(unsigned long long)retry_bytes[1],
                 (unsigned long long)(s.d[0].bytes+s.d[0].pkts*IPUDP_HDR),(unsigned long long)s.d[0].lost_queue);
             printf("STATE ms=%llu rto=%d cwnd=%u inflight_bytes=%llu pace_tokens=%lld cs_test=%u cs_recover=%u audio_queued=%u video_queued=%u audio_pending=%u video_pending=%u\n",
                 (unsigned long long)s.t,w->rx_rto,w->cwnd,(unsigned long long)bbr_inflight_bytes(w),(long long)w->pace_tokens,
-                w->cs_test_ts,w->cs_recover,s.e[0].h[0]->nsnd_que,s.e[0].h[1]->nsnd_que,
+                w->rate.cs_test_ts,w->rate.cs_recover,s.e[0].h[0]->nsnd_que,s.e[0].h[1]->nsnd_que,
                 s.e[0].h[0]->nsnd_buf,s.e[0].h[1]->nsnd_buf);
             printf("POLICER ms=%llu state=%d rate=%u from=%u hold=%u rounds=%u k=%u\n",
                 (unsigned long long)s.t,w->lt.state,w->lt.rate,w->lt.from,w->lt.hold,w->lt.rounds,w->lt.k);
@@ -305,7 +305,7 @@ int main(int argc, char **argv)
             printf("SAMPLE ms=%llu ratio=%d/%d srtt=%d loss=%u gate=%d need=%u key_need=%u scale=%d short=%d parity_video=%llu\n",
                 (unsigned long long)s.t, s.e[0].h[0]->fec_ratio, v->fec_ratio, w->rx_srtt, w->fec_loss, v->fec_gate,
                 fec_repair_ms(w, v, v->fec_frame_avg, 0, 0), fec_repair_ms(w, v, v->fec_key_bytes, 1, 0), scale,
-                w->capacity_short, (unsigned long long)parity_bytes[1]);
+                w->rate.capacity_short, (unsigned long long)parity_bytes[1]);
         }
     }
     for (i = 0; i < 2; i++) {

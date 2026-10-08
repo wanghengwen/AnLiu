@@ -3526,7 +3526,7 @@ static void run_capacity_short(int bw_kbps, int loss_pct, int *short_pct, uint32
         }
         while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) ;
         while (anl_stream_recv_frame(vb, buf, sizeof(buf), &fi) >= 0) (*video_got)++;
-        if (i >= 3000 && i % 100 == 0) { samples++; shorts += n.ep[0]->capacity_short != 0; }
+        if (i >= 3000 && i % 100 == 0) { samples++; shorts += n.ep[0]->rate.capacity_short != 0; }
     }
     *short_pct = samples ? shorts * 100 / samples : 0;
     *par_kbps = n.ep[0]->sent_par * 8 / 20000;
@@ -3584,10 +3584,10 @@ static void test_fec_capacity_recovery(int loss_pct)
                 timely[source / 5000] += i - source <= 500;
             }
         }
-        short_n += n.ep[0]->capacity_short != 0;
-        if (i >= 20000 && i < 50000 && n.ep[0]->capacity_short) last_short = i;
-        if (i >= 35000 && i < 50000) tail_short += n.ep[0]->capacity_short != 0;
-        if (i >= 40000 && i < 50000) stable_short += n.ep[0]->capacity_short != 0;
+        short_n += n.ep[0]->rate.capacity_short != 0;
+        if (i >= 20000 && i < 50000 && n.ep[0]->rate.capacity_short) last_short = i;
+        if (i >= 35000 && i < 50000) tail_short += n.ep[0]->rate.capacity_short != 0;
+        if (i >= 40000 && i < 50000) stable_short += n.ep[0]->rate.capacity_short != 0;
         if (i < 50000 && (i + 1) % 5000 == 0) {
             printf("  t=%d short=%u%% wire_ip=%u parity_est=%u kbps model=%u\n", i + 1, short_n / 50,
                 (unsigned)((n.wire_bytes[0] - wire0) * 8 / 5000),
@@ -3730,7 +3730,7 @@ static void test_fec_capacity_gate_priority(void)
     st.fec_deadline = 150; st.fec_frame_avg = 160;
     st.fec_start_ts = 100; st.fec_start_state = 1;
     st.fec_gate = 1; st.fec_gate_ts = 110;
-    w.capacity_short = 1; w.cs_ts = 120; w.cs_test_ts = 120;
+    w.rate.capacity_short = 1; w.rate.cs_ts = 120; w.rate.cs_test_ts = 120;
     fec_gate_update(&w, &st);
     CHECK(!st.fec_gate, "shortage immediately closes startup despite the gate hold");
     st.fec = st.fec_auto = st.fec_rtt_auto = st.drop_until_key = 1;
@@ -3741,7 +3741,7 @@ static void test_fec_capacity_gate_priority(void)
     st.fec_gate = 1;
     fec_gate_update(&w, &st);
     CHECK(!st.fec_gate, "hard loss cannot override capacity suppression");
-    w.capacity_short = 0; w.cs_test_ts = 0; w.cs_ts = 130;
+    w.rate.capacity_short = 0; w.rate.cs_test_ts = 0; w.rate.cs_ts = 130;
     w.current = 131;
     fec_gate_update(&w, &st);
     CHECK(!st.fec_gate, "startup and hard loss respect the post-shortage hold");
@@ -3924,16 +3924,16 @@ static void test_target_rate_wrap(void)
     memset(&plain, 0, sizeof(plain));
     plain.mss = 1200;
     plain.current = 1000;
-    plain.rate_ts = 800;
-    plain.rate_share = 230;
+    plain.rate.ts = 800;
+    plain.rate.share = 230;
     plain.btl_bw = 250000;
     plain.rx_srtt = 100;
     plain.sent_wire = 100000;
-    plain.rate_wire0 = plain.sent_wire;
+    plain.rate.wire0 = plain.sent_wire;
     plain.rate_cb = rate_cb;
     wrapped = plain;
     wrapped.sent_wire = UINT32_MAX - 29999;
-    wrapped.rate_wire0 = wrapped.sent_wire;
+    wrapped.rate.wire0 = wrapped.sent_wire;
     g_rate_calls = 0;
     for (i = 0; i < 3; i++) {
         plain.current += 200;
@@ -3943,16 +3943,16 @@ static void test_target_rate_wrap(void)
         plain.tx_payload += 40000;
         wrapped.tx_payload += 40000;
         /* Exercise feedback with acknowledged payload as well as sent bytes. */
-        plain.delivered_pay += 40000;
-        wrapped.delivered_pay += 40000;
+        plain.rate.delivered_pay += 40000;
+        wrapped.rate.delivered_pay += 40000;
         rate_update(&plain);
         targets[0] = g_rate;
         rate_update(&wrapped);
         targets[1] = g_rate;
-        CHECK(plain.rate_share == wrapped.rate_share,
-              "wire counter wrap preserves payload share (%u / %u)", plain.rate_share, wrapped.rate_share);
-        CHECK(plain.rate_target == wrapped.rate_target && targets[0] == targets[1],
-              "wire counter wrap preserves rate and callback (%u / %u)", plain.rate_target, wrapped.rate_target);
+        CHECK(plain.rate.share == wrapped.rate.share,
+              "wire counter wrap preserves payload share (%u / %u)", plain.rate.share, wrapped.rate.share);
+        CHECK(plain.rate.target == wrapped.rate.target && targets[0] == targets[1],
+              "wire counter wrap preserves rate and callback (%u / %u)", plain.rate.target, wrapped.rate.target);
     }
     CHECK(g_rate_calls >= 2, "rate callbacks exercised across wire counter wrap");
 }
@@ -3965,15 +3965,15 @@ static void test_target_rate_queued_ack_burst(void)
     uint32_t cut, rebound;
     memset(&w, 0, sizeof(w));
     w.mss = 1200;
-    w.current = 1000; w.rate_ts = 800;
-    w.rate_share = 256;
+    w.current = 1000; w.rate.ts = 800;
+    w.rate.share = 256;
     w.btl_bw = 250000;
     w.rx_srtt = 360;
-    w.rate_rtt_ts = 800; w.rate_rtt_min = w.rate_rtt_old = 180;
-    w.rate_target = 100000;
+    w.rate.rtt_ts = 800; w.rate.rtt_min = w.rate.rtt_old = 180;
+    w.rate.target = 100000;
     w.sent_wire = 10000; w.tx_payload = 10000; w.delivered = 10000;
     rate_update(&w);
-    cut = w.rate_target;
+    cut = w.rate.target;
     CHECK(cut <= 50000, "queued low delivery cuts promptly (%u)", cut);
 
     /* The next ACK batch covers four times as much payload, but the RTT
@@ -3981,30 +3981,30 @@ static void test_target_rate_queued_ack_burst(void)
     w.current += 200;
     w.sent_wire += 40000; w.tx_payload += 40000; w.delivered += 40000;
     rate_update(&w);
-    rebound = w.rate_target;
+    rebound = w.rate.target;
     CHECK(rebound <= cut + cut / 20,
           "queued ACK burst cannot bypass the 25%%/s rise limit (%u -> %u)", cut, rebound);
 
     w.current += 200;
     w.sent_wire += 4000; w.tx_payload += 4000; w.delivered += 4000;
     rate_update(&w);
-    CHECK(w.rate_target < rebound / 2,
-          "upward smoothing does not delay a further delivery cut (%u -> %u)", rebound, w.rate_target);
+    CHECK(w.rate.target < rebound / 2,
+          "upward smoothing does not delay a further delivery cut (%u -> %u)", rebound, w.rate.target);
 
     /* Sustained delivery loss has a separate ceiling based on several
        steps. A single sparse ACK step must not lock the encoder far below
        that already conservative ceiling while the queue drains. */
     w.current += 200;
-    w.rate_steps = 5;
-    w.rate_target = 20000;
-    w.pay_avg_prev = w.pay_avg = 160000;
-    w.dlv_avg = 80000;
-    w.cs_loss = 1;
+    w.rate.steps = 5;
+    w.rate.target = 20000;
+    w.rate.pay_avg_prev = w.rate.pay_avg = 160000;
+    w.rate.dlv_avg = 80000;
+    w.rate.cs_loss = 1;
     w.sent_wire += 40000; w.tx_payload += 40000;
-    w.delivered += 40000; w.delivered_pay += 40000;
+    w.delivered += 40000; w.rate.delivered_pay += 40000;
     rate_update(&w);
-    CHECK(w.rate_target > 21000 && w.rate_target <= 72000,
-          "queued ACK catch-up recovers within the sustained delivery ceiling (%u)", w.rate_target);
+    CHECK(w.rate.target > 21000 && w.rate.target <= 72000,
+          "queued ACK catch-up recovers within the sustained delivery ceiling (%u)", w.rate.target);
 }
 
 static void test_target_rate(void)
