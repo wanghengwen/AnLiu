@@ -101,7 +101,7 @@ static uint64_t g_rng;
 
 static lst *g_own[64], *g_acc[128];
 static int g_nown, g_nacc;
-static pend g_pend[4 * CLOSE_MAX];
+static pend g_pend[4 * SREC_MAX];
 static int g_npend;
 static uint32_t *g_lat[2];          /* confirmation times: [0] closed by the opener, [1] by the acceptor */
 static int g_nlat[2];
@@ -187,9 +187,16 @@ static int accept_cb(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user)
 static uint32_t own_closing(void)
 {
     uint32_t i, n = 0;
-    for (i = 0; i < g_w->nclos; i++)
-        if ((g_w->clos[i].sid & 1) == (g_server ? 1u : 0u)) n++;
+    for (i = 0; i < g_w->nsrec; i++)
+        if (g_w->srec[i].closing && (g_w->srec[i].sid & 1) == (g_server ? 1u : 0u)) n++;
     return n;
+}
+
+/* closed here, the peer's RST not in yet (a closing record) */
+static int closing(int sid)
+{
+    const sid_rec *r = srec_find(g_w, sid);
+    return r != NULL && r->closing;
 }
 
 static void track_close(anl_stream_t *s, int by_acceptor, uint32_t now)
@@ -197,11 +204,11 @@ static void track_close(anl_stream_t *s, int by_acceptor, uint32_t now)
     int sid = anl_stream_id(s), was_over = s->state == ANL_STREAM_CLOSED;
     anl_stream_close(s);
     if (was_over) {                     /* over already: nothing to tell */
-        if (clos_find(g_w, sid) >= 0) c_close_rec_bad++;
+        if (closing(sid)) c_close_rec_bad++;
         c_close_norec++;
         return;
     }
-    if (clos_find(g_w, sid) < 0) {      /* a close that tells the peer keeps a record */
+    if (!closing(sid)) {                /* a close that tells the peer keeps a record */
         if (anl_state(g_w) >= 0) c_close_rec_bad++;
         return;
     }
@@ -216,11 +223,11 @@ static void poll_confirm(uint32_t now)
 {
     int i;
     for (i = 0; i < g_npend; ) {
-        if (clos_find(g_w, g_pend[i].sid) >= 0) { i++; continue; }
+        if (closing(g_pend[i].sid)) { i++; continue; }
         if (g_nlat[g_pend[i].by_acceptor] < MAX_LAT) g_lat[g_pend[i].by_acceptor][g_nlat[g_pend[i].by_acceptor]++] = now - g_pend[i].t;
         g_pend[i] = g_pend[--g_npend];
     }
-    if (g_w->nclos > c_max_clos) c_max_clos = g_w->nclos;
+    if (sid_closing_count(g_w) > c_max_clos) c_max_clos = sid_closing_count(g_w);
     if (g_w->nstab > c_max_stab) c_max_stab = g_w->nstab;
 }
 

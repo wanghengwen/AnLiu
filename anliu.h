@@ -31,10 +31,9 @@ extern "C" {
 #define ANL_VERSION         1       /* wire version, flg bit7-6 */
 
 #define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
-                                               varint extension (DESIGN 5). A sid is the lowest
-                                               free one of its side's parity: one whose stream is
-                                               gone is held back a while (2 s, longer with a larger
-                                               ts_window_ms), then used again (DESIGN 6.1) */
+                                               varint extension (DESIGN 5). Each side's sids go up
+                                               by 2 from its first one, none is used twice on a
+                                               connection (DESIGN 6.1) */
 #define ANL_MAX_STREAMS     64      /* streams on a connection at once, both sides' and the
                                        default stream included (DESIGN 6.1) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
@@ -70,6 +69,7 @@ extern "C" {
 #define ANL_EBUSY         -16       /* retry later: ANL_MAX_STREAMS streams on the connection (closed
                                        ones the peer has not confirmed yet included) */
 #define ANL_EREPLAY       -17       /* datagram pn seen already or below the replay window (DESIGN 4.3), dropped */
+#define ANL_ENOSID        -18       /* the connection's sids are used up (2^24 opens per side, DESIGN 6.1): open a new connection */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -117,7 +117,8 @@ typedef struct anl_config {
                                    so minutes, not 20 round trips); FWD at retries > dead_link;
                                    OPEN excluded */
     int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2);
-                                   a sid is held at least this + 1 s (DESIGN 6.1) */
+                                   a sid of the peer's rests at least this + 1 s after its
+                                   stream went (DESIGN 6.1) */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
     int idle_timeout_ms;        /* SERVER default 30000, CLIENT default 0 */
     int pace_rate;              /* bytes/s; 0 = BBR alone (gain * bandwidth estimate), > 0 = upper
@@ -389,8 +390,8 @@ anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 /* Release the stream here and the handle: unsent, unacknowledged and unread
  * data is dropped; a stream whose data must arrive is closed once
  * anl_stream_waitsnd is 0. The peer is told (CLOSE, repeated until it
- * confirms; given up after dead_link unanswered ones, the sid then not used
- * again): its end is over, reads there return the data that had arrived
+ * confirms; given up after dead_link unanswered ones): its end is over,
+ * reads there return the data that had arrived
  * in order and then ANL_ECLOSED. Until the confirmation, about a round
  * trip, the place counts against anl_stream_open here, not against the
  * peer's opens. Afterwards the handle must not be used. The default stream

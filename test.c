@@ -375,17 +375,28 @@ static void dump_streams(const char *who, const anl_t *w)
     for (n = w->slist.next; n != &w->slist; n = n->next) {
         const anl_stream *st = STREAM_OF(n);
         if (st->strict) continue;
-        printf("    %s sid %d gen %d state %d peer_opened %d snd que/buf %u/%u snd_una/nxt %u/%u rcv_nxt %u rcvq %u ack %d\n",
-               who, st->sid, st->gen, st->state, st->peer_opened, st->nsnd_que, st->nsnd_buf, st->snd_una, st->snd_nxt,
+        printf("    %s sid %d state %d peer_opened %d snd que/buf %u/%u snd_una/nxt %u/%u rcv_nxt %u rcvq %u ack %d\n",
+               who, st->sid, st->state, st->peer_opened, st->nsnd_que, st->nsnd_buf, st->snd_una, st->snd_nxt,
                st->rcv_nxt, st->nrcv_que, st->ack_pending);
     }
     {
         uint32_t i;
-        for (i = 0; i < w->nclos; i++) printf("    %s closing sid %u gen %d\n", who, w->clos[i].sid, w->clos[i].gen);
-        for (i = 0; i < w->nheld; i++)
-            if (w->held[i].sid && tdiff(w->current, w->held[i].until) < 0)
-                printf("    %s held sid %u gen %d for %d ms\n", who, w->held[i].sid, w->held[i].gen, tdiff(w->held[i].until, w->current));
+        for (i = 0; i < w->nsrec; i++) {
+            const sid_rec *r = &w->srec[i];
+            if (r->closing) printf("    %s closing sid %u (%u sent)\n", who, r->sid, r->xmit);
+            else printf("    %s held sid %u for %d ms\n", who, r->sid, tdiff(r->ts, w->current));
+        }
     }
+}
+
+/* sids closed here, the peer's RST not in yet */
+static uint32_t nclos(const anl_t *w) { return sid_closing_count(w); }
+
+/* a sid of the peer's resting after its stream went (DESIGN 6.1) */
+static int sid_held(const anl_t *w, int sid)
+{
+    const sid_rec *r = srec_find(w, sid);
+    return r != NULL && !r->closing && tdiff(w->current, r->ts) < 0;
 }
 
 static int stream_state(const anl_stream_t *s)
@@ -846,16 +857,16 @@ static void test_close_notify(int loss)
     anl_get_stats(n.ep[0], &st);
     CHECK(st.streams == 1 && st.streams_closing == 1, "the place is held until the peer confirms (%u / %u)",
           st.streams, st.streams_closing);
-    for (i = 0; i < 20000 && (stream_state(b) != ANL_STREAM_CLOSED || n.ep[0]->nclos > 0); i++) net_tick(&n);
+    for (i = 0; i < 20000 && (stream_state(b) != ANL_STREAM_CLOSED || nclos(n.ep[0]) > 0); i++) net_tick(&n);
     CHECK(stream_state(b) == ANL_STREAM_CLOSED, "the peer's end is over (%d)", stream_state(b));
-    CHECK(n.ep[0]->nclos == 0, "the peer's RST confirmed it, %d ms after the close", (int)n.now - t_close);
+    CHECK(nclos(n.ep[0]) == 0, "the peer's RST confirmed it, %d ms after the close", (int)n.now - t_close);
     CHECK(n.ep[1]->nstab == 1 && stream_count(n.ep[1], NULL) == 1, "the peer's place is free, its handle kept");
     CHECK(anl_stream_send(b, "y", 1) == ANL_ECLOSED, "send: ECLOSED");
     while ((r = anl_stream_recv(b, buf, sizeof(buf))) > 0) { CHECK(r == 4000 && check_pattern(buf, r, (uint32_t)got), "content %d", got); got++; }
     CHECK(got == 10 && r == ANL_ECLOSED, "the 10 messages read after the close, then ECLOSED (%d, %d)", got, r);
     CHECK(anl_stream_peeksize(b) == ANL_ECLOSED, "peeksize: ECLOSED");
     anl_stream_close(b);                    /* over already: nothing to tell */
-    CHECK(stream_count(n.ep[1], NULL) == 0 && n.ep[1]->nclos == 0, "freed after close, no CLOSE of its own");
+    CHECK(stream_count(n.ep[1], NULL) == 0 && nclos(n.ep[1]) == 0, "freed after close, no CLOSE of its own");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  confirmed %d ms after the close\n", (int)n.now - t_close);
     net_stop(&n);
@@ -897,16 +908,16 @@ static void test_close_confirm(int loss)
     anl_stream_close(mine[0]);
     mine[0] = NULL;
     rto0 = 0;
-    for (i = 0; i < 3000; i++) { net_tick(&n); if (i == 0) rto0 = n.ep[0]->clos[0].rto; }
+    for (i = 0; i < 3000; i++) { net_tick(&n); if (i == 0) rto0 = srec_find(n.ep[0], sid)->rto; }
     anl_get_stats(n.ep[0], &st);
     CHECK(st.streams == ANL_MAX_STREAMS - 1 && st.streams_closing == 1, "closing: %u streams + %u closing", st.streams, st.streams_closing);
     CHECK(anl_stream_open(n.ep[0], &o, &err) == NULL && err == ANL_EBUSY, "no open while the peer may still be full (%d)", err);
-    CHECK(n.ep[0]->clos[0].rto > rto0 && n.ep[0]->clos[0].rto <= 5000, "CLOSE resent with backoff (rto %u -> %u)",
-          rto0, n.ep[0]->clos[0].rto);
+    CHECK(srec_find(n.ep[0], sid)->rto > rto0 && srec_find(n.ep[0], sid)->rto <= 5000, "CLOSE resent with backoff (rto %u -> %u)",
+          rto0, srec_find(n.ep[0], sid)->rto);
     CHECK(g_peer[1][sid] && stream_state(g_peer[1][sid]) == ANL_STREAM_OPEN, "the peer has not heard");
     n.block[0] = 0;
-    for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
-    CHECK(n.ep[0]->nclos == 0 && stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
+    for (i = 0; i < 20000 && nclos(n.ep[0]); i++) net_tick(&n);
+    CHECK(nclos(n.ep[0]) == 0 && stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
           "confirmed %d ms after the path came back, the peer's place free (%u)", i, n.ep[1]->nstab);
     anl_stream_close(g_peer[1][sid]);
     x = anl_stream_open(n.ep[0], &o, &err);
@@ -924,12 +935,12 @@ static void test_close_confirm(int loss)
     mine[1] = NULL;
     for (i = 0; i < 20000 && (!g_peer[1][sid] || stream_state(g_peer[1][sid]) != ANL_STREAM_CLOSED); i++) net_tick(&n);
     for (i = 0; i < 2000; i++) net_tick(&n);
-    CHECK(stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && n.ep[0]->nclos == 1, "the peer dropped it, the RST lost (%u)",
-          n.ep[0]->nclos);
+    CHECK(stream_state(g_peer[1][sid]) == ANL_STREAM_CLOSED && nclos(n.ep[0]) == 1, "the peer dropped it, the RST lost (%u)",
+          nclos(n.ep[0]));
     anl_stream_close(g_peer[1][sid]);       /* the handle goes; the sid stays used there */
     n.block[1] = 0;
-    for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "a later CLOSE gets the RST from no state (%d ms)", i);
+    for (i = 0; i < 20000 && nclos(n.ep[0]); i++) net_tick(&n);
+    CHECK(nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "a later CLOSE gets the RST from no state (%d ms)", i);
 
     /* 3. closed before the peer heard of it: never created there */
     n.block[0] = 1;
@@ -942,8 +953,8 @@ static void test_close_confirm(int loss)
         for (i = 0; i < 300; i++) net_tick(&n);
         anl_stream_close(s);
         n.block[0] = 0;
-        for (i = 0; i < 20000 && n.ep[0]->nclos; i++) net_tick(&n);
-        CHECK(n.ep[0]->nclos == 0 && g_acc[1] == acc && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
+        for (i = 0; i < 20000 && nclos(n.ep[0]); i++) net_tick(&n);
+        CHECK(nclos(n.ep[0]) == 0 && g_acc[1] == acc && n.ep[1]->nstab == ANL_MAX_STREAMS - 1,
               "confirmed, nothing created at the peer (%d accepts)", g_acc[1] - acc);
         CHECK(sid_held(n.ep[1], sid), "the sid is held there");
     }
@@ -955,9 +966,9 @@ static void test_close_confirm(int loss)
         anl_stream_close(mine[k]);
         mine[k] = NULL;
     }
-    CHECK(n.ep[0]->nclos == 4 && n.ep[1]->nclos == 4, "4 closing on each side");
-    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); i++) net_tick(&n);
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "each one's CLOSE confirms the other's (%d ms)", i);
+    CHECK(nclos(n.ep[0]) == 4 && nclos(n.ep[1]) == 4, "4 closing on each side");
+    for (i = 0; i < 20000 && (nclos(n.ep[0]) || nclos(n.ep[1])); i++) net_tick(&n);
+    CHECK(nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "each one's CLOSE confirms the other's (%d ms)", i);
 
     for (k = 0; k < nopen; k++) {
         if (!mine[k]) continue;
@@ -965,8 +976,8 @@ static void test_close_confirm(int loss)
         if (g_peer[1][sid]) anl_stream_close(g_peer[1][sid]);
         anl_stream_close(mine[k]);
     }
-    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos || n.ep[1]->nstab > 1); i++) net_tick(&n);
-    CHECK(n.ep[0]->nstab == 1 && n.ep[1]->nstab == 1 && n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "all freed and confirmed");
+    for (i = 0; i < 20000 && (nclos(n.ep[0]) || nclos(n.ep[1]) || n.ep[1]->nstab > 1); i++) net_tick(&n);
+    CHECK(n.ep[0]->nstab == 1 && n.ep[1]->nstab == 1 && nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "all freed and confirmed");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     (void)buf;
     net_stop(&n);
@@ -1015,9 +1026,9 @@ static void test_semi_close(int loss, int by_receiver)
                late, b ? stream_state(b) : -1);
     if (a) anl_stream_close(a);
     if (b) anl_stream_close(b);
-    for (i = 0; i < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); i++) net_tick(&n);
+    for (i = 0; i < 20000 && (nclos(n.ep[0]) || nclos(n.ep[1])); i++) net_tick(&n);
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "both sides freed");
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "the close confirmed");
+    CHECK(nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "the close confirmed");
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  %d of %d frames delivered\n", got, frames);
     net_stop(&n);
@@ -1266,25 +1277,24 @@ static void test_stream_lifecycle(int loss)
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all streams freed (%d / %d)",
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
     if (stream_count(n.ep[0], NULL) || stream_count(n.ep[1], NULL)) { dump_streams("A", n.ep[0]); dump_streams("B", n.ep[1]); }
-    for (iter = 0; iter < 20000 && (n.ep[0]->nclos || n.ep[1]->nclos); iter++) net_tick(&n);
+    for (iter = 0; iter < 20000 && (nclos(n.ep[0]) || nclos(n.ep[1])); iter++) net_tick(&n);
     CHECK(n.ep[0]->nstab == 1 && n.ep[1]->nstab == 1, "only the default stream holds a sid (%u / %u)", n.ep[0]->nstab, n.ep[1]->nstab);
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "every close confirmed (%u / %u)", n.ep[0]->nclos, n.ep[1]->nclos);
+    CHECK(nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "every close confirmed (%u / %u)", nclos(n.ep[0]), nclos(n.ep[1]));
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
     printf("  %d ms, both sides empty after the close\n", (int)(n.now - 1000));
     net_stop(&n);
 }
 
-/* sid reuse against what a late or missing answer leaves (DESIGN 6.1): a
- * late ACK of an earlier generation taken for the peer's answer to a new
- * stream whose OPEN was lost; the hold follows ts_window; an RST without a
- * generation is remembered so; a CLOSE nobody answers is given up on */
-static void test_sid_stale_proof(void)
+/* the hold follows ts_window (DESIGN 6.1): a sid of the peer's rests
+ * ts_window + 1 s after its stream went, the opener keeps nothing (it never
+ * uses the sid again); a CLOSE nobody answers is given up on, the
+ * connection stays alive */
+static void test_sid_hold(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
-    char buf[2000], pl[64], *q;
-    int sid, i, r, err;
+    int sid, i;
     anl_stream_t *a, *b, *a2, *b2;
-    printf("[sid reuse: late ACK of the earlier generation, hold and ts_window, RST without generation, CLOSE given up]\n");
+    printf("[sid hold: follows ts_window; CLOSE given up]\n");
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = 20;
     ca.ts_window_ms = cb.ts_window_ms = 3000;
@@ -1294,67 +1304,27 @@ static void test_sid_stale_proof(void)
     if (!b) { net_stop(&n); return; }
     sid = anl_stream_id(a);
     anl_stream_close(a);
-    for (i = 0; i < 1000 && (n.ep[0]->nclos || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    for (i = 0; i < 1000 && (nclos(n.ep[0]) || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
     anl_stream_close(b);
-    CHECK(n.ep[0]->nclos == 0 && sid_hold_ms(n.ep[0]) == 4000, "closed and confirmed; hold %u ms with a 3 s ts window",
+    CHECK(nclos(n.ep[0]) == 0 && sid_hold_ms(n.ep[0]) == 4000, "closed and confirmed; hold %u ms with a 3 s ts window",
           sid_hold_ms(n.ep[0]));
+    CHECK(!sid_held(n.ep[0], sid) && n.ep[0]->nsrec == 0 && sid_held(n.ep[1], sid), "held at the acceptor, nothing kept at the opener");
     for (i = 0; i < 3500; i++) net_tick(&n);
-    CHECK(sid_held(n.ep[0], sid) && sid_held(n.ep[1], sid), "still held 3.5 s later on both sides");
+    CHECK(sid_held(n.ep[1], sid), "still held 3.5 s later");
     for (i = 0; i < 600; i++) net_tick(&n);
-    CHECK(!sid_held(n.ep[0], sid) && !sid_held(n.ep[1], sid), "hold over at 4 s");
+    CHECK(!sid_held(n.ep[1], sid) && n.ep[1]->nsrec == 0, "hold over at 4 s, the record gone");
 
-    /* the new stream's OPEN and data are lost; an ACK of the earlier one,
-       held up past the hold, arrives before anything of the peer's: the
-       peer answers the data without parameters with an RST of the earlier
-       generation, which brings the parameters again */
-    g_peer[1][sid] = NULL;                      /* b's handle is gone */
-    n.block[0] = 1;
-    a2 = anl_stream_open(n.ep[0], &o, &err);
-    CHECK(a2 && anl_stream_id(a2) == sid, "sid %d again (%d)", sid, a2 ? anl_stream_id(a2) : -1);
-    if (!a2) { net_stop(&n); return; }
-    fill_pattern(buf, 500, 31);
-    anl_stream_send(a2, buf, 500);
-    for (i = 0; i < 50; i++) net_tick(&n);
-    q = plain_hdr(pl, n.ep[1], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
-    q = enc_sid(q, SEG_ACK, sid); q = enc8(q, 0); q = enc24(q, 0); q = enc16(q, 256); q = enc16(q, (uint16_t)(n.now - 60));
-    q = enc_varint(q, 0);
-    r = anl_input_plain(n.ep[0], pl, (long)(q - pl));
-    CHECK(r == ANL_OK && a2->peer_opened, "the late ACK passes for the answer (%d)", r);
-    n.block[0] = 0;
-    b2 = NULL;
-    for (i = 0, r = -1; i < 5000 && r < 0; i++) {
-        net_tick(&n);
-        if ((b2 = g_peer[1][sid]) != NULL) r = anl_stream_recv(b2, buf, sizeof(buf));
-    }
-    CHECK(r == 500 && check_pattern(buf, r, 31), "the peer has the new stream and its data after %d ms (%d)", i, r);
-    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
-    if (b2) anl_stream_close(b2);
-    anl_stream_close(a2);
-    for (i = 0; i < 2000; i++) net_tick(&n);
-
-    /* an RST without a generation for a sid never seen here: held, the
-       generation not made up - the RST answering its data has none either */
-    {
-        int h, s2 = 501;
-        q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
-        q = enc_sid(q, SEG_CTRL, s2); q = enc8(q, CTRL_RST); q = enc_varint(q, 0);
-        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
-        h = held_find(n.ep[1], s2);
-        CHECK(r == ANL_OK && h >= 0 && sid_held(n.ep[1], s2) && n.ep[1]->held[h].gen == GEN_ANY,
-              "held with the generation unknown (%d, %d)", r, h >= 0 ? n.ep[1]->held[h].gen : -2);
-    }
-
-    /* a CLOSE never answered: given up after dead_link sends, the sid kept out of use */
+    /* a CLOSE never answered: given up after dead_link sends, the connection alive */
     a2 = open_pair(&n, 0, &o, NULL, &b2);
     if (!b2) { net_stop(&n); return; }
     sid = anl_stream_id(a2);
     n.block[0] = 1;
     anl_stream_close(a2);
-    for (i = 0; i < 200000 && n.ep[0]->nclos; i++) net_tick(&n);
-    CHECK(n.ep[0]->nclos == 0 && i > 60000 && i < 120000, "CLOSE given up after %d ms", i);
+    for (i = 0; i < 200000 && nclos(n.ep[0]); i++) net_tick(&n);
+    CHECK(nclos(n.ep[0]) == 0 && i > 60000 && i < 120000, "CLOSE given up after %d ms", i);
     printf("  CLOSE given up after %d ms\n", i);
-    CHECK(sid_held(n.ep[0], sid) && anl_state(n.ep[0]) == 0, "sid %d kept out of use, connection alive (%d, %d)", sid,
-          sid_held(n.ep[0], sid), anl_state(n.ep[0]));
+    CHECK(anl_state(n.ep[0]) == 0 && n.ep[0]->nsrec == 0, "connection alive, nothing kept (%d, %u)", anl_state(n.ep[0]), n.ep[0]->nsrec);
+    n.block[0] = 0;
     anl_stream_close(b2);
     net_stop(&n);
 }
@@ -1399,24 +1369,23 @@ static void test_rack_repeat_backoff(void)
     net_stop(&n);
 }
 
-/* sids (DESIGN 6.1): the lowest free one of our parity; one whose stream
- * went is held 2 s on both sides, then used again. A late first datagram of
- * the old stream inside the hold gets RST, not a new stream */
-static void test_sid_reuse(void)
+/* sids (DESIGN 6.1): each open takes the next one of our parity, none is
+ * used twice; a sid of the peer's rests 2 s after its stream went, a late
+ * first datagram of that stream gets RST, not a new stream */
+static void test_sid_lifecycle(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
     char buf[2000], pl[64], *q;
-    int sid, i, r, acc, gen0;
+    int sid, i, r, acc;
     anl_stream_t *a, *b, *a2, *b2, *a3, *b3;
-    printf("[sid reuse: lowest free, held 2 s after the stream went, late first datagram gets RST]\n");
+    printf("[sid lifecycle: the next sid each time, held 2 s after the stream went, late first datagram gets RST]\n");
     net_init(&n, &ca, &cb);
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_RELIABLE);
-    n.ep[0]->sid_base = 300;                        /* 2-byte sid encoding */
+    n.ep[0]->sid_next = 300;                        /* 2-byte sid encoding */
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
     sid = anl_stream_id(a);
-    gen0 = a->gen;
     CHECK(sid == 300, "sid 300 (%d)", sid);
     fill_pattern(buf, 1500, 11);
     anl_stream_send(a, buf, 1500);
@@ -1424,12 +1393,12 @@ static void test_sid_reuse(void)
     CHECK(r == 1500 && check_pattern(buf, r, 11), "data (%d)", r);
 
     anl_stream_close(a);
-    for (i = 0; i < 1000 && (n.ep[0]->nclos || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
-    CHECK(n.ep[0]->nclos == 0 && stream_state(b) == ANL_STREAM_CLOSED, "closed, the peer dropped it, confirmed");
+    for (i = 0; i < 1000 && (nclos(n.ep[0]) || stream_state(b) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    CHECK(nclos(n.ep[0]) == 0 && stream_state(b) == ANL_STREAM_CLOSED, "closed, the peer dropped it, confirmed");
     anl_stream_close(b);
-    CHECK(sid_held(n.ep[0], 300) && sid_held(n.ep[1], 300), "sid 300 held on both sides");
+    CHECK(sid_held(n.ep[1], 300) && n.ep[0]->nsrec == 0, "sid 300 held at the peer, nothing kept here");
     a2 = anl_stream_open(n.ep[0], &o, NULL);
-    CHECK(a2 && anl_stream_id(a2) == 302, "the next open passes the held sid (%d)", a2 ? anl_stream_id(a2) : -1);
+    CHECK(a2 && anl_stream_id(a2) == 302, "the next open takes the next sid (%d)", a2 ? anl_stream_id(a2) : -1);
     for (i = 0; i < 300; i++) net_tick(&n);
 
     /* the old stream's first datagram (parameters, sn 0) arriving now: RST, nothing created */
@@ -1445,16 +1414,16 @@ static void test_sid_reuse(void)
     CHECK(stream_count(n.ep[0], NULL) == 1 && stream_count(n.ep[1], NULL) == 1 && sget(n.ep[0], 302) != NULL,
           "only the new stream on either side (%d / %d)", stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
 
-    /* parameters with a generation on the default stream and on one of the
-       receiver's own sids: generations are the opener's, these go by the mode */
+    /* parameters with the reserved ob bits set, on the default stream and on
+       one of the receiver's own sids: the bits are ignored, these go by the mode */
     {
         anl_stream_t *own = open_pair(&n, 1, &o, NULL, &b2), *mine2 = b2;
         q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
         q = enc_sid(q, SEG_DATA, 0); q = enc8(q, F_OPEN); q = enc24(q, (n.ep[1]->dflt->rcv_nxt - 1) & SN_MASK);
-        q = enc8(q, (uint8_t)((5 << OB_GEN_SHIFT) | OB_STREAM)); q = enc16(q, 4096); q = enc16(q, 0);
+        q = enc8(q, (uint8_t)((5 << 2) | OB_STREAM)); q = enc16(q, 4096); q = enc16(q, 0);
         q = enc_varint(q, 0);                                   /* an sn behind rcv_nxt: nothing delivered */
         q = enc_sid(q, SEG_DATA, own ? anl_stream_id(own) : 1); q = enc8(q, F_OPEN); q = enc24(q, 0);
-        q = enc8(q, (uint8_t)(9 << OB_GEN_SHIFT)); q = enc16(q, 256); q = enc16(q, 0);
+        q = enc8(q, (uint8_t)(9 << 2)); q = enc16(q, 256); q = enc16(q, 0);
         q = enc_varint(q, 0);
         r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
         CHECK(r == ANL_OK && anl_default_stream(n.ep[1])->state != ANL_STREAM_CLOSED, "the default stream stays (%d)", r);
@@ -1467,49 +1436,48 @@ static void test_sid_reuse(void)
         if (mine2) anl_stream_close(mine2);
     }
 
-    /* the hold over: sid 300 is the lowest free one again */
+    /* the hold over: sid 300 is not used again all the same */
     for (i = 0; i < 2200; i++) net_tick(&n);
-    CHECK(!sid_held(n.ep[0], 300) && !sid_held(n.ep[1], 300), "hold over");
+    CHECK(!sid_held(n.ep[1], 300), "hold over");
     a3 = open_pair(&n, 0, &o, NULL, &b3);
-    CHECK(a3 && anl_stream_id(a3) == 300, "sid 300 again (%d)", a3 ? anl_stream_id(a3) : -1);
+    CHECK(a3 && anl_stream_id(a3) == 304, "sid 304 (%d)", a3 ? anl_stream_id(a3) : -1);
     if (!b3) { net_stop(&n); return; }
     fill_pattern(buf, 700, 22);
     anl_stream_send(a3, buf, 700);
     for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b3, buf, sizeof(buf)); }
-    CHECK(r == 700 && check_pattern(buf, r, 22), "data on the second incarnation (%d)", r);
-    CHECK(a3 && b3->gen == a3->gen && a3->gen == ((gen0 + 1) & GEN_MASK), "the next generation (%d after %d)", a3 ? a3->gen : -1, gen0);
+    CHECK(r == 700 && check_pattern(buf, r, 22), "data on the third stream (%d)", r);
 
-    /* the first incarnation's first datagram arriving now, after the hold:
-       an earlier generation - RST for it, the stream here stays */
+    /* a late RST and a late CLOSE of the stream that went: nothing here
+       changes, the CLOSE is answered and the sid rests again */
     q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
-    q = enc_sid(q, SEG_DATA, 300); q = enc8(q, F_OPEN); q = enc24(q, 0);
-    q = enc8(q, (uint8_t)(gen0 << OB_GEN_SHIFT)); q = enc16(q, 256); q = enc16(q, 0);
-    q = enc_varint(q, 4); memcpy(q, "late", 4); q += 4;
+    q = enc_sid(q, SEG_CTRL, 300); q = enc8(q, CTRL_RST); q = enc_varint(q, 0);
+    q = enc_sid(q, SEG_CTRL, 300); q = enc8(q, CTRL_CLOSE); q = enc_varint(q, 0);
     r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
-    CHECK(r == ANL_OK && sget(n.ep[1], 300) == b3 && stream_state(b3) == ANL_STREAM_OPEN, "an earlier generation's OPEN leaves the stream (%d)", r);
+    CHECK(r == ANL_OK && sget(n.ep[1], 300) == NULL && sid_held(n.ep[1], 300) && stream_state(b3) == ANL_STREAM_OPEN,
+          "late RST / CLOSE of the stream that went: the sid rests, the others stay (%d)", r);
     for (i = 0; i < 300; i++) net_tick(&n);
-    CHECK(stream_state(a3) == ANL_STREAM_OPEN && stream_state(b3) == ANL_STREAM_OPEN, "... on both sides (the RST is for the earlier one)");
+    CHECK(stream_state(a3) == ANL_STREAM_OPEN && stream_state(b3) == ANL_STREAM_OPEN, "... on both sides");
     anl_stream_send(a3, buf, 700);
     for (i = 0, r = -1; i < 1000 && r < 0; i++) { net_tick(&n); r = anl_stream_recv(b3, buf, sizeof(buf)); }
     CHECK(r == 700, "data after it (%d)", r);
 
-    /* closed by the acceptor this time: held there from its close, here from its CLOSE */
+    /* closed by the acceptor this time: it rests there once the opener's RST confirms, the opener keeps nothing */
     anl_stream_close(b3);
-    for (i = 0; i < 1000 && (n.ep[1]->nclos || stream_state(a3) != ANL_STREAM_CLOSED); i++) net_tick(&n);
-    CHECK(n.ep[1]->nclos == 0 && stream_state(a3) == ANL_STREAM_CLOSED, "the acceptor's close confirmed");
-    CHECK(sid_held(n.ep[0], 300) && sid_held(n.ep[1], 300), "held on both sides again");
+    for (i = 0; i < 1000 && (nclos(n.ep[1]) || stream_state(a3) != ANL_STREAM_CLOSED); i++) net_tick(&n);
+    CHECK(nclos(n.ep[1]) == 0 && stream_state(a3) == ANL_STREAM_CLOSED, "the acceptor's close confirmed");
+    CHECK(sid_held(n.ep[1], 304) && !sid_held(n.ep[0], 304), "held at the acceptor, not at the opener");
     anl_stream_close(a3);
     a3 = anl_stream_open(n.ep[0], &o, NULL);
-    CHECK(a3 && anl_stream_id(a3) == 304, "302 in use, 300 held: 304 (%d)", a3 ? anl_stream_id(a3) : -1);
+    CHECK(a3 && anl_stream_id(a3) == 306, "the next sid, 306 (%d)", a3 ? anl_stream_id(a3) : -1);
     if (a3) anl_stream_close(a3);              /* the OPEN went out at open, the CLOSE right after */
     anl_stream_close(a2);
     b2 = g_peer[1][302];
-    for (i = 0; i < 1000 && (n.ep[0]->nclos || (b2 && stream_state(b2) != ANL_STREAM_CLOSED)); i++) net_tick(&n);
+    for (i = 0; i < 1000 && (nclos(n.ep[0]) || (b2 && stream_state(b2) != ANL_STREAM_CLOSED)); i++) net_tick(&n);
     if (b2) anl_stream_close(b2);
-    if (g_peer[1][304]) anl_stream_close(g_peer[1][304]);   /* accepted before the CLOSE came, if at all */
+    if (g_peer[1][306]) anl_stream_close(g_peer[1][306]);   /* accepted before the CLOSE came, if at all */
     for (i = 0; i < 300; i++) net_tick(&n);
-    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0 && n.ep[0]->nclos == 0, "all gone (%d / %d, %u closing)",
-          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL), n.ep[0]->nclos);
+    CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0 && nclos(n.ep[0]) == 0, "all gone (%d / %d, %u closing)",
+          stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL), nclos(n.ep[0]));
 
     /* one 45 s old (between half and a whole wrap of the 16-bit ts) extends
        to a ts in the future: it must not move the window - it did, and every
@@ -1556,7 +1524,7 @@ static void test_handle_lifetime(void)
     anl_stream_opt_default(&o, ANL_RELIABLE);
     anl_stream_set_user(anl_default_stream(n.ep[0]), &n);
     CHECK(anl_stream_get_user(anl_default_stream(n.ep[0])) == &n && anl_stream_conn(anl_default_stream(n.ep[0])) == n.ep[0], "user / conn");
-    n.ep[1]->sid_base = 41;                         /* server opens sid 41 */
+    n.ep[1]->sid_next = 41;                         /* server opens sid 41 */
     b = open_pair(&n, 1, &o, NULL, &a);
     if (!a) { net_stop(&n); return; }
     anl_stream_send(b, "last words", 10);
@@ -1592,7 +1560,7 @@ static void test_wire_v1_wrap(int semi)
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = 25;
     net_start(&n, &ca, &cb);
-    n.ep[0]->sid_base = 8192;
+    n.ep[0]->sid_next = 8192;
     anl_stream_opt_default(&o, semi ? ANL_SEMI : ANL_RELIABLE);
     o.fec = semi; o.fec_ratio = 100;
     if (semi) { o.max_age_ms = 5000; o.rcv_deadline_ms = 0; }
@@ -1714,7 +1682,7 @@ static void test_max_streams(void)
     anl_stream_close(g_peer[1][anl_stream_id(mine[0])]);
     anl_stream_close(mine[0]);
     for (iter = 0; iter < 3000 && (stream_count(n.ep[0], NULL) != nopen - 1 || stream_count(n.ep[1], NULL) != nopen - 1 ||
-                                   n.ep[0]->nclos || n.ep[1]->nclos); iter++)
+                                   nclos(n.ep[0]) || nclos(n.ep[1])); iter++)
         net_tick(&n);
     CHECK(n.ep[0]->nstab == ANL_MAX_STREAMS - 1 && n.ep[1]->nstab == ANL_MAX_STREAMS - 1, "a place free (%u / %u)",
           n.ep[0]->nstab, n.ep[1]->nstab);
@@ -1728,7 +1696,7 @@ static void test_max_streams(void)
           "both refused by a full peer (%d / %d)", y ? stream_state(y) : -1, z ? stream_state(z) : -1);
     if (y) anl_stream_close(y);
     if (z) anl_stream_close(z);
-    CHECK(n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0, "refused streams are not told again");
+    CHECK(nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0, "refused streams are not told again");
     x = anl_stream_open(n.ep[0], &o, &err);
     CHECK(x != NULL, "the place is free again (%d)", err);
     for (i = 0; i < 300; i++) net_tick(&n);
@@ -1750,9 +1718,8 @@ static void test_max_streams(void)
 }
 
 /* a proxy's pattern (DESIGN 6.1): streams opened, used and closed for good,
- * thousands of them, with loss and (then) duplicated datagrams. Sids are
- * used again after their hold, so the highest stays near what is in use or
- * held at a time; generations keep the earlier stream's late segments out */
+ * thousands of them, with loss and (then) duplicated datagrams. No sid is
+ * used twice: a late segment of a stream that went finds no stream */
 static void test_sid_churn(int loss, int TOTAL)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
@@ -1795,7 +1762,7 @@ static void test_sid_churn(int loss, int TOTAL)
                 }
             }
             if (stream_count(n.ep[0], &left) == 0 && stream_count(n.ep[1], NULL) == 0 &&
-                n.ep[0]->nclos == 0 && n.ep[1]->nclos == 0) break;   /* every place free again */
+                nclos(n.ep[0]) == 0 && nclos(n.ep[1]) == 0) break;   /* every place free again */
         }
         if (i == 60000) {
             printf("  batch at %d timed out (%d streams delivered so far)\n", done, got);
@@ -1815,17 +1782,17 @@ static void test_sid_churn(int loss, int TOTAL)
     printf("  done after %u ms of simulated time\n", n.now - 1000);
     CHECK(open_fail == 0, "every open succeeded (%d failed)", open_fail);
     CHECK(got == TOTAL, "every stream delivered its data (%d / %d)", got, TOTAL);
-    /* sids are reused once their 2 s hold is over: a batch's worth or so of
-       sids is in use or held at a time, not one per stream ever opened */
-    CHECK(top < 2u * (uint32_t)TOTAL / 3u && top >= 2u * BATCH, "sids reused: the highest was %u for %d streams", top, TOTAL);
+    /* one sid per stream ever opened */
+    CHECK(top == sid_first(ANL_ROLE_CLIENT) + 2u * (uint32_t)(TOTAL - open_fail - 1), "sids never used twice: the highest was %u for %d streams", top, TOTAL);
     CHECK(stream_count(n.ep[0], NULL) == 0 && stream_count(n.ep[1], NULL) == 0, "all freed (%d / %d)",
           stream_count(n.ep[0], NULL), stream_count(n.ep[1], NULL));
     CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
-    /* every hold over: the next open gets the lowest sid of all */
+    /* every hold over, nothing kept; the next open gets the next sid */
     for (i = 0; i < SID_HOLD_MS + 200; i++) net_tick(&n);
     {
         anl_stream_t *x = anl_stream_open(n.ep[0], &o, NULL);
-        CHECK(x && anl_stream_id(x) == (int)sid_first(ANL_ROLE_CLIENT), "the lowest sid again (%d)", x ? anl_stream_id(x) : -1);
+        CHECK(n.ep[0]->nsrec == 0 && n.ep[1]->nsrec == 0, "no record left (%u / %u)", n.ep[0]->nsrec, n.ep[1]->nsrec);
+        CHECK(x && anl_stream_id(x) == (int)top + 2, "the next sid (%d)", x ? anl_stream_id(x) : -1);
         if (x) anl_stream_close(x);
     }
     net_stop(&n);
@@ -4249,9 +4216,9 @@ static void test_outage(void)
     CHECK(rel_got == 90, "reliable stream delivered everything (%d)", rel_got);
     /* a close during the outage (DESIGN 6.1): gone here at once, its CLOSE
        repeated until the path is back and the peer's RST confirms it */
-    CHECK(stream_count(n.ep[0], NULL) == 2 && stream_state(cb2) == ANL_STREAM_CLOSED && n.ep[0]->nclos == 0,
+    CHECK(stream_count(n.ep[0], NULL) == 2 && stream_state(cb2) == ANL_STREAM_CLOSED && nclos(n.ep[0]) == 0,
           "close during the outage: freed here, the peer told after it, confirmed (%d / %d / %u)",
-          stream_count(n.ep[0], NULL), stream_state(cb2), n.ep[0]->nclos);
+          stream_count(n.ep[0], NULL), stream_state(cb2), nclos(n.ep[0]));
     net_stop(&n);
 }
 
@@ -4437,8 +4404,8 @@ int main(void)
     RUN(test_pacing());
     RUN(test_stream_lifecycle(0));
     RUN(test_stream_lifecycle(10));
-    RUN(test_sid_reuse());
-    RUN(test_sid_stale_proof());
+    RUN(test_sid_lifecycle());
+    RUN(test_sid_hold());
     RUN(test_rack_repeat_backoff());
     RUN(test_handle_lifetime());
     RUN(test_wire_v1_wrap(0));
