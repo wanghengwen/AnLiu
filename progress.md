@@ -12,6 +12,13 @@
 
 ## 2026-10-08
 
+- 按"单连接并发子流 ≤ 128"的尺度清理过度设计（评审第 1–5 项，5 个提交）：
+  - sid 生命周期：流表之外的四张表（关闭中数组、动态扩容到 1024 槽的保留期哈希、RST 队列）并为一张 128 项定长记录表（关闭中 / 保留期）加一个无状态 RST 列表；sid 改为本端奇偶的下一个值、连接内不复用，6 位代号、带代号的 RST / CLOSE 体和"对上一代 RST 再发 STREAM_OPEN"随之删除，本端自己的 sid 不再需要保留期。每端 2²⁴ 次打开后 `anl_stream_open` 返回新增的 `ANL_ENOSID`。DESIGN 5.2 / 5.5 / 6.1、`anliu.h`、README、`test.c`（`test_sid_lifecycle` / `test_sid_hold` 替换原 sid 复用测试，开关 9000 次的测试改为检验 sid 不复用）、`bench/churn.c` 同步。
+  - 重复代码合并：`fec_ok_prob`（二项分布尾概率此前三份）、`fec_repair_ms` 加单次重传参数（`fec_one_retry` 是它的前半）、`srtt_or_def`、`ack_jitter_ms`、`wnd_open`、`open_backoff`（OPEN 与 CLOSE 同一退避）、`fec_pcache_expire`（校验包缓存此前在两处过期）。行为不变：单元测试输出逐字节相同。
+  - 跟踪钩子：16 处 `#ifdef ANL_*_TRACE` 改为一个 `ANL_TRACE(kind, ...)`，`bench/anl_trace.h` 列出种类并转到工具自己的 `ANL_TRACE_<kind>` 宏（`data_seg` / `fec_block` / `dup` 把工具原来从库的作用域里取的变量改为显式参数）；流链表按（默认流、优先级、打开顺序）有序，flush 的三个按优先级逐遍的循环各改为一遍，`prio_pass` 删除。行为不变，输出逐字节相同。
+  - 线上格式：去掉末段省略长度字段（SEG_L，段首字节 bit 5 保留、须为 0）和 ACK 回显差分（ACK_F_DELTA）；每数据报多 1..2 字节，两端须同时升级；封包不再回写数据报，bench 的字节核算不再需要修正项。随机数序列因此平移，默认种子下两项已记录的不稳定检查失败：`test_fec_capacity_recovery` 改为从本次运行的种子开始（不再随前面的测试平移，单独运行时各种子通过）；`test_fec_buffers_release` 的关键帧原本只在 33 ms 帧槽与 2000 ms 对齐时发出（每 66 s 一次，一次未修复的丢失让 drop_until_key 停发一分钟、接收端空闲超时），改为每 2 s 一次。
+  - 注释：51 处记录实验经过（真实网络、仿真、数字）的注释块搬到 [TUNING.md](TUNING.md)，按代码顺序编号；代码里留结论和条目号。
+  - 已验证：`anliu.c` 6608 → 6292 行（注释约 1500 → 1330 行，TUNING.md 316 行）；默认种子与种子 1..8 全部通过（改动前种子 5、6 各失败一项 `test_fec_capacity_recovery`）；ASan/UBSan 加泄漏检查 CTest 6/6；libFuzzer（Clang）20000 次冒烟无崩溃；`bench/` 全部工具编译无警告。本次没有实网对照：线上格式变化只影响段长度字段，拥塞控制与 FEC 的规则未动。
 - 持 PSK 对端的健壮性评估（SECURITY_AUDIT.md 4.1）：缓冲区注入 / 内存安全未发现问题；默认流缺陷已修复；接收内存有界但偏大，写入 DESIGN 6.1 与 `anliu.h` 的 accept 回调说明。
   - 默认流（sid 0）可被一个违规段永久结束：可靠流上带帧号的 DATA、FWD、模式或字节流标志不符的 OPEN 在 sid 0 上会释放默认流且无法重建，`anl_send` / `anl_recv` 永久返回 `ANL_ECLOSED`，连接仍显示存活。三条路径各写 PoC 复现，回归测试 `test_default_violation` 在修复前 20 项检查失败。修复：`stream_reset` 对默认流只丢弃违规段（DESIGN 6.1）。
   - 模糊测试：新增 `tools/fuzz/`（libFuzzer，CMake `ANLIU_BUILD_FUZZERS`，Clang），输入直接交给 `anl_input_plain`，每个输入一个新连接，检查默认流仍在、流缓存不超过窗口。修复后 4 × 10 min 约 1460 万次执行，覆盖约 4400 条边，无崩溃、泄漏或不变量违反；撤掉修复时从原始种子约 1400 次执行即触发不变量。
