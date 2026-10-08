@@ -20,6 +20,7 @@ static int g_fail = 0;
  * deterministic random
  *-------------------------------------------------------------------*/
 static uint64_t g_seed = 0x9E3779B97F4A7C15ULL;
+static uint64_t g_seed0;                /* the run's seed: a test that starts from it does not depend on what ran before */
 static uint32_t rnd(void)
 {
     g_seed ^= g_seed << 13; g_seed ^= g_seed >> 7; g_seed ^= g_seed << 17;
@@ -2138,7 +2139,7 @@ static int skip_ack_output(char *wire, int len, anl_t *w, void *user)
             uint32_t n = 0, i, v;
             CHECK(marker == g_skip_want, "each split ACK shares a datagram with its retirement marker");
             if (end - p < ACK_FIX) break;
-            p += (dec8(&p) & ACK_F_DELTA) ? 6 : 7;     /* una(3) wnd(2), echo 1 or 2 */
+            (void)dec8(&p); p += 7;                     /* una(3) wnd(2) echo(2) */
             CHECK(dec_varint(&p, end, &n) == 0, "SACK count");
             for (i = 0; i < 2 * n; i++) CHECK(dec_varint(&p, end, &v) == 0, "SACK range");
             g_skip_acks++;
@@ -2431,7 +2432,7 @@ static void test_fec_buffers_release(void)
     anl_stream_t *v, *pv;
     anl_stream_stats ss;
     static char buf[40000];
-    int i;
+    int i, frames = 0;
     long tx_busy = 0, rx_busy = 0;
     printf("[fec buffers: released on a lossless path, back when it loses]\n");
     net_init(&n, &ca, &cb);
@@ -2445,7 +2446,10 @@ static void test_fec_buffers_release(void)
     for (i = 0; i < 160000; i++) {
         if (i == 40000) n.loss_pct = 5;
         if (i == 100000) n.loss_pct = 0;
-        if (i % 33 == 0) anl_stream_send_frame(v, i % 2000 == 0 ? ANL_FRAME_KEY : 0, buf, i % 2000 == 0 ? 20000 : 4000, NULL);
+        if (i % 33 == 0) {                      /* 30 fps, a key frame every 2 s */
+            int key = frames++ % 60 == 0;
+            anl_stream_send_frame(v, key ? ANL_FRAME_KEY : 0, buf, key ? 20000 : 4000, NULL);
+        }
         net_tick(&n);
         while (anl_stream_recv_frame(pv, buf, sizeof(buf), NULL) > 0) ;
         if (i == 39999) {
@@ -3548,6 +3552,7 @@ static void test_fec_capacity_recovery(int loss_pct)
     int i, frames = 0, recovered = -1, last_short = -1;
     unsigned tail_sent = 0, tail_timely = 0;
     printf("[fec: recovery after 800 kbps on a 4 Mbps / %d%% loss path, RTT 170 ms]\n", loss_pct);
+    g_seed = g_seed0;                   /* as when run alone: the random sequence does not shift with the tests before it */
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = 85;
     n.bandwidth_bps = 4000000; n.queue_limit = 36;
@@ -4376,6 +4381,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (seed) g_seed = 0x9E3779B97F4A7C15ULL * (strtoull(seed, NULL, 10) + 1);
     if (rnd_state) g_seed = strtoull(rnd_state, NULL, 16);
+    g_seed0 = g_seed;
     printf("seed %s\n", seed ? seed : "default");
     RUN(test_sid_churn(10, 4000));
     RUN(test_kat());

@@ -35,9 +35,6 @@
 #ifndef ANL_TRACE_seg_commit
 #define ANL_TRACE_seg_commit(...) ((void)0)
 #endif
-#ifndef ANL_TRACE_seg_trim
-#define ANL_TRACE_seg_trim(...) ((void)0)
-#endif
 #ifndef ANL_TRACE_data_seg
 #define ANL_TRACE_data_seg(...) ((void)0)
 #endif

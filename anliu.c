@@ -393,23 +393,21 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define OPEN_RTO_MAX    5000
 #define KEEPALIVE_PAD   16
 
-/* a segment's first byte (DESIGN 5): type(2) | L(1) | F(1) | sid[3:0](4), then
+/* a segment's first byte (DESIGN 5): type(2) | 0 | F(1) | sid[3:0](4), then
    if F the rest of the sid, sid >> 4, as a minimal non-zero varint */
 #define SID_LO_BITS     4
 #define SID_LO_MASK     0x0f
 #define SID_F           0x10    /* b0: the sid's varint extension follows */
-#define SEG_L           0x20    /* b0: the segment runs to the end of the datagram (before
-                                   padding): a DATA or CTRL segment without its length field */
+#define SEG_RSV         0x20    /* b0: reserved, zero */
 #define DATA_HDR_MAX    12      /* type|sid(1) b1 frg_ext(3) sn(3) frame(2) len(2); + OPEN_BODY until the peer is
                                    heard; a sid >= 16 takes its extension off its stream's mss (stream_mss) */
-#define ACK_FIX         8       /* after type|sid: b1 una(3) wnd(2) ts_echo(2, or a 1-byte delta) */
+#define ACK_FIX         8       /* after type|sid: b1 una(3) wnd(2) ts_echo(2) */
 #define SKIP_BODY       4       /* CTRL_RCV_SKIP body: the retired una, 32 bits */
 #define ECHO_BODY       3       /* CTRL_ECHO body: the peer's ts (16 bits), held here this long (ms, 8 bits) */
 #define ECHO_MS         100     /* at most this often, and only while our ACKs give the peer no echo */
 #define ECHO_RTT_WIN    10000   /* echo_rtt: a windowed minimum, like min_rtt (BBR_MIN_RTT_WIN) */
 #define ACK_F_WASK      0x80    /* window probe: please answer with an ACK */
 #define ACK_F_FRESH     0x40    /* data arrived since the last ACK: ts_echo is an RTT sample */
-#define ACK_F_DELTA     0x20    /* ts_echo is a zigzag varint delta from the datagram's previous ACK */
 #define SACK_REPEAT     3       /* every received segment is reported in at least 3 ACKs */
 #define REO_DIV         16      /* RACK reordering window starts at min_rtt / 16 */
 #define RCV_WAIT_PCT    60      /* rcv_deadline_ms -1: a gap is waited for this % of the local max_age
@@ -869,9 +867,6 @@ struct anl_s {
     char *buf;
     uint32_t ptr;
     int dg_has_data;
-    uint32_t dg_last_b0, dg_len_at, dg_len_n;   /* the last DATA / CTRL segment: its first byte and length
-                                                  field, dropped at output (SEG_L); n = 0: none */
-    uint16_t dg_echo; int dg_echo_valid;        /* the echo of the datagram's last ACK (ACK_F_DELTA) */
     char *rxbuf;
     char *scratch;      /* 2 * mtu */
     int64_t flush_budget;
@@ -1199,8 +1194,6 @@ static void dg_begin(anl_t *w)
 {
     w->ptr = ANL_OVERHEAD;
     w->dg_has_data = 0;
-    w->dg_len_n = 0;
-    w->dg_echo_valid = 0;
 }
 
 static uint32_t dg_room(const anl_t *w) { return w->mtu - w->ptr; }
@@ -1241,16 +1234,6 @@ static void dg_output(anl_t *w, int force_pad)
 
     if (w->output == NULL) { dg_begin(w); return; }
     echo_ride(w);
-
-    /* the last segment runs to the end: it loses its length field (SEG_L, DESIGN 5) */
-    if (w->dg_len_n) {
-        uint32_t at = w->dg_len_at, n = w->dg_len_n;
-        ANL_TRACE(seg_trim, w, n);
-        memmove(w->buf + at, w->buf + at + n, w->ptr - at - n);
-        w->ptr -= n;
-        w->buf[w->dg_last_b0] = (char)((uint8_t)w->buf[w->dg_last_b0] | SEG_L);
-        w->dg_len_n = 0;
-    }
 
     /* random padding of datagrams without data (DESIGN 3.5): an ACK's length is
        otherwise a fixed fingerprint, a data datagram's length is the media's */
@@ -1302,7 +1285,6 @@ static char *dg_ptr(anl_t *w) { return w->buf + w->ptr; }
 
 static void dg_commit(anl_t *w, uint32_t size, int is_data)
 {
-    w->dg_len_n = 0;                    /* the last segment so far has no length to drop */
     w->ptr += size;
     if (is_data) w->dg_has_data = 1;
     ANL_TRACE(seg_commit, w, size, is_data);
@@ -1323,13 +1305,9 @@ static void write_data_seg(anl_t *w, const anl_stream *st, const anl_seg *seg)
     p = enc24(p, seg->sn & SN_MASK);
     if (seg->flags & F_HAS_FRAME) p = enc16(p, (uint16_t)seg->frame_no);
     if (!st->peer_opened) p = enc_open_body(p, st);
-    {
-        uint32_t b0 = w->ptr, at = (uint32_t)(p - w->buf);
-        p = enc_varint(p, seg->len);
-        memcpy(p, seg->data, seg->len);
-        dg_commit(w, size, 1);
-        w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(seg->len);
-    }
+    p = enc_varint(p, seg->len);
+    memcpy(p, seg->data, seg->len);
+    dg_commit(w, size, 1);
     ANL_TRACE(data_seg, w, st, seg, size, seg->xmit == 0);
 }
 
@@ -1352,13 +1330,9 @@ static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *bo
     p = dg_ptr(w);
     p = enc_sid(p, SEG_CTRL, sid);
     p = enc8(p, subtype);
-    {
-        uint32_t b0 = w->ptr, at = (uint32_t)(p - w->buf);
-        p = enc_varint(p, blen);
-        if (blen) memcpy(p, body, blen);
-        dg_commit(w, size, subtype == CTRL_PARITY);
-        w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(blen);
-    }
+    p = enc_varint(p, blen);
+    if (blen) memcpy(p, body, blen);
+    dg_commit(w, size, subtype == CTRL_PARITY);
     if (subtype == CTRL_PARITY) ANL_TRACE(parity_seg, w, sid, size);
 }
 
@@ -1491,26 +1465,17 @@ static void write_ack_segs(anl_t *w, anl_stream *st)
             (void)enc32((char *)body, st->rcv_skip_una);
             write_ctrl_seg(w, st->sid, CTRL_RCV_SKIP, body, sizeof(body));
         }
-        {
-            /* the echo: 16 bits, or a 1-byte delta from the datagram's previous
-               ACK (streams of one flight echo nearby times) */
-            uint16_t echo = (uint16_t)st->ack_ts;
-            int16_t d = (int16_t)(uint16_t)(echo - w->dg_echo);
-            uint32_t zz = (uint32_t)(d >= 0 ? 2 * d : -2 * (int32_t)d - 1);
-            int delta = w->dg_echo_valid && zz < 0x80u;
-            p = dg_ptr(w);
-            p = enc_sid(p, SEG_ACK, st->sid);
-            p = enc8(p, (uint8_t)(b1 | (delta ? ACK_F_DELTA : 0)));
-            p = enc24(p, st->rcv_nxt & SN_MASK);
-            p = enc16(p, (uint16_t)wnd_unused(st));
-            p = delta ? enc8(p, (uint8_t)zz) : enc16(p, echo);
-            p = enc_varint(p, cnt);
-            memcpy(p, rb, rlen);
-            p += rlen;
-            dg_commit(w, (uint32_t)(p - dg_ptr(w)), 0);
-            w->dg_echo = echo; w->dg_echo_valid = 1;
-            w->ack_echo_tx_ts = w->current | 1;
-        }
+        p = dg_ptr(w);
+        p = enc_sid(p, SEG_ACK, st->sid);
+        p = enc8(p, b1);
+        p = enc24(p, st->rcv_nxt & SN_MASK);
+        p = enc16(p, (uint16_t)wnd_unused(st));
+        p = enc16(p, (uint16_t)st->ack_ts);
+        p = enc_varint(p, cnt);
+        memcpy(p, rb, rlen);
+        p += rlen;
+        dg_commit(w, (uint32_t)(p - dg_ptr(w)), 0);
+        w->ack_echo_tx_ts = w->current | 1;
     } while (pos != &st->rcv_runs);
 
     /* An ACK that carried news is sent once more an update interval later
@@ -3861,9 +3826,9 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
 {
     const char *p, *end;
     uint32_t conv, ts, ref, pn;
-    uint16_t ts16, echo_prev = 0;
+    uint16_t ts16;
     uint8_t flg;
-    int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0, echo_prev_ok = 0;
+    int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0;
     bbr_sample rs;
     uint32_t max_echo = 0;
     uint32_t *snbuf = (uint32_t *)w->scratch;
@@ -3925,11 +3890,11 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
 
     while (p < end) {
         uint8_t b0;
-        int type, sid, last;
+        int type, sid;
         anl_stream *st;
         b0 = dec8(&p);
+        if (b0 & SEG_RSV) return ANL_EFORMAT;
         type = b0 >> 6;
-        last = (b0 & SEG_L) != 0;
         sid = b0 & SID_LO_MASK;
         if (b0 & SID_F) {
             const char *q = p;
@@ -3938,8 +3903,6 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             if (dec_varint(&p, end, &hi) < 0 || hi == 0 || varint_size(hi) != (int)(p - q)) return ANL_EFORMAT;
             sid |= (int)(hi << SID_LO_BITS);
         }
-        if (last && (type == SEG_ACK || type == SEG_FWD)) return ANL_EFORMAT;
-
         if (type == SEG_DATA) {
             uint8_t b1, flags;
             uint32_t frg, len;
@@ -3970,8 +3933,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 if (end - p < OPEN_BODY) return ANL_EFORMAT;
                 dec_open_body(&p, &oi);
             }
-            if (last) len = (uint32_t)(end - p);
-            else if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
+            if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
             if ((uint32_t)(end - p) < len) return ANL_EFORMAT;
             had_data = 1;
             if (b1 & F_OPEN) {
@@ -3990,20 +3952,12 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             uint16_t wnd;
             uint32_t una24, ts_echo, n, i, span = 0;
             uint16_t echo16;
-            if (end - p < ACK_FIX - 1) return ANL_EFORMAT;
+            if (end - p < ACK_FIX) return ANL_EFORMAT;
             w->ack_rx_ts = w->current | 1;          /* the peer receives from us: write_echo */
             b1 = dec8(&p);
             una24 = dec24(&p);
             wnd = dec16(&p);
-            if (b1 & ACK_F_DELTA) {
-                uint8_t zz = dec8(&p);
-                if (!echo_prev_ok || (zz & 0x80)) return ANL_EFORMAT;
-                echo16 = (uint16_t)(echo_prev + (uint16_t)((zz & 1) ? -(int)((zz + 1) / 2) : (int)(zz / 2)));
-            } else {
-                if (end - p < 2) return ANL_EFORMAT;
-                echo16 = dec16(&p);
-            }
-            echo_prev = echo16; echo_prev_ok = 1;
+            echo16 = dec16(&p);
             /* our own clock, 16 bits back: the newest time with these low bits */
             ts_echo = w->current - (uint16_t)((uint16_t)w->current - echo16);
             if (dec_varint(&p, end, &n) < 0) return ANL_EFORMAT;
@@ -4040,8 +3994,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             uint32_t blen;
             if (end - p < 1) return ANL_EFORMAT;
             sub = dec8(&p);
-            if (last) blen = (uint32_t)(end - p);
-            else if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
+            if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
             if ((uint32_t)(end - p) < blen) return ANL_EFORMAT;
             if (sub == CTRL_PARITY) {
                 st = stream_for_input(w, sid);

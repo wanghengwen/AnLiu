@@ -3,13 +3,11 @@
  */
 #include "../anliu.h"
 static void trace_seg_commit(const anl_t *, uint32_t, int);
-static void trace_seg_trim(const anl_t *, uint32_t);
 static void trace_data_seg(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void trace_parity_seg(const anl_t *, int, uint32_t);
 static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
 static void trace_diag_output(const anl_t *, uint32_t, int);
 #define ANL_TRACE_seg_commit trace_seg_commit
-#define ANL_TRACE_seg_trim trace_seg_trim
 #define ANL_TRACE_data_seg trace_data_seg
 #define ANL_TRACE_parity_seg trace_parity_seg
 #define ANL_TRACE_fec_block trace_fec_block
@@ -79,7 +77,8 @@ static void run_cost(int fec)
     net_stop(&n);
 }
 
-/* Known wire lengths, independent of data_seg_size and residual accounting. */
+/* Known wire lengths, independent of data_seg_size: DATA sid(1) b1(1) sn(3) len(1) + 100,
+ * PARITY sid(1) sub(1) len(2) + 200, ECHO sid(1) sub(1) len(1) + 3. */
 static void run_exact_cost(void)
 {
     anl_config c; anl_t *w; anl_seg *s; uint8_t parity[200] = {0}; int kind;
@@ -96,11 +95,11 @@ static void run_exact_cost(void)
         if (kind == 4) write_ctrl_seg(w, 0, CTRL_ECHO, parity, ECHO_BODY);
         dg_seal(w);
         CHECK(!g_fec_diag.accounting_errors && g_fec_diag.overhead == ANL_OVERHEAD, "exact encapsulation kind=%d: %llu", kind, (unsigned long long)g_fec_diag.overhead);
-        if (kind == 0) CHECK(g_fec_diag.sent[0].first == 105 && g_fec_diag.output == 105 + ANL_OVERHEAD, "last DATA omits one-byte length");
-        if (kind == 1) CHECK(g_fec_diag.sent[0].retry == 105 && g_fec_diag.output == 105 + ANL_OVERHEAD, "last retransmit omits length");
-        if (kind == 2) CHECK(g_fec_diag.sent[0].first == 106 && g_fec_diag.sent[0].parity == 202 && !g_fec_diag.parity_datagrams[0], "mixed DATA/PARITY: only last segment loses length");
-        if (kind == 3) CHECK(g_fec_diag.sent[0].parity == 202 && g_fec_diag.parity_output[0] == 202 + ANL_OVERHEAD && g_fec_diag.parity_datagrams[0] == 1, "pure parity omits two-byte length");
-        if (kind == 4) CHECK(g_fec_diag.control == 5 && g_fec_diag.output == 5 + ANL_OVERHEAD, "last control omits length");
+        if (kind == 0) CHECK(g_fec_diag.sent[0].first == 106 && g_fec_diag.output == 106 + ANL_OVERHEAD, "a DATA segment: 6 + payload");
+        if (kind == 1) CHECK(g_fec_diag.sent[0].retry == 106 && g_fec_diag.output == 106 + ANL_OVERHEAD, "a retransmission: the same");
+        if (kind == 2) CHECK(g_fec_diag.sent[0].first == 106 && g_fec_diag.sent[0].parity == 204 && !g_fec_diag.parity_datagrams[0], "mixed DATA/PARITY: each its own size, not a pure parity datagram");
+        if (kind == 3) CHECK(g_fec_diag.sent[0].parity == 204 && g_fec_diag.parity_output[0] == 204 + ANL_OVERHEAD && g_fec_diag.parity_datagrams[0] == 1, "pure parity: 4 + body");
+        if (kind == 4) CHECK(g_fec_diag.control == 6 && g_fec_diag.output == 6 + ANL_OVERHEAD, "a control segment: 3 + body");
     }
     seg_free(s); anl_release(w);
     memset(&g_fec_diag, 0, sizeof(g_fec_diag));

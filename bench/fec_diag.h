@@ -8,7 +8,6 @@ typedef struct {
     const anl_t *owner;
     fec_diag_bytes pending[4], sent[4];
     uint64_t pending_control, control, overhead, output, datagrams;
-    uint64_t *last_segment; /* pending category of the segment whose length can be omitted */
     uint64_t blocks[4], data[4], parities[4], floor_blocks[4];
     uint64_t parity_output[4], parity_datagrams[4]; /* whole PARITY-only datagrams, including headers */
     uint64_t accounting_errors;
@@ -28,11 +27,7 @@ static unsigned fec_diag_tag(const anl_stream *st)
 static void trace_seg_commit(const anl_t *w, uint32_t bytes, int data)
 {
     if (!fec_diag_active(w)) return;
-    g_fec_diag.last_segment = NULL;
-    if (!data) {
-        g_fec_diag.pending_control += bytes;
-        g_fec_diag.last_segment = &g_fec_diag.pending_control;
-    }
+    if (!data) g_fec_diag.pending_control += bytes;
 }
 
 static void trace_data_seg(const anl_t *w, const anl_stream_t *st, const void *seg, uint32_t bytes, int first)
@@ -42,25 +37,11 @@ static void trace_data_seg(const anl_t *w, const anl_stream_t *st, const void *s
     if (!fec_diag_active(w)) return;
     p = &g_fec_diag.pending[fec_diag_tag(st)];
     if (first) p->first += bytes; else p->retry += bytes;
-    g_fec_diag.last_segment = first ? &p->first : &p->retry;
 }
 
 static void trace_parity_seg(const anl_t *w, int sid, uint32_t bytes)
 {
-    if (fec_diag_active(w)) {
-        uint64_t *p = &g_fec_diag.pending[fec_diag_tag(sget(w, sid))].parity;
-        *p += bytes;
-        g_fec_diag.last_segment = p;
-    }
-}
-
-/* SEG_L removes the last DATA/CTRL length after all segments were packed. */
-static void trace_seg_trim(const anl_t *w, uint32_t bytes)
-{
-    fec_diag *d = &g_fec_diag;
-    if (!fec_diag_active(w)) return;
-    if (!d->last_segment || *d->last_segment < bytes) d->accounting_errors++;
-    else *d->last_segment -= bytes;
+    if (fec_diag_active(w)) g_fec_diag.pending[fec_diag_tag(sget(w, sid))].parity += bytes;
 }
 
 static void trace_fec_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint32_t m, uint32_t lmax, int key)
@@ -92,7 +73,6 @@ static void fec_diag_output(const anl_t *w, uint32_t bytes)
         memset(p, 0, sizeof(*p));
     }
     d->output += bytes; d->datagrams++;
-    d->last_segment = NULL;
     /* Parity can share a datagram with DATA or ECHO. Only pure parity
        datagrams belong to this subset; mixed ones remain in total output. */
     if (parity && parity == segments && parity_tag >= 0) {

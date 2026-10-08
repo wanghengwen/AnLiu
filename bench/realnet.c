@@ -62,7 +62,6 @@ static void trace_pace_refill(const anl_t *, uint32_t, uint64_t, uint64_t);
 static void trace_tx_output(const anl_t *, uint32_t, int);
 static void trace_media_tx_output(const anl_t *, uint32_t, int);
 static void trace_seg_commit(const anl_t *, uint32_t, int);
-static void trace_seg_trim(const anl_t *, uint32_t);
 static void trace_data_seg(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void trace_parity_seg(const anl_t *, int, uint32_t);
 static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
@@ -71,7 +70,6 @@ static void trace_lt_begin(const anl_t *);
 #define ANL_TRACE_pace_refill trace_pace_refill
 #define ANL_TRACE_tx_output trace_media_tx_output
 #define ANL_TRACE_seg_commit trace_seg_commit
-#define ANL_TRACE_seg_trim trace_seg_trim
 #define ANL_TRACE_data_seg trace_data_seg
 #define ANL_TRACE_parity_seg trace_parity_seg
 #define ANL_TRACE_fec_block trace_fec_block

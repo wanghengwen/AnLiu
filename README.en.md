@@ -15,7 +15,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Congestion control and bandwidth estimation | BBRv2 (with BBRv3-style four-phase bandwidth probing): sends according to the measured bottleneck bandwidth and propagation delay without filling the bottleneck queue; the bandwidth estimate is exposed to the application through `anl_get_stats()` for bitrate control |
 | Smooth sending | Connection-level token-bucket pacing (rate = gain × bandwidth estimate); large frames are never sent as a full-window burst |
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
-| Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU, or 5 bytes when the last segment omits its length; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
+| Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
 See [DESIGN.md](DESIGN.md) for the detailed design and [performance.md](performance.md) for performance data; comparison tools are in `bench/`. (Both documents are currently in Chinese.)
 
