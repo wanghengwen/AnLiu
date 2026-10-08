@@ -17,7 +17,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
 | Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
-See [DESIGN.md](DESIGN.md) for the detailed design and [performance.md](performance.md) for performance data; comparison tools are in `bench/`. (Both documents are currently in Chinese.)
+See [DESIGN.md](DESIGN.md) for the detailed design, [performance.md](performance.md) for performance data and [TUNING.md](TUNING.md) for the measurements behind the rules in the code; comparison tools are in `bench/`. (The first two are currently in Chinese.)
 
 ## Build and install
 

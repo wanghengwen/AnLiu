@@ -15,7 +15,7 @@ AnLiu 是一个基于 UDP 的传输协议，实现方式参考 [ikcp](https://gi
 | 现代丢包恢复 | 区间确认（SACK）+ 基于时间的丢包判定（RACK）+ 乱序自适应 |
 | 精简头部 | 数据报头 23 字节（含 12 字节认证和 4 字节包号），默认 MTU 下基础 DATA 段头 6~7 字节，分片扩展、帧号、流 ID 扩展和 OPEN 参数另计；kcp 每段 24 字节且不加密 |
 
-详细设计见 [DESIGN.md](DESIGN.md)，性能测试数据见 [performance.md](performance.md)，对照测试工具位于 `bench/`。
+详细设计见 [DESIGN.md](DESIGN.md)，性能测试数据见 [performance.md](performance.md)，代码里各条规则的实验依据见 [TUNING.md](TUNING.md)，对照测试工具位于 `bench/`。
 
 ## 编译与安装
 

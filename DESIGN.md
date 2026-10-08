@@ -4,7 +4,7 @@
 整理日期：2026-10-06
 线上版本：`ANL_VERSION = 1`
 
-本文件描述当前实现。性能测量见 [performance.md](performance.md)；
+本文件描述当前实现。性能测量见 [performance.md](performance.md)，代码里各条规则的实验依据见 [TUNING.md](TUNING.md)；
 
 ---
 
