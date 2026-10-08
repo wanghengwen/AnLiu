@@ -9,7 +9,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Capability | Description |
 |---|---|
 | Encryption and anti-fingerprinting | SIV construction from ChaCha20 + SipHash-2-4; whole-datagram authentication, encryption after conv, per-direction keys, random padding |
-| Multiple streams | Up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); a stream ID is the lowest free one, used again 2 s after its close is confirmed, with a generation number telling the two apart; either side can open and close at any time, a close tells the peer (CLOSE, repeated until the peer confirms); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
+| Multiple streams | Up to 64 streams on a connection at once (`ANL_MAX_STREAMS`, the default stream included); a stream ID is the lowest free one, used again 2 s (longer with a larger timestamp window) after its close is confirmed, with a generation number telling the two apart; either side can open and close at any time, a close tells the peer (CLOSE, repeated until the peer confirms); shared congestion control, ACKs merged into datagrams, weighted scheduling by priority |
 | Semi-reliable frame delivery | Data is sent as "frames"; whole frames are dropped when they expire or back up; key-frame dependency handling; receiver-side frame skipping |
 | Per-stream FEC | Reed-Solomon forward error correction enabled per stream: fixed redundancy (default ratio 25%) or conditional adaptive mode; fixed blocks of 100 ms, adaptive blocks up to 400 ms; any m losses within a block are recoverable |
 | Congestion control and bandwidth estimation | BBRv2 (with BBRv3-style four-phase bandwidth probing): sends according to the measured bottleneck bandwidth and propagation delay without filling the bottleneck queue; the bandwidth estimate is exposed to the application through `anl_get_stats()` for bitrate control |
@@ -195,12 +195,12 @@ Coverage:
 
 | Category | Tests |
 |---|---|
-| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` without keys, conv masking and tamper detection); reflection attack; replay (packet-number window: duplicate, reordered inside the window, below it, a jump ahead) and a stale timestamp |
+| Cryptography | ChaCha20 (RFC 8439 vectors), SipHash-2-4 known answers; server dispatch (`anl_peek_conv` without keys, conv masking and tamper detection); reflection attack; replay (packet-number window: duplicate, reordered inside the window, below it, a jump ahead, beyond the ahead range, pn 0 after 2^31, wrap) and a stale timestamp |
 | Reliable streams | 0% / 10% loss, message mode and byte-stream mode, content and order checks |
 | Semi-reliable streams | 0% / 5% loss, with and without FEC, 1 Mbps congestion; frame numbers, `lost_before` accounting closes |
 | FEC | Specific datagram drops (last fragment of a frame, 3 scattered, 4 consecutive) must be recovered by RS within one RTT; adaptive redundancy (falls to the floor without loss, rises on late losses, does not rise when retransmission is in time); audio + video streams adapting simultaneously; PARITY segment fuzzing |
 | Key frames | Sender clears dependent frames in flight; receiver discards undecodable P-frames |
-| Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit; sid reuse (lowest free, 2 s hold, a late first datagram of the earlier generation gets RST, 9000 opens and closes with 10% loss and duplicates); handle lifetime; accept callback |
+| Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit; sid reuse (lowest free, 2 s hold and its growth with the timestamp window, a late first datagram of the earlier generation gets RST, a late ACK of the earlier generation taken for the new one's answer, an unanswered CLOSE given up, 9000 opens and closes with 10% loss and 5% duplicates); handle lifetime; accept callback |
 | Scheduling and congestion control | Priority (5 combinations × BBR / BBR + rate cap); pacing burst cap; fragment size; links with RTT under 2 ms |
 | Application interface | `target_rate`: an encoder following it climbs to the link rate and keeps up after a bandwidth drop; delay reports: measured on the receiver, received by the sender |
 | Robustness | Recovery after a 5 s outage; protocol violation (RST); fuzzing with 20000 randomly mutated datagrams |

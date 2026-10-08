@@ -10,9 +10,10 @@
  * change hooks while allocated objects remain alive or calls run concurrently.
  *
  * Re-entrancy: anl_flush, anl_update, anl_input (immediate ACKs),
- * anl_stream_open (the OPEN announcement) and the send calls of a stream
- * with flush_on_send may invoke the output callback synchronously. The
- * output callback must not call any anl_* function.
+ * anl_stream_open (the OPEN announcement), anl_stream_close (the CLOSE) and
+ * the send calls of a stream with flush_on_send may invoke the output
+ * callback synchronously. The output callback must not call any anl_*
+ * function.
  */
 #ifndef ANLIU_H
 #define ANLIU_H
@@ -32,7 +33,8 @@ extern "C" {
 #define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
                                                varint extension (DESIGN 5). A sid is the lowest
                                                free one of its side's parity: one whose stream is
-                                               gone is held back 2 s, then used again (DESIGN 6.1) */
+                                               gone is held back a while (2 s, longer with a larger
+                                               ts_window_ms), then used again (DESIGN 6.1) */
 #define ANL_MAX_STREAMS     64      /* streams on a connection at once, both sides' and the
                                        default stream included (DESIGN 6.1) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
@@ -111,8 +113,11 @@ typedef struct anl_config {
     int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
                                   also seeds pacing before the first bandwidth sample */
     int dead_link;              /* 20: reliable DATA dies at xmit >= dead_link (first send
-                                   included); FWD at retries > dead_link; OPEN excluded */
-    int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2) */
+                                   included; timeouts and repeated RACK retries both back off,
+                                   so minutes, not 20 round trips); FWD at retries > dead_link;
+                                   OPEN excluded */
+    int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2);
+                                   a sid is held at least this + 1 s (DESIGN 6.1) */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */
     int idle_timeout_ms;        /* SERVER default 30000, CLIENT default 0 */
     int pace_rate;              /* bytes/s; 0 = BBR alone (gain * bandwidth estimate), > 0 = upper
@@ -365,7 +370,10 @@ anl_stream_t *anl_default_stream(anl_t *w);
  *---------------------------------------------------------------------*/
 /* Opens a stream with an automatically allocated sid: the lowest free one of
  * this side's parity (client even from 2, server odd); a sid whose stream is
- * gone is used again 2 s after the peer confirmed that (DESIGN 6.1). There is
+ * gone is used again after a hold: 2 s (ts_window_ms + 1 s if longer) from
+ * when the stream went on both sides - for a close of ours, from the peer's
+ * confirmation; one whose close the peer never confirmed is not used again
+ * (DESIGN 6.1). There is
  * no handshake: the first segments carry the stream parameters and the peer
  * creates the stream on arrival.
  * Returns NULL on failure with the reason in *err (optional):
@@ -375,7 +383,8 @@ anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 /* Release the stream here and the handle: unsent, unacknowledged and unread
  * data is dropped; a stream whose data must arrive is closed once
  * anl_stream_waitsnd is 0. The peer is told (CLOSE, repeated until it
- * confirms): its end is over, reads there return the data that had arrived
+ * confirms; given up after dead_link unanswered ones, the sid then not used
+ * again): its end is over, reads there return the data that had arrived
  * in order and then ANL_ECLOSED. Until the confirmation, about a round
  * trip, the place counts against anl_stream_open here, not against the
  * peer's opens. Afterwards the handle must not be used. The default stream
