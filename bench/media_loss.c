@@ -316,7 +316,7 @@ int main(int argc, char **argv)
             anl_t *w = s.e[0].anl; anl_stream *v = s.e[0].h[1];
             printf("SAMPLE ms=%llu ratio=%d/%d srtt=%d loss=%u gate=%d need=%u key_need=%u scale=%d short=%d parity_video=%llu\n",
                 (unsigned long long)s.t, s.e[0].h[0]->fec_ratio, v->fec_ratio, w->rx_srtt, w->fec_loss, v->fec_gate,
-                fec_repair_ms(w, v, v->fec_frame_avg, 0), fec_repair_ms(w, v, v->fec_key_bytes, 1), scale,
+                fec_repair_ms(w, v, v->fec_frame_avg, 0, 0), fec_repair_ms(w, v, v->fec_key_bytes, 1, 0), scale,
                 w->capacity_short, (unsigned long long)parity_bytes[1]);
         }
     }
