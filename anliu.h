@@ -113,7 +113,9 @@ typedef struct anl_config {
     int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
                                   also seeds pacing before the first bandwidth sample */
     int dead_link;              /* 20: reliable DATA dies at xmit >= dead_link (first send
-                                   included); FWD at retries > dead_link; OPEN excluded */
+                                   included; timeouts and repeated RACK retries both back off,
+                                   so minutes, not 20 round trips); FWD at retries > dead_link;
+                                   OPEN excluded */
     int ts_window_ms;           /* 1000, fixed; not tied to RTO; <= 30000 (16-bit ts, DESIGN 4.2);
                                    a sid is held at least this + 1 s (DESIGN 6.1) */
     int keepalive_ms;           /* 0 = off; keepalive datagrams are always padded */

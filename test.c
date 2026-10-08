@@ -43,6 +43,7 @@ typedef struct net {
     int reflect;                    /* send packets back to the sender */
     uint32_t drop_at[4];            /* != 0: drop the datagrams with these n->sent numbers */
     int block[2];                   /* drop everything this side sends (a one-way outage) */
+    int max_len[2];                 /* != 0: drop what this side sends longer than this (a size blackhole) */
     int reorder;                    /* 1 = jitter may reorder datagrams; 0 = FIFO path */
     uint32_t last_at[2];            /* last scheduled delivery per direction (FIFO) */
     int bandwidth_bps;              /* 0 = unlimited; otherwise a bottleneck queue */
@@ -84,7 +85,7 @@ static int net_output(char *buf, int len, anl_t *w, void *user)
         for (d = 0; d < 4; d++)
             if (n->drop_at[d] != 0 && (uint32_t)n->sent == n->drop_at[d]) { n->lost++; return 0; }
     }
-    if (n->block[from]) { n->lost++; return 0; }
+    if (n->block[from] || (n->max_len[from] && len > n->max_len[from])) { n->lost++; return 0; }
     /* burst measurement over a 5 ms window */
     if ((int32_t)(n->now - n->burst_window_start[from]) >= 5) { n->burst_window_start[from] = n->now; n->burst_window_bytes[from] = 0; }
     n->burst_window_bytes[from] += (uint32_t)len;
@@ -1304,6 +1305,46 @@ static void test_sid_stale_proof(void)
     net_stop(&n);
 }
 
+/* a path that loses one segment over and over while the rest gets through (a
+ * size blackhole: large datagrams lost, small ones not): RACK keeps finding
+ * the segment lost from the peer's other ACKs. Its retransmissions back off,
+ * so dead_link takes minutes - at a fixed spacing of an RTO it took 20 round
+ * trips, and the connection died with the peer alive (real path, 2.7 s) */
+static void test_rack_repeat_backoff(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    char buf[4000];
+    int i, r, got = 0, small = 0;
+    printf("[a segment lost over and over while the peer acknowledges the rest: no death in seconds]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 50;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    n.max_len[0] = 300;
+    fill_pattern(buf, 3000, 41);
+    anl_stream_send(a, buf, 3000);
+    for (i = 0; i < 10000; i++) {
+        if (i % 20 == 0) anl_send(n.ep[0], "tick", 4);       /* small datagrams: the peer's ACKs go on */
+        net_tick(&n);
+        while (anl_recv(n.ep[1], buf, sizeof(buf)) == 4) small++;
+        if (anl_state(n.ep[0]) < 0) break;
+    }
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "alive after 10 s of the large segments lost (%d ms)", i);
+    CHECK(small > 400, "the small datagrams got through (%d)", small);
+    n.max_len[0] = 0;
+    for (i = 0; i < 120000 && got < 3000; i++) {
+        net_tick(&n);
+        while ((r = anl_stream_recv(b, buf + got, (int)sizeof(buf) - got)) > 0) got += r;
+        while (anl_recv(n.ep[1], buf + 3500, 100) > 0) ;
+    }
+    CHECK(got == 3000 && check_pattern(buf, 3000, 41), "delivered %d ms after the path took them again (%d)", i, got);
+    printf("  delivered %d ms after the path came back\n", i);
+    net_stop(&n);
+}
+
 /* sids (DESIGN 6.1): the lowest free one of our parity; one whose stream
  * went is held 2 s on both sides, then used again. A late first datagram of
  * the old stream inside the hold gets RST, not a new stream */
@@ -2343,6 +2384,67 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
     CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
     net_stop(&n);
     return open;
+}
+
+/* FEC buffers only while parities may come of them (DESIGN 8.7): on a
+ * lossless path the encoder's copies and the receive cache go; once the path
+ * loses on a long RTT they come back and repair; lossless again, they go */
+static long fec_buf_bytes(const anl_t *w)
+{
+    long t = 0;
+    const anl_node *nd;
+    uint32_t j;
+    for (nd = w->slist.next; nd != &w->slist; nd = nd->next) {
+        const anl_stream *st = STREAM_OF(nd);
+        if (st->fec_slot) for (j = 0; j < FEC_K_MAX; j++) t += st->fec_slot[j].cap;
+        if (st->fec_out) for (j = 0; j < FEC_M_MAX; j++) t += st->fec_out[j].cap;
+        if (st->cache) for (j = 0; j < st->cache_n; j++) t += st->cache[j].b.cap;
+        if (st->pcache) for (j = 0; j < st->pcache_n; j++) t += st->pcache[j].b.cap;
+    }
+    return t;
+}
+
+static void test_fec_buffers_release(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *v, *pv;
+    anl_stream_stats ss;
+    static char buf[40000];
+    int i;
+    long tx_busy = 0, rx_busy = 0;
+    printf("[fec buffers: released on a lossless path, back when it loses]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 120;
+    ca.interval = cb.interval = 10;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.drop_until_key = 1;
+    v = open_pair(&n, 0, &o, NULL, &pv);
+    if (!pv) { net_stop(&n); return; }
+    for (i = 0; i < 160000; i++) {
+        if (i == 40000) n.loss_pct = 5;
+        if (i == 100000) n.loss_pct = 0;
+        if (i % 33 == 0) anl_stream_send_frame(v, i % 2000 == 0 ? ANL_FRAME_KEY : 0, buf, i % 2000 == 0 ? 20000 : 4000, NULL);
+        net_tick(&n);
+        while (anl_stream_recv_frame(pv, buf, sizeof(buf), NULL) > 0) ;
+        if (i == 39999) {
+            CHECK(fec_buf_bytes(n.ep[0]) == 0 && fec_buf_bytes(n.ep[1]) == 0, "lossless 40 s: no FEC buffers (%ld / %ld)",
+                  fec_buf_bytes(n.ep[0]), fec_buf_bytes(n.ep[1]));
+            anl_stream_get_stats(pv, &ss);
+            CHECK(ss.fec_recovered == 0, "nothing rebuilt yet (%u)", ss.fec_recovered);
+        }
+        if (i >= 60000 && i < 100000) {
+            if (fec_buf_bytes(n.ep[0]) > 0) tx_busy++;
+            if (fec_buf_bytes(n.ep[1]) > 0) rx_busy++;
+        }
+    }
+    anl_stream_get_stats(pv, &ss);
+    CHECK(tx_busy > 30000 && rx_busy > 30000, "with 5%% loss the buffers are back (%ld / %ld ms of 40000)", tx_busy, rx_busy);
+    CHECK(ss.fec_recovered > 50, "and repair (%u rebuilt)", ss.fec_recovered);
+    CHECK(fec_buf_bytes(n.ep[0]) == 0 && fec_buf_bytes(n.ep[1]) == 0, "lossless again 60 s: gone again (%ld / %ld)",
+          fec_buf_bytes(n.ep[0]), fec_buf_bytes(n.ep[1]));
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connections alive");
+    net_stop(&n);
 }
 
 /* latency_rtt (DESIGN 8.6): the application waits N round trips - the FEC
@@ -4282,6 +4384,7 @@ int main(void)
     RUN(test_stream_lifecycle(10));
     RUN(test_sid_reuse());
     RUN(test_sid_stale_proof());
+    RUN(test_rack_repeat_backoff());
     RUN(test_handle_lifetime());
     RUN(test_wire_v1_wrap(0));
     RUN(test_wire_v1_wrap(1));
@@ -4349,6 +4452,7 @@ int main(void)
     RUN(test_review_timers());
     RUN(test_review_backlog());
     RUN(test_review_gf_tables());
+    RUN(test_fec_buffers_release());      /* last: new tests leave the others' random sequences alone */
     if (g_fail) { printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("\nall tests passed\n");
     return 0;

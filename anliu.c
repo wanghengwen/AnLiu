@@ -670,6 +670,8 @@ typedef struct anl_stream {
     fec_pentry *pcache;
     uint32_t pcache_n;
     uint32_t par_rx_ts;                 /* receiver: the last parity arrived (| 1; 0: none) */
+    uint32_t fec_rx_ts;                 /* receiver: the first data (| 1; 0: none yet) - the cache runs from it */
+    int fec_tx_held, fec_rx_held;       /* the encoder's / the receive cache's buffers hold memory (fec_release_*) */
     int in_retry;
 
     uint32_t fec_rec_ring[FEC_REC_RING];/* receiver: the last rebuilt sn (spurious when the original follows) */
@@ -831,6 +833,8 @@ struct anl_s {
                                            by the peer's FEC or not) in the current window */
     uint32_t fec_loss;                  /* raw loss of the connection before FEC, 1/65536 (DESIGN 8.5) */
     int fec_loss_valid;                 /* windows fec_loss has had, up to FEC_LOSS_WARM (0: none yet) */
+    uint32_t rx_hole_ts;                /* the last datagram that showed a hole in a stream here (| 1; 0: none):
+                                           the peer may be about to open its FEC gate (fec_rx_wanted) */
     uint32_t fec_loss_ts;               /* the last loss with hard evidence (| 1; 0: none yet): a confirmed retry,
                                            RTO, expiry or reported rebuild - not "acknowledged after a higher sn",
                                            which reordering does too (DESIGN 8.6) */
@@ -1715,6 +1719,29 @@ static int fbuf_reserve(fec_buf *b, uint32_t n)
     return 0;
 }
 
+/* FEC buffers out of use (DESIGN 8.7): the encoder's copies of the open
+ * block, and the parities once sent; the receive cache and the parities
+ * waiting in it. The arrays stay, the buffers grow again on use */
+static void fec_release_tx(anl_stream *st)
+{
+    uint32_t i;
+    if (!st->fec_tx_held || st->fec_slot == NULL || st->fec_n > 0) return;
+    for (i = 0; i < FEC_K_MAX; i++) fbuf_free(&st->fec_slot[i]);
+    if (st->fec_out_i < st->fec_out_m) return;      /* parities still to go: next time */
+    for (i = 0; i < FEC_M_MAX; i++) fbuf_free(&st->fec_out[i]);
+    st->fec_out_m = st->fec_out_i = 0;
+    st->fec_tx_held = 0;
+}
+
+static void fec_release_rx(anl_stream *st)
+{
+    uint32_t i;
+    if (!st->fec_rx_held || st->cache == NULL || st->pcache == NULL) return;
+    for (i = 0; i < st->cache_n; i++) { fbuf_free(&st->cache[i].b); st->cache[i].valid = 0; }
+    for (i = 0; i < st->pcache_n; i++) { fbuf_free(&st->pcache[i].b); st->pcache[i].valid = 0; }
+    st->fec_rx_held = 0;
+}
+
 static void fec_free(anl_stream *st)
 {
     uint32_t i;
@@ -2265,6 +2292,20 @@ static void fec_drop_block(anl_stream *st, uint32_t base, uint32_t k)
         if (st->pcache[i].valid && st->pcache[i].base == base && st->pcache[i].k == k) st->pcache[i].valid = 0;
 }
 
+/* The receive cache (DESIGN 8.7): kept while the peer may send parities -
+ * the stream's first FEC_LOSS_RECENT_MS (the first key frame, audio startup),
+ * a parity within that long, or a hole in any stream here within that long:
+ * the peer opens its gate only on a loss with hard evidence that recent
+ * (fec_gate_update), which its receiver sees first as a hole. A lossless
+ * path drops it; a lossy one with a gate shut by a short RTT keeps it */
+static int fec_rx_wanted(anl_t *w, anl_stream *st)
+{
+    if (st->fec_rx_ts == 0) st->fec_rx_ts = w->current | 1;
+    if (tdiff(w->current, st->fec_rx_ts) < FEC_LOSS_RECENT_MS) return 1;
+    if (st->par_rx_ts && tdiff(w->current, st->par_rx_ts) < FEC_LOSS_RECENT_MS) return 1;
+    return w->rx_hole_ts && tdiff(w->current, w->rx_hole_ts) < FEC_LOSS_RECENT_MS;
+}
+
 /* a parity waits for at most this long for the rest of its block */
 static uint32_t fec_parity_ttl(const anl_t *w)
 {
@@ -2313,6 +2354,7 @@ static void handle_parity(anl_t *w, anl_stream *st, const char *body, uint32_t b
     }
     e = &st->pcache[slot];
     if (fbuf_reserve(&e->b, lmax) < 0) return;
+    st->fec_rx_held = 1;
     e->valid = 1;
     e->base = base;
     e->k = k;
@@ -2364,6 +2406,7 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
         ANL_DUP_TRACE(w, st, sn);
 #endif
     if (tdiff(sn, st->rcv_nxt) < 0) return;
+    if (!recovered && tdiff(sn, st->rcv_nxt) > 0) w->rx_hole_ts = w->current | 1;  /* behind a hole: loss (or reordering) */
 
     r = run_find(st, sn);
     if (r && tdiff(sn, r->end) < 0) {
@@ -2390,7 +2433,10 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
     rcv_bytes_add(w, len);
 
     if (st->fec) {
-        fec_cache_add(st, sn, frg, flags, frame16, data, len);
+        if (fec_rx_wanted(w, st)) {
+            fec_cache_add(st, sn, frg, flags, frame16, data, len);
+            st->fec_rx_held = 1;
+        } else fec_release_rx(st);
     }
     move_to_queue(w, st);
     if (st->fec && !recovered) fec_retry_pending(w, st);
@@ -2448,10 +2494,13 @@ static int rack_candidate(const anl_t *w, const anl_stream *st, const anl_seg *s
        empty part of a policer's token cycle. With a 1 ms RTT, a later packet
        was delivered while the same missing packet lost 20 transmissions in
        64 ms. Space repeated fast retries by 4, 8, 16 ... ms, capped by its
-       existing RTO (and 256 ms). The first fast retry and semi deadlines keep
-       their original timing; RTO backoff and dead_link remain unchanged. */
+       RTO - which a lost retransmission backs off (flush, as for a timeout):
+       held at the RTO (137 ms on a 100 ms path) the cap let a segment the
+       path kept losing use up dead_link in 2.7 s while the peer acknowledged
+       everything else, and the connection died. The first fast retry and
+       semi deadlines keep their original timing. */
     if (st->mode == ANL_RELIABLE && seg->xmit > 1) {
-        uint32_t shift = seg->xmit > 8 ? 8 : seg->xmit;
+        uint32_t shift = seg->xmit > 16 ? 16 : seg->xmit;
         uint32_t pause = umin32(seg->rto, 1u << shift);
         if (tdiff(w->current, seg->ts_sent) < (int32_t)pause) return 0;
     }
@@ -4676,6 +4725,27 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
     st->fec_sent = st->fec_miss = 0;
 }
 
+/* A block opening now (with seg) could get parities (DESIGN 8.7): a fixed
+ * ratio or adaptive without the RTT gate always; the RTT gate only while it
+ * is open, in audio startup, before anything is known (the first key frame),
+ * or with a loss of hard evidence within FEC_LOSS_RECENT_MS (what opens it,
+ * fec_gate_update / fec_key_gate, needs that too) and then for a key frame
+ * of a drop_until_key stream, or a typical frame whose repair is past half
+ * of fec_deadline. The gate is judged when the block closes, with the RTT
+ * of then: a key frame's own queue raised it from 192 to 226 ms within the
+ * frame (2 Mbit, 20 ms) - hence the margin, and key frames whatever their
+ * repair. Otherwise the block's copies are not made and the buffers go;
+ * the first block collected again is the one that can open the gate */
+static int fec_collect(anl_t *w, anl_stream *st, const anl_seg *seg)
+{
+    uint32_t d = st->fec_deadline;
+    if (!st->fec_rtt_auto || st->fec_gate || fec_audio_startup(w, st)) return 1;
+    if (!w->fec_loss_valid && w->fec_loss_ts == 0) return 1;
+    if (w->fec_loss_ts == 0 || tdiff(w->current, w->fec_loss_ts) >= FEC_LOSS_RECENT_MS) return 0;
+    if (w->rx_srtt <= 0 || d == 0 || (seg->fkey && st->drop_until_key)) return 1;
+    return fec_repair_ms(w, st, st->fec_frame_avg, 0) * 2 > d;
+}
+
 /* How long the block opening now collects (DESIGN 8.2). Adaptive parity: as
  * long as fec_deadline leaves after the trip (srtt / 2), the last block's
  * parities FEC_GAP apart and the jitter (two update intervals, 4 rttvar) -
@@ -4700,6 +4770,10 @@ static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
         st->fec_start_state = 1;
     }
     if (st->fec_n > 0 && seg->sn != st->fec_base + st->fec_n) fec_close_block(w, st);
+    if (st->fec_n == 0 && !fec_collect(w, st, seg)) {
+        fec_release_tx(st);
+        return;
+    }
     if (st->fec_n == 0) {
         st->fec_base = seg->sn;
         st->fec_first_ts = w->current;
@@ -4707,6 +4781,7 @@ static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
     }
     b = &st->fec_slot[st->fec_n];
     if (fbuf_reserve(b, seg->len + CANON_HDR_MAX) < 0) { fec_close_block(w, st); return; }
+    st->fec_tx_held = 1;
     b->len = canon_build(b->p, seg->frg, seg->flags, (uint16_t)seg->frame_no, seg->data, seg->len);
     st->fec_n++;
     if (seg->fkey) st->fec_blk_key = 1;
@@ -5641,6 +5716,11 @@ static void anl_flush_internal(anl_t *w)
                     seg->rto = umin32(seg->rto + seg->rto / 2, RTO_MAX);  /* back off x1.5 */
                     seg->resendts = current + seg->rto;
                 } else if (why == 3) {
+                    /* a reliable retransmission lost again backs off as an RTO
+                       would (rack_candidate spaces the next one by it): the
+                       sends that count towards dead_link take minutes, not
+                       20 round trips, whether the timer or RACK finds them */
+                    if (st->mode == ANL_RELIABLE && seg->xmit > 1) seg->rto = umin32(seg->rto + seg->rto / 2, RTO_MAX);
                     seg->resendts = current + seg->rto;
                 }
 #ifdef ANL_RTX_TRACE
