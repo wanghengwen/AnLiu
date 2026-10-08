@@ -282,7 +282,11 @@ typedef int (*anl_output_fn)(char *buf, int len, anl_t *w, void *user);
  * with anl_stream_opt_default(peer mode) plus the peer's mode / stream / tag /
  * rcv_wnd, and the callback may change any local option except those four.
  * Return 0 to accept (the application then owns s and must anl_stream_close
- * it), < 0 to refuse (s is freed, the peer gets an RST). Like the output
+ * it), < 0 to refuse (s is freed, the peer gets an RST). The peer's rcv_wnd
+ * (up to ANL_MAX_WND) is what this end may have to hold for the stream -
+ * about 49 MB at 32768 full segments with a 1400 MTU, read or not -
+ * so with an untrusted peer refuse what exceeds the budget (DESIGN 6.1).
+ * Without a callback every stream is accepted. Like the output
  * callback it may only call anl_stream_set_user and the read-only stream
  * metadata getters (id, tag, conn, get_user). */
 typedef int (*anl_accept_fn)(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user);
@@ -350,7 +354,9 @@ void     anl_allocator(void *(*new_malloc)(size_t), void (*new_free)(void *));
 /*---------------------------------------------------------------------
  * default stream (sid 0): created with the connection on both sides, usable
  * at once, reliable byte stream (ikcp semantics), strict priority over every
- * other stream, cannot be closed. Windows: cfg.default_snd_wnd / rcv_wnd.
+ * other stream, cannot be closed by either side: a segment of the peer's
+ * that would reset another stream (a frame number, FWD, other stream
+ * parameters) is dropped there (DESIGN 6.1). Windows: cfg.default_snd_wnd / rcv_wnd.
  *---------------------------------------------------------------------*/
 int      anl_send(anl_t *w, const char *buf, int len);
 int      anl_recv(anl_t *w, char *buf, int len);

@@ -1930,9 +1930,14 @@ static void stream_free_ex(anl_t *w, anl_stream *st, int keep_read)
 static void stream_free(anl_t *w, anl_stream *st) { stream_free_ex(w, st, 0); }
 
 /* the peer broke the stream's rules (wrong segment type for the mode,
- * parameter mismatch): drop it here and tell the peer */
+ * parameter mismatch): drop it here and tell the peer. The default stream
+ * cannot be closed by either side, as CLOSE / RST for sid 0 are ignored:
+ * there the offending segment alone is dropped (every caller returns right
+ * after), or one datagram from the peer would end sid 0 for good while the
+ * connection looked alive (DESIGN 6.1) */
 static void stream_reset(anl_t *w, anl_stream *st)
 {
+    if (st == w->dflt) return;
     rstq_push(w, st->sid, st->gen);
     stream_free(w, st);
 }

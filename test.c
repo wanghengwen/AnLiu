@@ -720,6 +720,60 @@ static void test_violation(void)
     net_stop(&n);
 }
 
+/* The default stream cannot be closed by either side (anliu.h): a segment
+   breaking its rules - what resets any other stream - is dropped, and sid 0
+   keeps working with its byte stream intact (DESIGN 6.1) */
+static void test_default_violation(void)
+{
+    static const char *what[4] = { "DATA with a frame number", "FWD", "OPEN declaring semi-reliable",
+                                   "OPEN declaring a message stream" };
+    net n; anl_config ca, cb;
+    char pl[64], *q, buf[3000];
+    int v, i, r;
+    uint64_t seed0 = g_seed;        /* restored at the end: later tests see the random sequence as before */
+    printf("[protocol violation on the default stream: dropped, sid 0 stays]\n");
+    net_init(&n, &ca, &cb);
+    net_start(&n, &ca, &cb);
+    for (v = 0; v < 4; v++) {
+        uint32_t nxt0 = n.ep[1]->dflt->rcv_nxt, sn = nxt0 & SN_MASK;   /* the next byte-stream slot */
+        q = plain_hdr(pl, n.ep[0], 0x11223344, ANL_VERSION << 6, (uint16_t)n.now);
+        if (v == 0) {
+            q = enc_sid(q, SEG_DATA, 0); q = enc8(q, F_HAS_FRAME); q = enc24(q, sn);
+            q = enc16(q, 0); q = enc_varint(q, 4); memcpy(q, "evil", 4); q += 4;
+        } else if (v == 1) {
+            q = enc_sid(q, SEG_FWD, ANL_SID_DEFAULT); q = enc24(q, (sn + 5) & SN_MASK);
+        } else {
+            q = enc_sid(q, SEG_DATA, 0); q = enc8(q, F_OPEN); q = enc24(q, sn);
+            q = enc8(q, v == 2 ? OB_SEMI : 0); q = enc16(q, 4096); q = enc16(q, 0);
+            q = enc_varint(q, 4); memcpy(q, "evil", 4); q += 4;
+        }
+        r = anl_input_plain(n.ep[1], pl, (long)(q - pl));
+        CHECK(r == ANL_OK, "%s: input (%d)", what[v], r);
+        CHECK(sget(n.ep[1], ANL_SID_DEFAULT) == n.ep[1]->dflt && n.ep[1]->dflt->state == ANL_STREAM_OPEN,
+              "%s: the default stream stays (state %d)", what[v], n.ep[1]->dflt->state);
+        CHECK(n.ep[1]->dflt->rcv_nxt == nxt0 && QEMPTY(&n.ep[1]->dflt->rcv_buf) && anl_peeksize(n.ep[1]) == ANL_EAGAIN,
+              "%s: nothing of it stored", what[v]);
+        /* both directions still carry the byte stream, unchanged */
+        fill_pattern(buf, 2500, (uint32_t)v);
+        CHECK(anl_send(n.ep[0], buf, 2500) == 0 && anl_send(n.ep[1], buf, 2500) == 0, "%s: send on sid 0", what[v]);
+        for (i = 0, r = 0; i < 1000 && r < 2500; i++) {
+            int k;
+            net_tick(&n);
+            while ((k = anl_recv(n.ep[1], buf + r, (int)sizeof(buf) - r)) > 0) r += k;
+        }
+        CHECK(r == 2500 && check_pattern(buf, r, (uint32_t)v), "%s: bytes arrive intact (%d)", what[v], r);
+        for (i = 0, r = 0; i < 1000 && r < 2500; i++) {
+            int k;
+            net_tick(&n);
+            while ((k = anl_recv(n.ep[0], buf + r, (int)sizeof(buf) - r)) > 0) r += k;
+        }
+        CHECK(r == 2500 && check_pattern(buf, r, (uint32_t)v), "%s: and back (%d)", what[v], r);
+    }
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connection alive");
+    net_stop(&n);
+    g_seed = seed0;
+}
+
 /* segments cut before the peer answered carry the stream parameters and are
    OPEN_BODY smaller; later ones use the full connection mss (DESIGN 5.2) */
 static void test_seg_size(void)
@@ -4371,6 +4425,7 @@ int main(void)
     RUN(test_reflect());
     RUN(test_replay());
     RUN(test_violation());
+    RUN(test_default_violation());
     RUN(test_seg_size());
     RUN(test_close_notify(0));
     RUN(test_close_notify(15));

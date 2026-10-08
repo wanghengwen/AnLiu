@@ -203,7 +203,7 @@ Coverage:
 | Stream lifecycle | Close told to the peer and confirmed (lost CLOSE / RST, stream the peer never saw, both sides closing at once); semi-reliable close by sender / receiver; 31 streams opened on each side (with 10% loss); 64-stream limit; sid reuse (lowest free, 2 s hold and its growth with the timestamp window, a late first datagram of the earlier generation gets RST, a late ACK of the earlier generation taken for the new one's answer, an unanswered CLOSE given up, 9000 opens and closes with 10% loss and 5% duplicates); handle lifetime; accept callback |
 | Scheduling and congestion control | Priority (5 combinations × BBR / BBR + rate cap); pacing burst cap; fragment size; links with RTT under 2 ms |
 | Application interface | `target_rate`: an encoder following it climbs to the link rate and keeps up after a bandwidth drop; delay reports: measured on the receiver, received by the sender |
-| Robustness | Recovery after a 5 s outage; protocol violation (RST); fuzzing with 20000 randomly mutated datagrams |
+| Robustness | Recovery after a 5 s outage; protocol violation (RST), where a violating segment on the default stream is only dropped and the default stream is unaffected; fuzzing with 20000 randomly mutated datagrams; coverage-guided fuzzing for a peer holding the PSK in `tools/fuzz/` (libFuzzer, optional) |
 
 **Multi-seed sweep**: the same suite is run with 1000 seeds one by one under AddressSanitizer + UndefinedBehaviorSanitizer; failing seeds are rerun individually, traced down to the exact loss sequence, then fixed.
 

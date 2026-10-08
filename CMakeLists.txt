@@ -6,9 +6,13 @@ include(CTest)
 
 option(ANLIU_BUILD_BENCHMARKS "Build simulation and real-network tools" ON)
 option(ANLIU_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(ANLIU_BUILD_FUZZERS "Build the libFuzzer targets in tools/fuzz (Clang)" OFF)
 
 if(ANLIU_ENABLE_SANITIZERS AND NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     message(FATAL_ERROR "ANLIU_ENABLE_SANITIZERS requires GCC or Clang")
+endif()
+if(ANLIU_BUILD_FUZZERS AND NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ANLIU_BUILD_FUZZERS requires Clang (libFuzzer)")
 endif()
 
 function(anliu_configure_target target)
@@ -162,6 +166,29 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     #   python3 bench/test_media_loss.py build/bench/anl_media_loss
     add_executable(anl_media_loss bench/media_loss.c)
     anliu_configure_tool(anl_media_loss)
+endif()
+
+if(ANLIU_BUILD_FUZZERS)
+    # Receive path when the peer holds the PSK (SECURITY_AUDIT.md 4): the
+    # target feeds plaintext datagrams to the parser, so it includes anliu.c
+    # like test.c does. anl_fuzz_seeds writes seeds from a real exchange.
+    set(ANLIU_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    add_executable(anl_fuzz_peer tools/fuzz/fuzz_peer.c)
+    target_compile_features(anl_fuzz_peer PRIVATE c_std_99)
+    target_compile_options(anl_fuzz_peer PRIVATE -Wall -Wextra -g -O1 ${ANLIU_FUZZ_FLAGS})
+    target_link_options(anl_fuzz_peer PRIVATE ${ANLIU_FUZZ_FLAGS})
+    add_executable(anl_fuzz_seeds tools/fuzz/make_seeds.c)
+    target_compile_features(anl_fuzz_seeds PRIVATE c_std_99)
+    target_compile_options(anl_fuzz_seeds PRIVATE -Wall -Wextra)
+    if(UNIX)
+        target_link_libraries(anl_fuzz_peer PRIVATE m)
+        target_link_libraries(anl_fuzz_seeds PRIVATE m)
+    endif()
+    if(BUILD_TESTING)
+        # a short deterministic run; real campaigns are in tools/fuzz/README.md
+        add_test(NAME anliu.fuzz_peer_smoke COMMAND anl_fuzz_peer -runs=20000 -seed=1)
+        set_tests_properties(anliu.fuzz_peer_smoke PROPERTIES TIMEOUT 300)
+    endif()
 endif()
 
 if(BUILD_TESTING)
