@@ -55,6 +55,17 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME anliu.unit COMMAND anl_test)
 
+    # Adversarial harness: an on-path attacker without the PSK trying replay,
+    # reflection, forgery, tampering, malleability and injection. Includes
+    # anliu.c for the same reason test.c does.
+    add_executable(anl_attack test_attack.c)
+    anliu_configure_test(anl_attack)
+    set_target_properties(anl_attack PROPERTIES C_EXTENSIONS OFF)
+    if(UNIX)
+        target_link_libraries(anl_attack PRIVATE m)
+    endif()
+    add_test(NAME anliu.attack COMMAND anl_attack)
+
     add_executable(test_fec_diag bench/test_fec_diag.c)
     anliu_configure_test(test_fec_diag)
     set_target_properties(test_fec_diag PROPERTIES C_EXTENSIONS OFF)
@@ -154,7 +165,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BUILD_TESTING)
-    set_tests_properties(anliu.unit anliu.fec_accounting PROPERTIES TIMEOUT 180)
+    set_tests_properties(anliu.unit anliu.fec_accounting anliu.attack PROPERTIES TIMEOUT 180)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set_tests_properties(anliu.tx_accounting anliu.media_workload PROPERTIES TIMEOUT 30)
     endif()
