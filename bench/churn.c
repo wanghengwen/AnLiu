@@ -43,9 +43,9 @@ struct anl_s;
 /* why the connection was declared dead (DEAD line) */
 static void trace_dead(const struct anl_s *w, const char *reason, int sid, uint32_t sn,
                        uint32_t xmit, uint32_t enqueued, uint32_t last_sent);
-#define ANL_DEAD_TRACE trace_dead
+#define ANL_TRACE_dead trace_dead
+#include "anl_trace.h"
 #include "../anliu.c"
-#undef ANL_DEAD_TRACE
 static void trace_dead(const struct anl_s *w, const char *reason, int sid, uint32_t sn,
                        uint32_t xmit, uint32_t enqueued, uint32_t last_sent)
 {

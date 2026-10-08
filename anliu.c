@@ -16,6 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* internal trace points for the bench tools (bench/anl_trace.h lists them):
+   a tool that includes this file defines ANL_TRACE first; off, nothing */
+#ifndef ANL_TRACE
+#define ANL_TRACE(kind, ...) ((void)0)
+#endif
+
 /*=====================================================================
  * 1. utilities
  *====================================================================*/
@@ -944,11 +950,24 @@ static anl_stream *sget(const anl_t *w, int sid)
     return NULL;
 }
 
+/* slist is in scheduling order: the default stream (strict), then by
+ * priority, streams of one priority in the order they were opened - one
+ * pass over it is a flush's priority order (DESIGN 6.4) */
+static int slist_key(const anl_stream *st) { return st->strict ? -1 : st->prio; }
+
+static void slist_place(anl_t *w, anl_stream *st)
+{
+    anl_node *pos;
+    if (st->lnode.next) qdel(&st->lnode);
+    for (pos = w->slist.next; pos != &w->slist && slist_key(STREAM_OF(pos)) <= slist_key(st); pos = pos->next) ;
+    qadd_after(&st->lnode, pos->prev);
+}
+
 static int sput(anl_t *w, anl_stream *st)
 {
     if (w->nstab == ANL_MAX_STREAMS) return ANL_EBUSY;
     w->stab[w->nstab++] = st;
-    qadd_tail(&st->lnode, &w->slist);
+    slist_place(w, st);
     return 0;
 }
 
@@ -1113,11 +1132,8 @@ static uint32_t canon_build(uint8_t *out, uint32_t frg, uint8_t flags, uint16_t 
 static void mark_dead(anl_t *w, const char *reason, int sid, uint32_t sn,
                       uint32_t xmit, uint32_t enqueued, uint32_t last_sent)
 {
-#ifdef ANL_DEAD_TRACE
-    if (w->state >= 0) ANL_DEAD_TRACE(w, reason, sid, sn, xmit, enqueued, last_sent);
-#else
+    if (w->state >= 0) ANL_TRACE(dead, w, reason, sid, sn, xmit, enqueued, last_sent);
     (void)reason; (void)sid; (void)sn; (void)xmit; (void)enqueued; (void)last_sent;
-#endif
     w->state = -1;
 }
 
@@ -1229,9 +1245,7 @@ static void dg_output(anl_t *w, int force_pad)
     /* the last segment runs to the end: it loses its length field (SEG_L, DESIGN 5) */
     if (w->dg_len_n) {
         uint32_t at = w->dg_len_at, n = w->dg_len_n;
-#ifdef ANL_SEG_TRIM_TRACE
-        ANL_SEG_TRIM_TRACE(w, n);
-#endif
+        ANL_TRACE(seg_trim, w, n);
         memmove(w->buf + at, w->buf + at + n, w->ptr - at - n);
         w->ptr -= n;
         w->buf[w->dg_last_b0] = (char)((uint8_t)w->buf[w->dg_last_b0] | SEG_L);
@@ -1264,9 +1278,7 @@ static void dg_output(anl_t *w, int force_pad)
     w->output(w->buf, (int)w->ptr, w, w->user);
     w->tx_dg++;
     w->last_tx = w->current;
-#ifdef ANL_TX_OUTPUT_TRACE
-    ANL_TX_OUTPUT_TRACE(w, w->ptr, w->dg_has_data);
-#endif
+    ANL_TRACE(tx_output, w, w->ptr, w->dg_has_data);
     /* paced at a start_rate hint, the hint is the path's rate: the IP/UDP
        header counts too - at 240 kB/s over 2 Mbit/s, datagrams without the
        padding they used to carry overran the bottleneck (test_start_rate:
@@ -1293,9 +1305,7 @@ static void dg_commit(anl_t *w, uint32_t size, int is_data)
     w->dg_len_n = 0;                    /* the last segment so far has no length to drop */
     w->ptr += size;
     if (is_data) w->dg_has_data = 1;
-#ifdef ANL_SEG_COMMIT_TRACE
-    ANL_SEG_COMMIT_TRACE(w, size, is_data);
-#endif
+    ANL_TRACE(seg_commit, w, size, is_data);
 }
 
 /* DATA segment; carries the stream parameters until the peer has been heard (DESIGN 5.2) */
@@ -1320,9 +1330,7 @@ static void write_data_seg(anl_t *w, const anl_stream *st, const anl_seg *seg)
         dg_commit(w, size, 1);
         w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(seg->len);
     }
-#ifdef ANL_DATA_SEG_TRACE
-    ANL_DATA_SEG_TRACE(w, st, size, seg->xmit == 0);
-#endif
+    ANL_TRACE(data_seg, w, st, seg, size, seg->xmit == 0);
 }
 
 static void write_fwd_seg(anl_t *w, const anl_stream *st, uint32_t new_una)
@@ -1351,9 +1359,7 @@ static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *bo
         dg_commit(w, size, subtype == CTRL_PARITY);
         w->dg_last_b0 = b0; w->dg_len_at = at; w->dg_len_n = (uint32_t)varint_size(blen);
     }
-#ifdef ANL_PARITY_SEG_TRACE
-    if (subtype == CTRL_PARITY) ANL_PARITY_SEG_TRACE(w, sid, size);
-#endif
+    if (subtype == CTRL_PARITY) ANL_TRACE(parity_seg, w, sid, size);
 }
 
 static void write_report_seg(anl_t *w, anl_stream *st)
@@ -1617,10 +1623,7 @@ static void pace_refill(anl_t *w)
         int64_t step = (int64_t)w->pace_rate * (int64_t)umin32((uint32_t)dt, w->interval) / 1000;
         int64_t cap = w->pace_blocked && step > (int64_t)w->pace_burst ? step : (int64_t)w->pace_burst;
         w->pace_tokens += earned;
-#ifdef ANL_PACE_REFILL_TRACE
-        ANL_PACE_REFILL_TRACE(w, (uint32_t)dt, (uint64_t)earned,
-                              w->pace_tokens > cap ? (uint64_t)(w->pace_tokens - cap) : 0);
-#endif
+        ANL_TRACE(pace_refill, w, (uint32_t)dt, (uint64_t)earned, w->pace_tokens > cap ? (uint64_t)(w->pace_tokens - cap) : 0);
         if (w->pace_tokens > cap) w->pace_tokens = cap;
     }
     w->pace_last = w->current;
@@ -2361,10 +2364,7 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
         return;
     }
     ack_schedule(st);
-#ifdef ANL_DUP_TRACE
-    if (!recovered && (tdiff(sn, st->rcv_nxt) < 0 || ((r = run_find(st, sn)) && tdiff(sn, r->end) < 0)))
-        ANL_DUP_TRACE(w, st, sn);
-#endif
+    ANL_TRACE(dup, w, st, sn, recovered);
     if (tdiff(sn, st->rcv_nxt) < 0) return;
     if (!recovered && tdiff(sn, st->rcv_nxt) > 0) w->rx_hole_ts = w->current | 1;  /* behind a hole: loss (or reordering) */
 
@@ -2618,9 +2618,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     uint32_t dur, rate, loss, counted;
     if (w->lt_ts == 0) {
         w->lt_ts = w->current | 1; w->lt_sent0 = w->sent_wire; w->lt_infl0 = bbr_inflight_bytes(w);
-#ifdef ANL_POLICER_BEGIN_TRACE
-        ANL_POLICER_BEGIN_TRACE(w);
-#endif
+        ANL_TRACE(policer_begin, w);
     }
     /* Just after STARTUP a round over 25% lost, delivering less than half
        the estimate, clears what the filter kept
@@ -2662,9 +2660,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         w->lt_ts = w->current | 1;
         w->lt_sent0 = w->sent_wire;
         w->lt_infl0 = bbr_inflight_bytes(w);
-#ifdef ANL_POLICER_BEGIN_TRACE
-        ANL_POLICER_BEGIN_TRACE(w);
-#endif
+        ANL_TRACE(policer_begin, w);
         return;
     }
     w->lt_rd += rd;
@@ -2706,11 +2702,9 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         sent = sent > infl ? sent - infl : 0;
         loss = sent > w->lt_rd ? (uint32_t)((sent - w->lt_rd) * 1000 / sent) : 0;
     }
-#ifdef ANL_POLICER_TRACE
-    /* Optional internal diagnostics: observe the completed interval before
-       the decision, and afterwards while its counters are still intact. */
-    ANL_POLICER_TRACE(w, dur, rate, loss, counted, 0);
-#endif
+    /* the completed interval before the decision, and (below) after it while
+       its counters are still intact */
+    ANL_TRACE(policer, w, dur, rate, loss, counted, 0);
     if (w->lt_state != 3) w->lt_queue = 0;
     if (w->lt_state != 2) w->lt_res_low = 0;
     if (w->lt_state == 1 && w->lt_from == 3) {
@@ -2943,18 +2937,14 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     } else {
         w->lt_prev_rate = 0;
     }
-#ifdef ANL_POLICER_TRACE
-    ANL_POLICER_TRACE(w, dur, rate, loss, counted, 1);
-#endif
+    ANL_TRACE(policer, w, dur, rate, loss, counted, 1);
     w->lt_rd = w->lt_lost = 0;
     w->lt_rounds = 0;
     w->lt_bad = 0;
     w->lt_ts = w->current | 1;
     w->lt_sent0 = w->sent_wire;
     w->lt_infl0 = bbr_inflight_bytes(w);
-#ifdef ANL_POLICER_BEGIN_TRACE
-    ANL_POLICER_BEGIN_TRACE(w);
-#endif
+    ANL_TRACE(policer_begin, w);
 }
 
 /* The RTT the model works with: min_rtt, but not below the update interval.
@@ -3792,6 +3782,7 @@ static anl_stream *accept_stream(anl_t *w, int sid, const open_info *oi)
         opt.tag = oi->tag;
         opt.rcv_wnd = (int)st->rcv_wnd;
         if (stream_opt_check(&opt) != 0 || stream_apply_local(w, st, &opt) != 0) goto refuse;
+        slist_place(w, st);                     /* the callback may have set the priority */
     }
     return st;
 refuse:
@@ -4483,9 +4474,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     st->fec_out_small = k * lmax <= FEC_SMALL_BLOCK;
     fec_budget_refill(w);
     w->par_tokens -= (int64_t)m * (lmax + PARITY_HDR + SEG_WIRE_OVH);
-#ifdef ANL_FEC_BLOCK_TRACE
-    ANL_FEC_BLOCK_TRACE(w, st, k, m);
-#endif
+    ANL_TRACE(fec_block, w, st, k, m, lmax, key);
     /* the members still unacknowledged are covered from now on: RACK
        (rack_sent) counts from the last parity, a repair may need it -
        otherwise it resends what the peer is rebuilding (not the RTO: when
@@ -4546,9 +4535,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
  * audio alone takes seconds to see a few losses. */
 static void fec_loss_add(anl_t *w, uint32_t sent, uint32_t lost, int hard)
 {
-#ifdef ANL_FEC_LOSS_TRACE
-    ANL_FEC_LOSS_TRACE(w, sent, lost);
-#endif
+    ANL_TRACE(fec_loss, w, sent, lost);
     w->fl_sent += sent;
     w->fl_lost += lost;
     if (lost && hard) w->fec_loss_ts = w->current | 1;
@@ -4601,9 +4588,7 @@ static uint32_t fec_parities_for(uint32_t k, uint32_t p, uint32_t fail)
 static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
 {
     uint32_t srtt = srtt_or_def(w);
-#ifdef ANL_FEC_COUNT_TRACE
-    ANL_FEC_COUNT_TRACE(w, st, lost);
-#endif
+    ANL_TRACE(fec_count, w, st, lost);
     if (st->fec && lost == FEC_SENT) fec_loss_add(w, 1, 0, 0); /* losses: RACK marks, RTO ACKs */
     if (!st->fec_auto || !fec_active(st) || lost == FEC_LOST) return; /* the loss estimate only */
     if (lost == FEC_SENT) {
@@ -5388,9 +5373,7 @@ static void rate_update(anl_t *w)
             w->cs_retry = 0;
             if (w->capacity_short) w->cs_ts = w->current | 1;
         }
-#ifdef ANL_CAPACITY_TRACE
-        ANL_CAPACITY_TRACE(w, enter, leave);
-#endif
+        ANL_TRACE(capacity, w, enter, leave);
     }
     /* parity budget (DESIGN 8.6): 90% of the estimate less all else sent,
        smoothed over about 8 steps (1.6 s): a key frame fills a 200 ms
@@ -5501,16 +5484,10 @@ static void fec_deadline_follow(const anl_t *w, anl_stream *st)
     st->fec_deadline = d;
 }
 
-/* a stream the flush's passes by priority have anything to do for */
+/* a stream the flush's passes in priority order have anything to do for */
 static int flush_busy(const anl_stream *st)
 {
     return st->nsnd_que || st->nsnd_buf || (st->fec && (st->fec_n > 0 || st->fec_out_i < st->fec_out_m));
-}
-
-/* the pass for priority prio (-1: the default stream's strict priority) visits st */
-static int prio_pass(const anl_stream *st, int prio)
-{
-    return flush_busy(st) && (prio < 0 ? st->strict : !st->strict && st->prio == prio);
 }
 
 static void anl_flush_internal(anl_t *w)
@@ -5519,7 +5496,7 @@ static void anl_flush_internal(anl_t *w)
     uint32_t inflight = 0;
     int lost = 0;
     int64_t retrans_limit, retrans_spent = 0;
-    int rtx_capped = 0, prio, new_data = 0, queued;
+    int rtx_capped = 0, new_data = 0, queued;
     anl_node *n, *nx;
     anl_stream *st;
 
@@ -5560,13 +5537,13 @@ static void anl_flush_internal(anl_t *w)
     FOR_EACH_STREAM(w, st, n, nx) {
         if (stream_sendable(st)) (void)rack_detect(w, st);           /* RACK timer */
     }
-    for (prio = -1; prio < ANL_MAX_PRIO && !w->pace_blocked && !rtx_capped; prio++) {
-        FOR_EACH_STREAM(w, st, n, nx) {
+    FOR_EACH_STREAM(w, st, n, nx) {
+        {
             anl_node *pos;
             uint32_t next_rto = current + RTO_MAX, want, found = 0;
             int rto_due;
             if (w->pace_blocked || rtx_capped) break;
-            if (!prio_pass(st, prio) || !stream_sendable(st)) continue;
+            if (!flush_busy(st) || !stream_sendable(st)) continue;
             /* The walk costs the window (DESIGN 5.1): only while something is
                lost or an RTO may be due (every segment in snd_buf has been sent
                - move_and_send - so there is no first transmission), and with no
@@ -5622,9 +5599,7 @@ static void anl_flush_internal(anl_t *w)
                     if (st->mode == ANL_RELIABLE && seg->xmit > 1) seg->rto = umin32(seg->rto + seg->rto / 2, RTO_MAX);
                     seg->resendts = current + seg->rto;
                 }
-#ifdef ANL_RTX_TRACE
-                ANL_RTX_TRACE(w, st, seg, why);
-#endif
+                ANL_TRACE(rtx, w, st, seg, why);
                 seg->rack_rtx = (uint8_t)(why == 3 ? 1 : 2);
                 if (seg->lost) st->nlost--;
                 seg->lost = 0;
@@ -5686,10 +5661,10 @@ static void anl_flush_internal(anl_t *w)
             FOR_EACH_STREAM(w, st, n, nx)
                 if (!st->strict) st->sched_left = prio_weight[st->prio];
         }
-        for (prio = 0; prio < ANL_MAX_PRIO && !w->pace_blocked && w->flush_budget > 0; prio++) {
-            FOR_EACH_STREAM(w, st, n, nx) {
+        FOR_EACH_STREAM(w, st, n, nx) {
+            {
                 if (w->pace_blocked || w->flush_budget <= 0) break;
-                if (!prio_pass(st, prio) || !stream_sendable(st) || !st->sched_left) continue;
+                if (st->strict || !flush_busy(st) || !stream_sendable(st) || !st->sched_left) continue;
                 if (st->fec) fec_pump(w, st, 0);
                 while (st->sched_left > 0 && !w->pace_blocked && w->flush_budget > 0 && st->nsnd_que > 0 && wnd_open(st)) {
                     if (!pace_can_send(w)) { w->pace_blocked = 1; break; }
@@ -5726,21 +5701,17 @@ static void anl_flush_internal(anl_t *w)
 
     /* 5: FEC: blocks that collected fec_blk_ms, parities still due (streams
        without new data), in priority order; stale parities */
-    for (prio = -1; prio < ANL_MAX_PRIO; prio++) {
-        FOR_EACH_STREAM(w, st, n, nx) {
-            if (!st->fec || !prio_pass(st, prio)) continue;
-            if (st->fec_n > 0 && tdiff(current, st->fec_first_ts) >= (int32_t)st->fec_blk_ms) fec_close_block(w, st);
-            if (!w->pace_blocked) fec_pump(w, st, 0);
-        }
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (!st->fec || !flush_busy(st)) continue;
+        if (st->fec_n > 0 && tdiff(current, st->fec_first_ts) >= (int32_t)st->fec_blk_ms) fec_close_block(w, st);
+        if (!w->pace_blocked) fec_pump(w, st, 0);
     }
     FOR_EACH_STREAM(w, st, n, nx) {
         if (st->fec) fec_pcache_expire(w, st);
     }
 
     dg_seal(w);
-#ifdef ANL_FLUSH_TRACE
-    ANL_FLUSH_TRACE(w, (int64_t)w->cwnd - (int64_t)inflight, retrans_spent, rtx_capped);
-#endif
+    ANL_TRACE(flush, w, (int64_t)w->cwnd - (int64_t)inflight, retrans_spent, rtx_capped);
 
     /* BBR: an RTO means the model may be stale - the bandwidth dropped: keep
        inflight where it is for a round (packet conservation) instead of
@@ -5870,7 +5841,7 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
         o.rcv_wnd = cfg->default_rcv_wnd > 0 ? cfg->default_rcv_wnd : 4096;
         w->dflt = stream_create(w, ANL_SID_DEFAULT, &o);
         if (w->dflt == NULL) { anl_release(w); return NULL; }
-        w->dflt->strict = 1;
+        w->dflt->strict = 1;                    /* first in slist already: nothing else is there */
     }
     return w;
 }

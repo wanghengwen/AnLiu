@@ -4,16 +4,17 @@
 #include "../anliu.h"
 static void trace_seg_commit(const anl_t *, uint32_t, int);
 static void trace_seg_trim(const anl_t *, uint32_t);
-static void trace_data_seg(const anl_t *, const anl_stream_t *, uint32_t, int);
+static void trace_data_seg(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void trace_parity_seg(const anl_t *, int, uint32_t);
-static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t);
+static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
 static void trace_diag_output(const anl_t *, uint32_t, int);
-#define ANL_SEG_COMMIT_TRACE trace_seg_commit
-#define ANL_SEG_TRIM_TRACE trace_seg_trim
-#define ANL_DATA_SEG_TRACE trace_data_seg
-#define ANL_PARITY_SEG_TRACE trace_parity_seg
-#define ANL_FEC_BLOCK_TRACE trace_fec_block
-#define ANL_TX_OUTPUT_TRACE trace_diag_output
+#define ANL_TRACE_seg_commit trace_seg_commit
+#define ANL_TRACE_seg_trim trace_seg_trim
+#define ANL_TRACE_data_seg trace_data_seg
+#define ANL_TRACE_parity_seg trace_parity_seg
+#define ANL_TRACE_fec_block trace_fec_block
+#define ANL_TRACE_tx_output trace_diag_output
+#include "anl_trace.h"
 #define main original_test_main
 #include "../test.c"
 #undef main

@@ -63,34 +63,24 @@ static void trace_tx_output(const anl_t *, uint32_t, int);
 static void trace_media_tx_output(const anl_t *, uint32_t, int);
 static void trace_seg_commit(const anl_t *, uint32_t, int);
 static void trace_seg_trim(const anl_t *, uint32_t);
-static void trace_data_seg(const anl_t *, const anl_stream_t *, uint32_t, int);
+static void trace_data_seg(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void trace_parity_seg(const anl_t *, int, uint32_t);
-static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t);
+static void trace_fec_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
 static void trace_flush(const anl_t *, int64_t, int64_t, int);
 static void trace_lt_begin(const anl_t *);
-#define ANL_PACE_REFILL_TRACE trace_pace_refill
-#define ANL_TX_OUTPUT_TRACE trace_media_tx_output
-#define ANL_SEG_COMMIT_TRACE trace_seg_commit
-#define ANL_SEG_TRIM_TRACE trace_seg_trim
-#define ANL_DATA_SEG_TRACE trace_data_seg
-#define ANL_PARITY_SEG_TRACE trace_parity_seg
-#define ANL_FEC_BLOCK_TRACE trace_fec_block
-#define ANL_FLUSH_TRACE trace_flush
-#define ANL_POLICER_BEGIN_TRACE trace_lt_begin
-#define ANL_POLICER_TRACE trace_lt_interval
-#define ANL_DEAD_TRACE trace_dead
+#define ANL_TRACE_pace_refill trace_pace_refill
+#define ANL_TRACE_tx_output trace_media_tx_output
+#define ANL_TRACE_seg_commit trace_seg_commit
+#define ANL_TRACE_seg_trim trace_seg_trim
+#define ANL_TRACE_data_seg trace_data_seg
+#define ANL_TRACE_parity_seg trace_parity_seg
+#define ANL_TRACE_fec_block trace_fec_block
+#define ANL_TRACE_flush trace_flush
+#define ANL_TRACE_policer_begin trace_lt_begin
+#define ANL_TRACE_policer trace_lt_interval
+#define ANL_TRACE_dead trace_dead
+#include "anl_trace.h"
 #include "../anliu.c"       /* build without ../anliu.c: REALNET_TRACE shows BBR internals */
-#undef ANL_POLICER_TRACE
-#undef ANL_DEAD_TRACE
-#undef ANL_PACE_REFILL_TRACE
-#undef ANL_TX_OUTPUT_TRACE
-#undef ANL_SEG_COMMIT_TRACE
-#undef ANL_SEG_TRIM_TRACE
-#undef ANL_DATA_SEG_TRACE
-#undef ANL_PARITY_SEG_TRACE
-#undef ANL_FEC_BLOCK_TRACE
-#undef ANL_FLUSH_TRACE
-#undef ANL_POLICER_BEGIN_TRACE
 #include "tx_diag.h"
 #include "fec_diag.h"
 static void trace_media_tx_output(const anl_t *w, uint32_t bytes, int paced)

@@ -34,17 +34,18 @@ static void loss_parity(const anl_t *, int, uint32_t);
 static void loss_commit(const anl_t *, uint32_t, int);
 static void loss_trim(const anl_t *, uint32_t);
 static void loss_block(const anl_t *, const anl_stream_t *, uint32_t, uint32_t, uint32_t, int);
-#define ANL_DATA_SEG_TRACE(w, st, bytes, first) loss_data(w, st, seg, bytes, first)
-#define ANL_PARITY_SEG_TRACE loss_parity
-#define ANL_SEG_COMMIT_TRACE loss_commit
-#define ANL_SEG_TRIM_TRACE loss_trim
-#define ANL_FEC_BLOCK_TRACE(w, st, k, m) loss_block(w, st, k, m, lmax, key)
+#define ANL_TRACE_data_seg loss_data
+#define ANL_TRACE_parity_seg loss_parity
+#define ANL_TRACE_seg_commit loss_commit
+#define ANL_TRACE_seg_trim loss_trim
+#define ANL_TRACE_fec_block loss_block
 static void loss_rtx(const anl_t *, const anl_stream_t *, const void *, int);
-static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t);
-#define ANL_RTX_TRACE(w, st, seg, why) loss_rtx(w, st, seg, why)
-#define ANL_DUP_TRACE(w, st, sn) loss_dup(w, st, sn)
+static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t, int);
+#define ANL_TRACE_rtx loss_rtx
+#define ANL_TRACE_dup loss_dup
 static unsigned fec_counts[2][4];
-#define ANL_FEC_COUNT_TRACE(w, st, lost) do { if ((st)->tag <= 1 && (lost) >= 0 && (lost) < 4) fec_counts[(st)->tag][lost]++; } while (0)
+#define ANL_TRACE_fec_count(w, st, lost) do { if ((st)->tag <= 1 && (lost) >= 0 && (lost) < 4) fec_counts[(st)->tag][lost]++; } while (0)
+#include "anl_trace.h"
 #include "../anliu.c"
 #include "gcc_model.h"
 static gcc_t g_gcc;
@@ -121,9 +122,12 @@ static void loss_rtx(const anl_t *w, const anl_stream_t *st, const void *p, int 
     if (getenv("MEDIA_LOSS_RTX")) printf("RTXEV ms=%u id=%d why=%d sn=%u xmit=%u sent=%u age=%d rto=%u srtt=%d var=%d fec_ts=%u resend=%u\n", w->current, id, why, seg->sn, seg->xmit, seg->ts_sent, (int)(w->current-seg->ts_sent), seg->rto, w->rx_srtt, w->rx_rttval, seg->fec_ts, seg->resendts);
     if (seg->fec_ts) rtx_cov[id][why]++;
 }
-static void loss_dup(const anl_t *w, const anl_stream_t *st, uint32_t sn)
+/* a DATA segment the receiver had already (below rcv_nxt or inside a run) */
+static void loss_dup(const anl_t *w, const anl_stream_t *st, uint32_t sn, int recovered)
 {
     int id = st->tag;
+    const rcv_run *r;
+    if (recovered || !(tdiff(sn, st->rcv_nxt) < 0 || ((r = run_find(st, sn)) && tdiff(sn, r->end) < 0))) return;
     if (w == owner || id < 0 || id > 1) return;
     dup_rx[id]++;
     dup_why[id][last_why[id][sn & 65535] & 3]++;

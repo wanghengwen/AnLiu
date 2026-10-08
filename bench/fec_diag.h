@@ -35,9 +35,10 @@ static void trace_seg_commit(const anl_t *w, uint32_t bytes, int data)
     }
 }
 
-static void trace_data_seg(const anl_t *w, const anl_stream_t *st, uint32_t bytes, int first)
+static void trace_data_seg(const anl_t *w, const anl_stream_t *st, const void *seg, uint32_t bytes, int first)
 {
     fec_diag_bytes *p;
+    (void)seg;
     if (!fec_diag_active(w)) return;
     p = &g_fec_diag.pending[fec_diag_tag(st)];
     if (first) p->first += bytes; else p->retry += bytes;
@@ -62,9 +63,10 @@ static void trace_seg_trim(const anl_t *w, uint32_t bytes)
     else *d->last_segment -= bytes;
 }
 
-static void trace_fec_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint32_t m)
+static void trace_fec_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint32_t m, uint32_t lmax, int key)
 {
     unsigned tag;
+    (void)lmax; (void)key;
     if (!fec_diag_active(w)) return;
     tag = fec_diag_tag(st);
     g_fec_diag.blocks[tag]++;
