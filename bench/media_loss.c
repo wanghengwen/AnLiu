@@ -292,7 +292,7 @@ int main(int argc, char **argv)
                 w->cs_test_ts,w->cs_recover,s.e[0].h[0]->nsnd_que,s.e[0].h[1]->nsnd_que,
                 s.e[0].h[0]->nsnd_buf,s.e[0].h[1]->nsnd_buf);
             printf("POLICER ms=%llu state=%d rate=%u from=%u hold=%u rounds=%u k=%u\n",
-                (unsigned long long)s.t,w->lt_state,w->lt_rate,w->lt_from,w->lt_hold,w->lt_rounds,w->lt_k);
+                (unsigned long long)s.t,w->lt.state,w->lt.rate,w->lt.from,w->lt.hold,w->lt.rounds,w->lt.k);
             {
                 const anl_stream *a = s.e[0].h[0], *b = s.e[1].h[0];
                 printf("AUDIOSTATE ms=%llu remote_wnd=%u fwd_pending=%d fwd_ts=%u fwd_rto=%u peer_open=%d recv_nxt=%u recv_buf=%u recv_queue=%u block_since=%u gate=%d\n",

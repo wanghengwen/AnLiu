@@ -107,7 +107,7 @@ what is still lost at the policer's rate is random loss: send that much more, or
 
 `anliu.c`: bbr_policer
 
-Paced lt_rate * (4 + k) / 4, a share k / (4 + k) of what is sent is above the rate. A ceiling drops it: the loss rises by that much over the residual (lt_res). Random loss does not depend on the pace: at 20% it read "an eighth more sent than delivered" and locked a 20 Mbps path at 0.8 (s1 20%/50 ms) - it is the rise that tells. Half the share: a jittery ceiling drops less.
+Paced lt.rate * (4 + k) / 4, a share k / (4 + k) of what is sent is above the rate. A ceiling drops it: the loss rises by that much over the residual (lt.res). Random loss does not depend on the pace: at 20% it read "an eighth more sent than delivered" and locked a 20 Mbps path at 0.8 (s1 20%/50 ms) - it is the rise that tells. Half the share: a jittery ceiling drops less.
 
 ## 18. the probe's tail interval
 

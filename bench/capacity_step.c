@@ -68,8 +68,8 @@ int main(int argc, char **argv)
             }
             printf("FAIL dead t=%llu sender=%d receiver=%d lt=%d rate=%u pace=%u hold=%u"
                    " max_xmit=%u sn=%u last_rtx=%u\n", (unsigned long long)s.t,
-                   w->state, s.e[1].anl->state, w->lt_state, w->lt_rate, w->pace_rate,
-                   w->lt_hold, most ? most->xmit : 0, most ? most->sn : 0,
+                   w->state, s.e[1].anl->state, w->lt.state, w->lt.rate, w->pace_rate,
+                   w->lt.hold, most ? most->xmit : 0, most ? most->sn : 0,
                    most ? (unsigned)most->rack_rtx : 0);
             sim_finish(&s, &result, s.t / 1000.0);
             return 1;
@@ -82,7 +82,7 @@ int main(int argc, char **argv)
                 (unsigned long long)s.t, rates[cur],
                 (f.rcv_bytes - last_bytes) * 8.0 / 5000000.0,
                 (s.d[0].bytes - last_wire) * 8.0 / 5000000.0,
-                w->retrans_total - last_rtx, w->lt_state, w->lt_k, w->lt_rate, stats.bw_estimate);
+                w->retrans_total - last_rtx, w->lt.state, w->lt.k, w->lt.rate, stats.bw_estimate);
             last_bytes = f.rcv_bytes; last_wire = s.d[0].bytes; last_rtx = w->retrans_total;
         }
     }

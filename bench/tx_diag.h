@@ -82,17 +82,17 @@ static void trace_flush(const anl_t *w, int64_t budget, int64_t retrans_bytes, i
 
 /* Cumulative counters at exact detector boundaries. Difference consecutive
  * lt_begin / lt_end records; a new begin without an end discards a transition.
- * lt_ts uses current|1 in the protocol, so prefer now for elapsed accounting. */
+ * lt.ts uses current|1 in the protocol, so prefer now for elapsed accounting. */
 static void tx_diag_print(const anl_t *w, const char *stage)
 {
     tx_diag *d = &g_tx_diag;
     if (!d->enabled || (d->owner && d->owner != w)) return;
     tx_diag_observe(d, w);
-    fprintf(stderr, "TXDIAG now=%u stage=%s lt_ts=%u lt=%d k=%u elapsed_ms=%llu"
+    fprintf(stderr, "TXDIAG now=%u stage=%s lt.ts=%u lt=%d k=%u elapsed_ms=%llu"
             " newq_empty_ms=%llu all_window_ms=%llu cwnd_ms=%llu pace_ms=%llu ready_ms=%llu"
             " earned=%llu clipped=%llu spent=%llu control=%llu tokens=%lld refill_ms=%llu refill_n=%llu"
             " flush_n=%llu rtx_cap_n=%llu retrans_seg_bytes=%llu budget_min=%lld budget_max=%lld\n",
-            w->current, stage, w->lt_ts, w->lt_state, w->lt_k,
+            w->current, stage, w->lt.ts, w->lt.state, w->lt.k,
             (unsigned long long)d->elapsed, (unsigned long long)d->empty_ms,
             (unsigned long long)d->window_ms, (unsigned long long)d->cwnd_ms,
             (unsigned long long)d->pace_ms, (unsigned long long)d->ready_ms,

@@ -2839,14 +2839,14 @@ static void test_fec_auto(void)
 static void policer_interval(anl_t *w, uint32_t dur, uint32_t sent,
                              uint32_t infl0, uint32_t infl1, uint64_t delivered, uint64_t lost)
 {
-    w->lt_ts = 1;
+    w->lt.ts = 1;
     w->current = dur + 1;
-    w->lt_rounds = BBR_LT_ROUNDS - 1;
-    w->lt_skip = w->lt_bad = 0;
-    w->lt_rd = w->lt_lost = 0;
-    w->lt_sent0 = w->sent_wire;
+    w->lt.rounds = BBR_LT_ROUNDS - 1;
+    w->lt.skip = w->lt.bad = 0;
+    w->lt.rd = w->lt.lost = 0;
+    w->lt.sent0 = w->sent_wire;
     w->sent_wire += sent;
-    w->lt_infl0 = infl0;
+    w->lt.infl0 = infl0;
     w->avg_seg = 1;
     w->inflight_segs = infl1;
     bbr_policer(w, delivered, lost, 0);
@@ -2859,65 +2859,65 @@ static void test_bbr_policer_probes(void)
     printf("[bbr: underfed tails, real capacity loss and exhausted probe bursts]\n");
     for (wrap = 0; wrap < 2; wrap++) {
         memset(&w, 0, sizeof(w));
-        w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_tail = 1;
-        w.lt_rate = 6006981; w.lt_res = 4; w.lt_span = 16;
+        w.lt.state = 3; w.lt.from = 2; w.lt.k = 1; w.lt.tail = 1;
+        w.lt.rate = 6006981; w.lt.res = 4; w.lt.span = 16;
         if (wrap) w.sent_wire = 0xfffffc17u;
         /* J1, tr16d_hz2zjg: only 4.46 MB/s sent at a 7.51 MB/s target,
            26 per mille lost; old code lowered the rate to 5256104. */
         policer_interval(&w, 678, 3021818, 770286, 1258346, 2466360, 62186);
-        CHECK(w.lt_state == 2 && w.lt_rate == 6006981, "underfed tail keeps the known rate (wrap=%d)", wrap);
-        CHECK(w.lt_left == 16 && w.lt_span == 16, "inconclusive tail does not extend the probe wait");
+        CHECK(w.lt.state == 2 && w.lt.rate == 6006981, "underfed tail keeps the known rate (wrap=%d)", wrap);
+        CHECK(w.lt.left == 16 && w.lt.span == 16, "inconclusive tail does not extend the probe wait");
     }
     /* Same offered load, but a severe real delivery loss must still reduce
        the estimate. A blanket send-rate guard would discard this evidence. */
-    w.lt_state = 3; w.lt_tail = 1;
+    w.lt.state = 3; w.lt.tail = 1;
     policer_interval(&w, 678, 3021818, 770286, 1258346, 800000, 2000000);
-    CHECK(w.lt_state == 2 && w.lt_rate < 6006981, "lossy capacity drop still lowers the rate");
+    CHECK(w.lt.state == 2 && w.lt.rate < 6006981, "lossy capacity drop still lowers the rate");
 
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 1; w.lt_k = 1; w.lt_tail = 1;
-    w.lt_rate = 6006981; w.lt_res = 4; w.lt_span = 16;
+    w.lt.state = 3; w.lt.from = 1; w.lt.k = 1; w.lt.tail = 1;
+    w.lt.rate = 6006981; w.lt.res = 4; w.lt.span = 16;
     policer_interval(&w, 678, 3021818, 770286, 1258346, 2466360, 62186);
-    CHECK(w.lt_state == 0, "underfed first confirmation does not establish a ceiling");
+    CHECK(w.lt.state == 0, "underfed first confirmation does not establish a ceiling");
 
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 3;
-    w.lt_rate = 5256104; w.lt_res = 4; w.lt_span = 32;
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 3;
+    w.lt.rate = 5256104; w.lt.res = 4; w.lt.span = 32;
     /* J4: k=3 still delivers the burst; at k=4 sending grows, delivery
        falls and loss rises to 192 per mille. Do not accelerate to k=5. */
     policer_interval(&w, 682, 6098444, 1550121, 1568158, 6080526, 0);
-    CHECK(w.lt_state == 3 && w.lt_k == 4 && !w.lt_tail, "delivery follows the probe before the bucket empties");
+    CHECK(w.lt.state == 3 && w.lt.k == 4 && !w.lt.tail, "delivery follows the probe before the bucket empties");
     policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
-    CHECK(w.lt_state == 3 && w.lt_k == 4 && w.lt_tail, "probe measures the ceiling before further acceleration");
+    CHECK(w.lt.state == 3 && w.lt.k == 4 && w.lt.tail, "probe measures the ceiling before further acceleration");
 
-    w.lt_state = 3; w.lt_k = 4; w.lt_tail = 0; w.lt_prev_rate = 8915727;
-    w.lt_res = 200;
+    w.lt.state = 3; w.lt.k = 4; w.lt.tail = 0; w.lt.prev_rate = 8915727;
+    w.lt.res = 200;
     policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
-    CHECK(w.lt_k == 5 && !w.lt_tail, "delivery dip with residual random loss alone is inconclusive");
-    w.lt_k = 4; w.lt_tail = 0; w.lt_prev_rate = 8915727; w.lt_res = 4;
+    CHECK(w.lt.k == 5 && !w.lt.tail, "delivery dip with residual random loss alone is inconclusive");
+    w.lt.k = 4; w.lt.tail = 0; w.lt.prev_rate = 8915727; w.lt.res = 4;
     policer_interval(&w, 682, 1800000, 0, 0, 1500000, 300000);
-    CHECK(w.lt_k == 5 && !w.lt_tail, "reduced offered load does not prove a new ceiling");
+    CHECK(w.lt.k == 5 && !w.lt.tail, "reduced offered load does not prove a new ceiling");
     w.min_rtt = 100; w.prev_round_min_rtt = 200;
     policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
-    CHECK(w.lt_state == 0 && w.lt_hold == 48, "long-RTT queued probe still yields immediately to congestion control");
+    CHECK(w.lt.state == 0 && w.lt.hold == 48, "long-RTT queued probe still yields immediately to congestion control");
 
     /* J8, ab17b_zjg2lsj_v16d: an underfed k=2 tail still loses 152 per
        mille. The low-loss guard must not widen with the nominal probe. */
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 2; w.lt_tail = 1;
-    w.lt_rate = 3537950; w.lt_res = 1; w.lt_span = 16;
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 2; w.lt.tail = 1;
+    w.lt.rate = 3537950; w.lt.res = 1; w.lt.span = 16;
     policer_interval(&w, 321, 623968, 0, 0, 529108, 84320);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3095701, "moderate loss must still allow a rate reduction at k=2");
+    CHECK(w.lt.state == 2 && w.lt.rate == 3095701, "moderate loss must still allow a rate reduction at k=2");
 
     /* J4, ab17_hz2zjg_v17: delivery falls 5.2% while loss rises to 149
        per mille. A 1/16 decline threshold continued accelerating here. */
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1;
-    w.lt_rate = 6225626; w.lt_res = 0; w.lt_span = 16;
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 1;
+    w.lt.rate = 6225626; w.lt.res = 0; w.lt.span = 16;
     policer_interval(&w, 745, 5717950, 1442960, 1434472, 5726382, 0);
-    CHECK(w.lt_k == 2 && !w.lt_tail, "probe still advances while delivery follows");
+    CHECK(w.lt.k == 2 && !w.lt.tail, "probe still advances while delivery follows");
     policer_interval(&w, 759, 6472614, 1629696, 1604232, 5528230, 837930);
-    CHECK(w.lt_state == 3 && w.lt_k == 2 && w.lt_tail, "5.2 percent fall with rising loss stops further acceleration");
+    CHECK(w.lt.state == 3 && w.lt.k == 2 && w.lt.tail, "5.2 percent fall with rising loss stops further acceleration");
 }
 
 /* J8: a recovering ceiling can flatten gradually rather than falling by
@@ -2937,59 +2937,59 @@ static void test_bbr_policer_plateau(void)
     for (wrap = 0; wrap < 2; wrap++) for (run = 0; run < 2; run++) {
         const uint32_t (*a)[6] = raw[run];
         memset(&w, 0, sizeof(w));
-        w.lt_state = 3; w.lt_from = 2; w.lt_k = 10; w.lt_span = 8;
-        w.lt_rate = run ? 948950 : 948600;
+        w.lt.state = 3; w.lt.from = 2; w.lt.k = 10; w.lt.span = 8;
+        w.lt.rate = run ? 948950 : 948600;
         if (wrap) w.sent_wire = 0xfffffc17u;
         policer_interval(&w, a[0][0], a[0][1], a[0][2], a[0][3], a[0][4], a[0][5]);
-        CHECK(w.lt_k == 11 && !w.lt_tail, "initial slight excess still permits the next step");
+        CHECK(w.lt.k == 11 && !w.lt.tail, "initial slight excess still permits the next step");
         policer_interval(&w, a[1][0], a[1][1], a[1][2], a[1][3], a[1][4], a[1][5]);
-        CHECK(w.lt_state == 3 && w.lt_k == 11 && w.lt_tail,
+        CHECK(w.lt.state == 3 && w.lt.k == 11 && w.lt.tail,
               "J8 raw run %d stops on flattened delivery (wrap=%d)", run + 1, wrap);
     }
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_rate = 948600; w.lt_span = 8;
-    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt_state == 3 && !w.lt_tail; k++) {
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 1; w.lt.rate = 948600; w.lt.span = 8;
+    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt.state == 3 && !w.lt.tail; k++) {
         uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
         uint32_t delivered = umin32(sent, 900000);  /* 3 MB/s, no bucket overshoot */
         policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
     }
-    CHECK(w.lt_state == 3 && w.lt_tail, "a flat ceiling is measured without a delivery dip");
-    if (w.lt_state == 3 && w.lt_tail) {
+    CHECK(w.lt.state == 3 && w.lt.tail, "a flat ceiling is measured without a delivery dip");
+    if (w.lt.state == 3 && w.lt.tail) {
         uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
         policer_interval(&w, 300, sent, 0, 0, 900000, sent - 900000);
-        CHECK(w.lt_state == 2 && w.lt_rate == 3000000, "tail confirms the newly available capacity");
+        CHECK(w.lt.state == 2 && w.lt.rate == 3000000, "tail confirms the newly available capacity");
     }
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 11; w.lt_rate = 948600;
-    w.lt_prev_rate = 2000000;
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 11; w.lt.rate = 948600;
+    w.lt.prev_rate = 2000000;
     /* Only 2.2 MB/s offered at a 3.56 MB/s target. About 10% loss and a
        near-flat delivery rate cannot establish the path's ceiling. */
     policer_interval(&w, 300, 660000, 0, 0, 594000, 66000);
-    CHECK(w.lt_k == 12 && !w.lt_tail, "an underfed plateau does not establish a ceiling");
+    CHECK(w.lt.k == 12 && !w.lt.tail, "an underfed plateau does not establish a ceiling");
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 11; w.lt_rate = 750000;
-    w.lt_prev_rate = 2300000;
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 11; w.lt.rate = 750000;
+    w.lt.prev_rate = 2300000;
     policer_interval(&w, 300, 840000, 0, 0, 726000, 114000);
-    CHECK(w.lt_k == 12 && !w.lt_tail, "delivery still grows with the offered probe");
+    CHECK(w.lt.k == 12 && !w.lt.tail, "delivery still grows with the offered probe");
     memset(&w, 0, sizeof(w));
-    w.lt_state = 3; w.lt_from = 2; w.lt_k = 1; w.lt_rate = 948600; w.lt_res = 200;
-    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt_state == 3; k++) {
+    w.lt.state = 3; w.lt.from = 2; w.lt.k = 1; w.lt.rate = 948600; w.lt.res = 200;
+    for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt.state == 3; k++) {
         uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
         uint32_t delivered = sent * 4 / 5;
         policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
-        CHECK(!w.lt_tail, "unchanged residual random loss does not set a ceiling (step %d)", k);
+        CHECK(!w.lt.tail, "unchanged residual random loss does not set a ceiling (step %d)", k);
     }
-    CHECK(w.lt_state == 0, "probe budget can still end without a measured ceiling");
+    CHECK(w.lt.state == 0, "probe budget can still end without a measured ceiling");
 }
 
 static void policer_confirmed(anl_t *w)
 {
     memset(w, 0, sizeof(*w));
-    w->lt_state = 2;
-    w->lt_rate = 3541495;
-    w->lt_res = 2;
-    w->lt_left = 32;
-    w->lt_span = 64;
+    w->lt.state = 2;
+    w->lt.rate = 3541495;
+    w->lt.res = 2;
+    w->lt.left = 32;
+    w->lt.span = 64;
 }
 
 static void test_bbr_policer_pacing(void)
@@ -3003,18 +3003,18 @@ static void test_bbr_policer_pacing(void)
         w.mss = 1368; w.interval = intervals[i]; w.rx_srtt = 1;
         w.pacing_gain = BBR_UNIT; w.btl_bw = 527000;
         /* J12 tcv_v5_f19: the old floor forced 547200 instead of 358360. */
-        w.lt_state = 1; w.lt_from = 2; w.lt_rate = 358360;
+        w.lt.state = 1; w.lt.from = 2; w.lt.rate = 358360;
         CHECK(compute_pace_rate(&w) == 358360, "execute the requested trial (interval=%u)", w.interval);
-        w.lt_state = 2;
+        w.lt.state = 2;
         CHECK(compute_pace_rate(&w) == 358360, "keep a confirmed low ceiling");
-        w.lt_state = 3; w.lt_k = 1;
+        w.lt.state = 3; w.lt.k = 1;
         CHECK(compute_pace_rate(&w) == 447950, "allow the explicit quarter-rate probe");
-        w.lt_k = 4;
+        w.lt.k = 4;
         CHECK(compute_pace_rate(&w) == 716720, "probe can discover recovered capacity");
         w.pace_rate_cfg = 100000;
         CHECK(compute_pace_rate(&w) == 100000, "configured rate cap still wins");
     }
-    w.pace_rate_cfg = 0; w.lt_state = 0; w.interval = 10;
+    w.pace_rate_cfg = 0; w.lt.state = 0; w.interval = 10;
     CHECK(compute_pace_rate(&w) == 547200, "ordinary BBR keeps its pacing floor");
 }
 
@@ -3026,59 +3026,59 @@ static void test_bbr_policer_capacity_change(void)
     policer_confirmed(&w);
     /* ab20: two stable low-rate intervals after the first mixed interval. */
     policer_interval(&w, 327, 459544, 0, 0, 363630, 95914);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "one low interval is inconclusive");
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495, "one low interval is inconclusive");
     policer_interval(&w, 329, 462706, 0, 0, 363630, 99076);
-    CHECK(w.lt_state == 1 && w.lt_from == 2 && w.lt_rate < 1200000,
+    CHECK(w.lt.state == 1 && w.lt.from == 2 && w.lt.rate < 1200000,
           "stable excess loss starts a lower-rate trial");
-    CHECK(w.lt_save_btl == 3541495 && w.lt_skip, "trial preserves the confirmed rate and excludes transition");
-    trial = w.lt_rate;
+    CHECK(w.lt.save_btl == 3541495 && w.lt.skip, "trial preserves the confirmed rate and excludes transition");
+    trial = w.lt.rate;
     policer_interval(&w, 400, 445600, 0, 0, 445600, 0);
-    CHECK(w.lt_state == 3 && w.lt_from == 2 && w.lt_rate == trial && w.lt_span == BBR_LT_SPAN,
+    CHECK(w.lt.state == 3 && w.lt.from == 2 && w.lt.rate == trial && w.lt.span == BBR_LT_SPAN,
           "loss falls at the executed trial rate: verify its ceiling");
-    CHECK(w.lt_recover_rate == 3541495, "remember the capacity that may return");
+    CHECK(w.lt.recover_rate == 3541495, "remember the capacity that may return");
     policer_interval(&w, 400, 556000, 0, 0, 444000, 112000);
-    CHECK(w.lt_tail, "excess probe loss starts tail measurement");
+    CHECK(w.lt.tail, "excess probe loss starts tail measurement");
     policer_interval(&w, 400, 556000, 0, 0, 444000, 112000);
-    CHECK(w.lt_state == 2 && w.lt_rate == 1110000 && w.lt_span == BBR_LT_SPAN,
+    CHECK(w.lt.state == 2 && w.lt.rate == 1110000 && w.lt.span == BBR_LT_SPAN,
           "confirmed lower ceiling bypasses the old ceiling's 7/8 floor and long backoff");
-    w.lt_state = 3; w.lt_k = 8; w.lt_tail = 1;
+    w.lt.state = 3; w.lt.k = 8; w.lt.tail = 1;
     policer_interval(&w, 400, 1332000, 0, 0, 1300000, 32000);
-    CHECK(w.lt_state == 2 && w.lt_recover_rate == 0 && w.lt_span == 2 * BBR_LT_SPAN,
+    CHECK(w.lt.state == 2 && w.lt.recover_rate == 0 && w.lt.span == 2 * BBR_LT_SPAN,
           "capacity recovered: resume ordinary probe backoff");
 
     policer_confirmed(&w);
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
-    CHECK(w.lt_state == 1, "new 30 percent random loss is suspicious but not yet a lower ceiling");
-    left = w.lt_left;
+    CHECK(w.lt.state == 1, "new 30 percent random loss is suspicious but not yet a lower ceiling");
+    left = w.lt.left;
     policer_interval(&w, 400, 992800, 0, 0, 694960, 297840);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495 && w.lt_recover_rate == 0,
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495 && w.lt.recover_rate == 0,
           "loss persists after slowing: restore the confirmed ceiling");
-    CHECK(w.lt_left == left && w.lt_hold == left && w.lt_span == 64,
+    CHECK(w.lt.left == left && w.lt.hold == left && w.lt.span == 64,
           "failed trial preserves the previous probe schedule");
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "cooldown prevents repeated trials of unchanged random loss");
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495, "cooldown prevents repeated trials of unchanged random loss");
 
     policer_confirmed(&w);
     policer_interval(&w, 327, 459544, 0, 0, 363630, 95914);
     policer_interval(&w, 329, 462706, 0, 0, 363630, 99076);
     policer_interval(&w, 400, 200000, 0, 0, 200000, 0);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495 && w.lt_recover_rate == 0,
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495 && w.lt.recover_rate == 0,
           "loss-free but underfed trial does not confirm a capacity fall");
 
     policer_confirmed(&w);
     policer_interval(&w, 400, 1400000, 0, 0, 900000, 500000);
     policer_interval(&w, 400, 650000, 0, 0, 440000, 210000);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "mixed transition and low interval do not form a stable pair");
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495, "mixed transition and low interval do not form a stable pair");
     policer_interval(&w, 400, 650000, 0, 0, 440000, 210000);
-    CHECK(w.lt_state == 1, "two subsequent low intervals can start a trial");
+    CHECK(w.lt.state == 1, "two subsequent low intervals can start a trial");
 
     policer_confirmed(&w);
-    w.lt_res = 300;
+    w.lt.res = 300;
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
     policer_interval(&w, 400, 1416000, 0, 0, 991200, 424800);
-    CHECK(w.lt_state == 2 && w.lt_rate == 3541495, "known residual loss is not evidence of a capacity fall");
+    CHECK(w.lt.state == 2 && w.lt.rate == 3541495, "known residual loss is not evidence of a capacity fall");
 }
 
 static void test_bbr_policer_residual_refresh(void)
@@ -3089,16 +3089,16 @@ static void test_bbr_policer_residual_refresh(void)
     printf("[bbr: remeasure stale residual below the ceiling, preserve real random loss]\n");
     for (wrap = 0; wrap < 2; wrap++) for (scenario = 0; scenario < 4; scenario++) {
         policer_confirmed(&w);
-        w.lt_rate = 1040000; w.lt_res = 84; w.lt_left = 1; w.lt_span = 8;
+        w.lt.rate = 1040000; w.lt.res = 84; w.lt.left = 1; w.lt.span = 8;
         if (wrap) w.sent_wire = 0xfffffc17u;
-        old_rate = w.lt_rate;
+        old_rate = w.lt.rate;
         corrected = old_rate * 916 / 1000;
         /* About 7% steady loss no longer exceeds residual+100, so the
            capacity-fall detector cannot repair the old 84-per-mille value. */
         policer_interval(&w, 300, 312000, 0, 0, 290160, 21840);
-        CHECK(w.lt_state == 1 && w.lt_from == 3 && w.lt_rate < corrected,
+        CHECK(w.lt.state == 1 && w.lt.from == 3 && w.lt.rate < corrected,
               "periodic probe measures below old delivery, scenario=%d wrap=%d", scenario, wrap);
-        trial_bytes = w.lt_rate * 3 / 10;
+        trial_bytes = w.lt.rate * 3 / 10;
         if (scenario == 1) {
             /* Real 8.4% random loss persists even below the ceiling. */
             policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes * 916 / 1000, trial_bytes * 84 / 1000);
@@ -3107,7 +3107,7 @@ static void test_bbr_policer_residual_refresh(void)
             policer_interval(&w, 300, trial_bytes / 2, 0, 0, trial_bytes / 2, 0);
         } else {
             policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes, 0);
-            CHECK(w.lt_state == 1 && w.lt_res == 84, "one quiet interval cannot erase the residual");
+            CHECK(w.lt.state == 1 && w.lt.res == 84, "one quiet interval cannot erase the residual");
             if (scenario == 3) {
                 /* A second interval contradicts the first: retain the old value. */
                 policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes * 9 / 10, trial_bytes / 10);
@@ -3115,25 +3115,25 @@ static void test_bbr_policer_residual_refresh(void)
                 policer_interval(&w, 300, trial_bytes, 0, 0, trial_bytes, 0);
             }
         }
-        CHECK(w.lt_state == 3 && w.lt_from == 2 && w.lt_k == 1 && w.lt_skip,
+        CHECK(w.lt.state == 3 && w.lt.from == 2 && w.lt.k == 1 && w.lt.skip,
               "recheck returns to a bounded capacity probe");
         if (scenario == 0) {
-            CHECK(w.lt_res == 0 && w.lt_rate == corrected, "remove stale compensation after two clean intervals");
+            CHECK(w.lt.res == 0 && w.lt.rate == corrected, "remove stale compensation after two clean intervals");
             policer_interval(&w, 300, 357240, 0, 0, 285000, 72240);
             policer_interval(&w, 300, 357240, 0, 0, 285000, 72240);
-            CHECK(w.lt_state == 2 && w.lt_rate == 950000, "probe reconfirms the actual ceiling");
-        } else CHECK(w.lt_res == 84 && w.lt_rate == old_rate, "inconclusive recheck preserves residual and ceiling");
-        if (scenario == 2) CHECK(!w.lt_res_checked, "underfed check remains eligible for a later retry");
+            CHECK(w.lt.state == 2 && w.lt.rate == 950000, "probe reconfirms the actual ceiling");
+        } else CHECK(w.lt.res == 84 && w.lt.rate == old_rate, "inconclusive recheck preserves residual and ceiling");
+        if (scenario == 2) CHECK(!w.lt.res_checked, "underfed check remains eligible for a later retry");
     }
     policer_confirmed(&w);
-    w.lt_rate = 1040000; w.lt_res = 84; w.lt_left = 1; w.lt_res_checked = 1;
+    w.lt.rate = 1040000; w.lt.res = 84; w.lt.left = 1; w.lt.res_checked = 1;
     policer_interval(&w, 300, 312000, 0, 0, 285792, 26208);
-    CHECK(w.lt_state == 3 && w.lt_from == 2, "already checked random loss does not delay every capacity probe");
-    w.lt_state = 2; w.lt_left = 2;
+    CHECK(w.lt.state == 3 && w.lt.from == 2, "already checked random loss does not delay every capacity probe");
+    w.lt.state = 2; w.lt.left = 2;
     policer_interval(&w, 300, 312000, 0, 0, 293280, 18720);
-    CHECK(w.lt_state == 2, "one newly lower-loss interval is inconclusive");
+    CHECK(w.lt.state == 2, "one newly lower-loss interval is inconclusive");
     policer_interval(&w, 300, 312000, 0, 0, 293280, 18720);
-    CHECK(w.lt_state == 1 && w.lt_from == 3, "persistent lower loss permits another residual check");
+    CHECK(w.lt.state == 1 && w.lt.from == 3, "persistent lower loss permits another residual check");
 }
 
 static void test_bbr_policer_queue_recheck(void)
@@ -3143,26 +3143,26 @@ static void test_bbr_policer_queue_recheck(void)
     printf("[bbr: transient queued interval must not erase an established policer]\n");
     for (initial = 0; initial < 2; initial++) {
         policer_confirmed(&w);
-        w.lt_state = 3; w.lt_from = initial ? 1 : 2;
-        w.lt_k = 1; w.lt_rate = 951805; w.lt_res = 3;
+        w.lt.state = 3; w.lt.from = initial ? 1 : 2;
+        w.lt.k = 1; w.lt.rate = 951805; w.lt.res = 3;
         w.min_rtt = 1; w.prev_round_min_rtt = 20;
         /* j8d pn r5: at k=1 a queue-tainted interval delivered all 344658
            bytes, but old code discarded the ceiling and waited 48 intervals. */
         policer_interval(&w, 301, 344658, 0, 0, 344658, 0);
         if (initial) {
-            CHECK(w.lt_state == 0, "initial detection still rejects a queued path");
+            CHECK(w.lt.state == 0, "initial detection still rejects a queued path");
             continue;
         }
-        CHECK(w.lt_state == 3 && w.lt_k == 1 && w.lt_rate == 951805 && !w.lt_hold,
+        CHECK(w.lt.state == 3 && w.lt.k == 1 && w.lt.rate == 951805 && !w.lt.hold,
               "repeat the same bounded step after a transient queue signal");
         w.prev_round_min_rtt = 1;
         policer_interval(&w, 301, 344658, 0, 0, 344658, 0);
-        CHECK(w.lt_state == 3 && w.lt_k == 2, "clean next interval resumes capacity discovery");
+        CHECK(w.lt.state == 3 && w.lt.k == 2, "clean next interval resumes capacity discovery");
         w.prev_round_min_rtt = 20;
         policer_interval(&w, 301, 420000, 0, 0, 344658, 75342);
-        CHECK(w.lt_state == 3 && w.lt_k == 2, "nonconsecutive queue events do not count as persistent");
+        CHECK(w.lt.state == 3 && w.lt.k == 2, "nonconsecutive queue events do not count as persistent");
         policer_interval(&w, 301, 420000, 0, 0, 344658, 75342);
-        CHECK(w.lt_state == 0 && w.lt_hold == 48, "consecutive queue evidence still releases the ceiling");
+        CHECK(w.lt.state == 0 && w.lt.hold == 48, "consecutive queue evidence still releases the ceiling");
     }
 }
 

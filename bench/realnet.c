@@ -326,7 +326,7 @@ static void trace_dead(const anl_t *w, const char *reason, int sid, uint32_t sn,
     fprintf(stderr, "DEAD now=%u reason=%s sid=%d sn=%u xmit=%u enqueued=%u last_sent=%u"
             " last_rx=%u srtt=%d rto=%d lt=%d rate=%u pace=%u hold=%u\n",
             w->current, reason, sid, sn, xmit, enqueued, last_sent, w->last_rx,
-            w->rx_srtt, w->rx_rto, w->lt_state, w->lt_rate, w->pace_rate, w->lt_hold);
+            w->rx_srtt, w->rx_rto, w->lt.state, w->lt.rate, w->pace_rate, w->lt.hold);
 }
 
 /* Completed intervals, including local measurements lost when the detector
@@ -334,7 +334,7 @@ static void trace_dead(const anl_t *w, const char *reason, int sid, uint32_t sn,
 static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
                               uint32_t loss, uint32_t counted, int after)
 {
-    uint32_t sent = w->sent_wire - w->lt_sent0;
+    uint32_t sent = w->sent_wire - w->lt.sent0;
     const anl_stream_t *bulk = g_h[3];
     if (!after) tx_diag_print(w, "lt_end");
     if (!is_sender() || !getenv("REALNET_TRACE")) return;
@@ -343,12 +343,12 @@ static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
             " rate=%u ref_loss=%u prev_rate=%u prev_loss=%u res=%u compensated=%u base=%u floor=%u probe=%u send_rate=%u pace=%u applied_pace=%u"
             " cwnd=%u infl=%u queued=%d sendable=%d rmt_wnd=%u snd_span=%u snd_queued=%u snd_buf=%u"
             " minrtt=%u qprobe=%u lag_ms=%d\n",
-            w->current, after ? "after" : "before", w->bbr_state, w->probe_phase, w->lt_state, w->lt_k, w->lt_from,
-            w->lt_tail, w->lt_bad, w->lt_hold, w->lt_left, w->lt_span, w->lt_rounds, dur,
-            sent, (unsigned long long)w->lt_infl0, (unsigned long long)bbr_inflight_bytes(w),
-            (unsigned long long)w->lt_rd, (unsigned long long)w->lt_lost, loss, counted,
-            rate, w->lt_ref_loss, w->lt_prev_rate, w->lt_prev_loss, w->lt_res,
-            sat32((uint64_t)rate * 1000 / (1000 - w->lt_res)), w->lt_rate, w->lt_rate / 8 * 7,
+            w->current, after ? "after" : "before", w->bbr_state, w->probe_phase, w->lt.state, w->lt.k, w->lt.from,
+            w->lt.tail, w->lt.bad, w->lt.hold, w->lt.left, w->lt.span, w->lt.rounds, dur,
+            sent, (unsigned long long)w->lt.infl0, (unsigned long long)bbr_inflight_bytes(w),
+            (unsigned long long)w->lt.rd, (unsigned long long)w->lt.lost, loss, counted,
+            rate, w->lt.ref_loss, w->lt.prev_rate, w->lt.prev_loss, w->lt.res,
+            sat32((uint64_t)rate * 1000 / (1000 - w->lt.res)), w->lt.rate, w->lt.rate / 8 * 7,
             bbr_lt_probe_rate(w), sat32((uint64_t)sent * 1000 / dur), compute_pace_rate(w), w->pace_rate,
             w->cwnd, w->inflight_segs, has_queued_data(w), has_new_data(w), bulk ? bulk->rmt_wnd : 0,
             bulk ? bulk->snd_nxt - bulk->snd_una : 0, bulk ? bulk->nsnd_que : 0, bulk ? bulk->nsnd_buf : 0,
@@ -1306,32 +1306,32 @@ int main(int argc, char **argv)
                     (t - start_us) / 1e6, st.cc_state, st.cwnd, st.inflight, st.bw_estimate, st.pace_rate, st.srtt, st.min_rtt, st.retrans,
                     st.capacity_short, st.target_rate);
 #ifdef REALNET_INTERNAL
-            fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d lt_rate=%u lt_k=%u lt_span=%u rto=%d qflat=%u probed=%d",
+            fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d lt.rate=%u lt.k=%u lt.span=%u rto=%d qflat=%u probed=%d",
                     g_anl->btl_bw, g_anl->bw_lo, (unsigned long long)g_anl->inflight_hi, g_anl->probe_phase, g_anl->loss_rate,
                     g_anl->qfall, bbr_queue_signal(g_anl), tdiff(g_anl->round_count, g_anl->rto_round) < 0, g_anl->prev_round_min_rtt,
-                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt_state, g_anl->lt_rate, g_anl->lt_k, g_anl->lt_span, g_anl->rx_rto, g_anl->qflat, g_anl->min_rtt_probed);
-            fprintf(stderr, " lt_hold=%u lt_bad=%d lt_from=%u lt_tail=%u lt_skip=%u lt_res=%u lt_prev_rate=%u lt_prev_loss=%u post_su=%u qprobe=%u",
-                    g_anl->lt_hold, g_anl->lt_bad, g_anl->lt_from, g_anl->lt_tail, g_anl->lt_skip, g_anl->lt_res,
-                    g_anl->lt_prev_rate, g_anl->lt_prev_loss, g_anl->post_startup, g_anl->qflat_probe);
+                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt.state, g_anl->lt.rate, g_anl->lt.k, g_anl->lt.span, g_anl->rx_rto, g_anl->qflat, g_anl->min_rtt_probed);
+            fprintf(stderr, " lt.hold=%u lt.bad=%d lt.from=%u lt.tail=%u lt.skip=%u lt.res=%u lt.prev_rate=%u lt.prev_loss=%u lt.post_startup=%u qprobe=%u",
+                    g_anl->lt.hold, g_anl->lt.bad, g_anl->lt.from, g_anl->lt.tail, g_anl->lt.skip, g_anl->lt.res,
+                    g_anl->lt.prev_rate, g_anl->lt.prev_loss, g_anl->lt.post_startup, g_anl->qflat_probe);
 #endif
             fprintf(stderr, "\n");
         }
 #ifdef REALNET_INTERNAL
         /* limiter events: one line whenever the policer detector or the BBR state changes
-           (interval ends show as lt_hold / lt_k / lt_rate steps), between the periodic lines */
+           (interval ends show as lt.hold / lt.k / lt.rate steps), between the periodic lines */
         if (started && is_sender() && is_anl() && getenv("REALNET_TRACE")) {
             static int ev_init, ev_lt, ev_bad, ev_st;
             static uint32_t ev_k, ev_rate, ev_hold, ev_tail, ev_skip, ev_prev;
-            if (!ev_init || ev_lt != g_anl->lt_state || ev_k != g_anl->lt_k || ev_rate != g_anl->lt_rate || ev_hold != g_anl->lt_hold
-                || ev_tail != g_anl->lt_tail || ev_skip != g_anl->lt_skip || ev_prev != g_anl->lt_prev_rate || ev_st != (int)g_anl->bbr_state) {
+            if (!ev_init || ev_lt != g_anl->lt.state || ev_k != g_anl->lt.k || ev_rate != g_anl->lt.rate || ev_hold != g_anl->lt.hold
+                || ev_tail != g_anl->lt.tail || ev_skip != g_anl->lt.skip || ev_prev != g_anl->lt.prev_rate || ev_st != (int)g_anl->bbr_state) {
                 anl_stats es;
                 anl_get_stats(g_anl, &es);
-                ev_init = 1; ev_lt = g_anl->lt_state; ev_k = g_anl->lt_k; ev_rate = g_anl->lt_rate; ev_hold = g_anl->lt_hold;
-                ev_tail = g_anl->lt_tail; ev_skip = g_anl->lt_skip; ev_prev = g_anl->lt_prev_rate; ev_st = (int)g_anl->bbr_state; ev_bad = g_anl->lt_bad;
-                fprintf(stderr, "LTEV t=%.3f st=%d lt=%d k=%u rate=%u prev_rate=%u prev_loss=%u res=%u hold=%u bad=%d from=%u tail=%u skip=%u rounds=%u btl=%u lo=%u pace=%u minrtt=%u lr=%u q=%d rtx=%u post_su=%u qprobe=%u now=%u\n",
-                        (t - start_us) / 1e6, ev_st, ev_lt, ev_k, ev_rate, ev_prev, g_anl->lt_prev_loss, g_anl->lt_res, ev_hold, ev_bad,
-                        g_anl->lt_from, ev_tail, ev_skip, g_anl->lt_rounds, g_anl->btl_bw, g_anl->bw_lo, es.pace_rate, g_anl->min_rtt,
-                        g_anl->loss_rate, bbr_queue_signal(g_anl), es.retrans, g_anl->post_startup, g_anl->qflat_probe, g_anl->current);
+                ev_init = 1; ev_lt = g_anl->lt.state; ev_k = g_anl->lt.k; ev_rate = g_anl->lt.rate; ev_hold = g_anl->lt.hold;
+                ev_tail = g_anl->lt.tail; ev_skip = g_anl->lt.skip; ev_prev = g_anl->lt.prev_rate; ev_st = (int)g_anl->bbr_state; ev_bad = g_anl->lt.bad;
+                fprintf(stderr, "LTEV t=%.3f st=%d lt=%d k=%u rate=%u prev_rate=%u prev_loss=%u res=%u hold=%u bad=%d from=%u tail=%u skip=%u rounds=%u btl=%u lo=%u pace=%u minrtt=%u lr=%u q=%d rtx=%u lt.post_startup=%u qprobe=%u now=%u\n",
+                        (t - start_us) / 1e6, ev_st, ev_lt, ev_k, ev_rate, ev_prev, g_anl->lt.prev_loss, g_anl->lt.res, ev_hold, ev_bad,
+                        g_anl->lt.from, ev_tail, ev_skip, g_anl->lt.rounds, g_anl->btl_bw, g_anl->bw_lo, es.pace_rate, g_anl->min_rtt,
+                        g_anl->loss_rate, bbr_queue_signal(g_anl), es.retrans, g_anl->lt.post_startup, g_anl->qflat_probe, g_anl->current);
             }
         }
 #endif
