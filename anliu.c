@@ -775,12 +775,16 @@ struct anl_s {
     uint32_t probe_rtt_done_ts, probe_rtt_round;
     uint64_t inflight_hi;               /* BBRv2 loss bound on inflight, bytes; 0 = none */
     uint32_t loss_rate;                 /* smoothed per-round loss fraction, 1/256 */
-    uint32_t qfall;                     /* consecutive congestive rounds whose delivery rate fell with our cuts */
-    uint32_t qflat, qflat_rtt;          /* consecutive loss-free rounds at gain <= 1 whose RTT stayed above min_rtt, and that RTT */
-    uint8_t  qflat_probe;               /* the current PROBE_RTT was asked for by qflat: its RTT becomes min_rtt */
-    uint32_t probed_rtt;                /* the lowest min_rtt a PROBE_RTT has seen, before or after it (0: none) */
-    uint8_t  min_rtt_probed;            /* a PROBE_RTT has run since min_rtt last took a lower value */
-    uint32_t qfall_rtt, qfall_rate;     /* ... the round min RTT and delivery rate of the last one counted */
+    /* the path's propagation delay changing under a standing queue (bbr_path_rtt): told
+       from a queue by how delivery moves with our cuts, or by a PROBE_RTT asked for */
+    struct {
+        uint32_t qfall;                     /* consecutive congestive rounds whose delivery rate fell with our cuts */
+        uint32_t qflat, qflat_rtt;          /* consecutive loss-free rounds at gain <= 1 whose RTT stayed above min_rtt, and that RTT */
+        uint8_t  qflat_probe;               /* the current PROBE_RTT was asked for by qflat: its RTT becomes min_rtt */
+        uint32_t probed_rtt;                /* the lowest min_rtt a PROBE_RTT has seen, before or after it (0: none) */
+        uint8_t  min_rtt_probed;            /* a PROBE_RTT has run since min_rtt last took a lower value */
+        uint32_t qfall_rtt, qfall_rate;     /* ... the round min RTT and delivery rate of the last one counted */
+    } path;
     uint32_t round_ts, last_round_rate; /* start of the round; delivery rate of the last round, bytes/s */
     uint32_t round_sent0;               /* sent_wire at the start of the round (its send rate: what the sender needed) */
     uint32_t clean_rounds;              /* rounds without congestive loss since inflight_hi was set */
@@ -2977,7 +2981,7 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
            the pipe does not fully drain, and the 10 s expiry takes any
            sample; the path's own RTT then read as new every few seconds and
            re-armed the probe against the same standing queue (TUNING.md 21) */
-        if (w->min_rtt == 0 || ((uint32_t)rtt < w->min_rtt && (w->probed_rtt == 0 || (uint32_t)rtt < w->probed_rtt))) w->min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
+        if (w->min_rtt == 0 || ((uint32_t)rtt < w->min_rtt && (w->path.probed_rtt == 0 || (uint32_t)rtt < w->path.probed_rtt))) w->path.min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
         w->min_rtt = umax32((uint32_t)rtt, 1);
         w->min_rtt_ts = w->current;
     }
@@ -2991,23 +2995,6 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
     }
 }
 
-/* a new round trip begins: bandwidth filter slot, loss bounds, STARTUP exit */
-static void bbr_round_end(anl_t *w, int app_limited)
-{
-    uint64_t rd = w->delivered - w->round_delivered0;
-    uint64_t lost = w->lost_bytes > w->round_lost0 ? w->lost_bytes - w->round_lost0 : 0;   /* undone losses (handle_ack) */
-    uint32_t i;
-    uint32_t rdur = (uint32_t)tdiff(w->current, w->round_ts);   /* the round's duration and delivery rate */
-    uint32_t rrate = rdur > 0 ? sat32(rd * 1000 / rdur) : 0;
-    uint32_t rsent = w->sent_wire - w->round_sent0;             /* wire bytes sent in the round (wraps) */
-    w->prev_round_min_rtt = w->round_min_rtt;
-    w->round_min_rtt = 0;
-    bbr_policer(w, rd, lost, app_limited);
-    /* BBRv2: congestive loss bounds inflight - loss while a queue stands.
-       Loss without a queue (radio, random) does not: on lossy links it would
-       throttle to nothing. Heavy loss without a queue (a policer) counts only
-       in PROBE_BW: in STARTUP the first RTOs, before any RTT sample, are
-       often spurious (initial RTO below the path RTT). */
     /* The path's RTT went up (route change, new link): every round now looks
        queued against the old min_rtt for up to BBR_MIN_RTT_WIN, and random
        loss looks congestive - each round would cut the model by 0.7 until
@@ -3022,61 +3009,80 @@ static void bbr_round_end(anl_t *w, int app_limited)
        (within a quarter): a longer path's RTT stays put while we cut, a
        queue's moves with the cuts. And each counted round must deliver less
        than the last one counted (TUNING.md 22) */
-    {
-        uint32_t rate = rrate;
-        int cong = rd + lost > 0 && lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w);
-        /* an app-limited sender builds no queue at all: counts too */
-        if (cong && (app_limited || (w->last_round_rate != 0 && (uint64_t)rate * 100 < (uint64_t)w->last_round_rate * 85))) {
-            /* "less than the one before" is the last round counted, not the
-               last round: between them a bursty sender's rate goes up and
-               down (video), and a slower bottleneck's would pass on the way
-               down (5000 -> 1000 kbps: 75, 62, 70 KB/s counted 3) */
-            uint32_t r = w->prev_round_min_rtt;
-            int same_path = r + r / 4 >= w->qfall_rtt && w->qfall_rtt + w->qfall_rtt / 4 >= r;
-            int falling = app_limited || (uint64_t)rate * 100 < (uint64_t)w->qfall_rate * 85;
-            if (w->qfall == 0 || (same_path && falling)) w->qfall++;
-            else w->qfall = 1;
-            w->qfall_rtt = r;
-            w->qfall_rate = rate;
-        }
-        else if (!bbr_queue_signal(w)) w->qfall = 0;
-        w->last_round_rate = rate;
-        w->round_ts = w->current;
-        w->round_sent0 = w->sent_wire;
-        if (w->qfall >= BBR_PATH_ROUNDS) {
-            w->min_rtt = w->prev_round_min_rtt;
-            w->min_rtt_ts = w->current;
-            w->bw_lo = 0;
-            w->inflight_hi = 0;
-            w->qfall = 0;
-        }
-        /* The same without loss: the round RTT sits above 1.25x min_rtt while
-           we pace at or below the estimate (DOWN, CRUISE) and does not move
-           from one round to the next. Either a standing queue or the path -
-           passively the two look alike, so ask the network: PROBE_RTT now
-           instead of at the 10 s expiry, and take the drained RTT as min_rtt
-           (bbr_update_state). A queue drains and the old min_rtt comes back;
-           the path does not. Once per min_rtt value (min_rtt_probed): a
-           sender whose bursts keep a standing queue at the bottleneck would
-           otherwise drain it every few seconds, each drain holding the
-           control stream behind the minimum cwnd (TUNING.md 23) */
-        if (!cong && bbr_queue_signal(w) && w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase <= BBR_CRUISE) {
-            uint32_t r = w->prev_round_min_rtt;
-            int flat = r + r / 16 >= w->qflat_rtt && w->qflat_rtt + w->qflat_rtt / 16 >= r;
-            if (w->qflat == 0 || flat) w->qflat++;
-            else w->qflat = 1;
-            w->qflat_rtt = r;
-            if (w->qflat > BBR_PATH_ROUNDS && !app_limited && !w->min_rtt_probed &&
-                tdiff(w->current, w->min_rtt_ts) >= 1000) {
-                w->qflat = 0;
-                w->qflat_probe = 1;
-                w->bbr_state = ANL_BBR_PROBE_RTT;
-                w->pacing_gain = BBR_UNIT;
-                w->cwnd_gain = BBR_CWND_GAIN;
-                w->probe_rtt_done_ts = 0;
-            }
-        } else w->qflat = 0;
+static void bbr_path_rtt(anl_t *w, uint64_t rd, uint64_t lost, uint32_t rate, int app_limited)
+{
+    int cong = rd + lost > 0 && lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w);
+    /* an app-limited sender builds no queue at all: counts too */
+    if (cong && (app_limited || (w->last_round_rate != 0 && (uint64_t)rate * 100 < (uint64_t)w->last_round_rate * 85))) {
+        /* "less than the one before" is the last round counted, not the
+           last round: between them a bursty sender's rate goes up and
+           down (video), and a slower bottleneck's would pass on the way
+           down (5000 -> 1000 kbps: 75, 62, 70 KB/s counted 3) */
+        uint32_t r = w->prev_round_min_rtt;
+        int same_path = r + r / 4 >= w->path.qfall_rtt && w->path.qfall_rtt + w->path.qfall_rtt / 4 >= r;
+        int falling = app_limited || (uint64_t)rate * 100 < (uint64_t)w->path.qfall_rate * 85;
+        if (w->path.qfall == 0 || (same_path && falling)) w->path.qfall++;
+        else w->path.qfall = 1;
+        w->path.qfall_rtt = r;
+        w->path.qfall_rate = rate;
     }
+    else if (!bbr_queue_signal(w)) w->path.qfall = 0;
+    if (w->path.qfall >= BBR_PATH_ROUNDS) {
+        w->min_rtt = w->prev_round_min_rtt;
+        w->min_rtt_ts = w->current;
+        w->bw_lo = 0;
+        w->inflight_hi = 0;
+        w->path.qfall = 0;
+    }
+    /* The same without loss: the round RTT sits above 1.25x min_rtt while
+       we pace at or below the estimate (DOWN, CRUISE) and does not move
+       from one round to the next. Either a standing queue or the path -
+       passively the two look alike, so ask the network: PROBE_RTT now
+       instead of at the 10 s expiry, and take the drained RTT as min_rtt
+       (bbr_update_state). A queue drains and the old min_rtt comes back;
+       the path does not. Once per min_rtt value (min_rtt_probed): a
+       sender whose bursts keep a standing queue at the bottleneck would
+       otherwise drain it every few seconds, each drain holding the
+       control stream behind the minimum cwnd (TUNING.md 23) */
+    if (!cong && bbr_queue_signal(w) && w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase <= BBR_CRUISE) {
+        uint32_t r = w->prev_round_min_rtt;
+        int flat = r + r / 16 >= w->path.qflat_rtt && w->path.qflat_rtt + w->path.qflat_rtt / 16 >= r;
+        if (w->path.qflat == 0 || flat) w->path.qflat++;
+        else w->path.qflat = 1;
+        w->path.qflat_rtt = r;
+        if (w->path.qflat > BBR_PATH_ROUNDS && !app_limited && !w->path.min_rtt_probed &&
+            tdiff(w->current, w->min_rtt_ts) >= 1000) {
+            w->path.qflat = 0;
+            w->path.qflat_probe = 1;
+            w->bbr_state = ANL_BBR_PROBE_RTT;
+            w->pacing_gain = BBR_UNIT;
+            w->cwnd_gain = BBR_CWND_GAIN;
+            w->probe_rtt_done_ts = 0;
+        }
+    } else w->path.qflat = 0;
+}
+
+/* a new round trip begins: bandwidth filter slot, loss bounds, STARTUP exit */
+static void bbr_round_end(anl_t *w, int app_limited)
+{
+    uint64_t rd = w->delivered - w->round_delivered0;
+    uint64_t lost = w->lost_bytes > w->round_lost0 ? w->lost_bytes - w->round_lost0 : 0;   /* undone losses (handle_ack) */
+    uint32_t i;
+    uint32_t rdur = (uint32_t)tdiff(w->current, w->round_ts);   /* the round's duration and delivery rate */
+    uint32_t rrate = rdur > 0 ? sat32(rd * 1000 / rdur) : 0;
+    uint32_t rsent = w->sent_wire - w->round_sent0;             /* wire bytes sent in the round (wraps) */
+    w->prev_round_min_rtt = w->round_min_rtt;
+    w->round_min_rtt = 0;
+    bbr_policer(w, rd, lost, app_limited);
+    bbr_path_rtt(w, rd, lost, rrate, app_limited);
+    w->last_round_rate = rrate;
+    w->round_ts = w->current;
+    w->round_sent0 = w->sent_wire;
+    /* BBRv2: congestive loss bounds inflight - loss while a queue stands.
+       Loss without a queue (radio, random) does not: on lossy links it would
+       throttle to nothing. Heavy loss without a queue (a policer) counts only
+       in PROBE_BW: in STARTUP the first RTOs, before any RTT sample, are
+       often spurious (initial RTO below the path RTT). */
     if (rd + lost > 0 && ((lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w)) ||
                           (w->bbr_state == ANL_BBR_PROBE_BW && lost * 100 > BBR_LOSS_BLIND * (rd + lost)))) {
         uint64_t cur = (uint64_t)w->cwnd * w->avg_seg;
@@ -3218,14 +3224,14 @@ static void bbr_update_state(anl_t *w)
         } else if (tdiff(w->current, w->probe_rtt_done_ts) >= 0 && tdiff(w->round_count, w->probe_rtt_round) >= 0) {
             /* a probe the flat queue signal asked for: the RTT of the drained
                pipe is the path's, above the old min_rtt or not (bbr_round_end) */
-            w->probed_rtt = w->min_rtt;
-            if (w->qflat_probe) {
+            w->path.probed_rtt = w->min_rtt;
+            if (w->path.qflat_probe) {
                 uint32_t m = w->round_min_rtt ? w->round_min_rtt : w->prev_round_min_rtt;
                 if (m != 0) w->min_rtt = m;
-                w->qflat_probe = 0;
+                w->path.qflat_probe = 0;
             }
-            w->min_rtt_probed = 1;
-            if (w->min_rtt < w->probed_rtt) w->probed_rtt = w->min_rtt;
+            w->path.min_rtt_probed = 1;
+            if (w->min_rtt < w->path.probed_rtt) w->path.probed_rtt = w->min_rtt;
             w->min_rtt_ts = w->current;
             if (w->full_bw_reached) bbr_enter_probe_bw(w);
             else { w->bbr_state = ANL_BBR_STARTUP; w->pacing_gain = BBR_STARTUP_GAIN; }

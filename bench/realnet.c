@@ -352,7 +352,7 @@ static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
             bbr_lt_probe_rate(w), sat32((uint64_t)sent * 1000 / dur), compute_pace_rate(w), w->pace_rate,
             w->cwnd, w->inflight_segs, has_queued_data(w), has_new_data(w), bulk ? bulk->rmt_wnd : 0,
             bulk ? bulk->snd_nxt - bulk->snd_una : 0, bulk ? bulk->nsnd_que : 0, bulk ? bulk->nsnd_buf : 0,
-            w->min_rtt, w->qflat_probe, tdiff(now_ms(), w->current));
+            w->min_rtt, w->path.qflat_probe, tdiff(now_ms(), w->current));
 }
 #endif
 
@@ -1308,11 +1308,11 @@ int main(int argc, char **argv)
 #ifdef REALNET_INTERNAL
             fprintf(stderr, " btl=%u lo=%u hi=%llu ph=%d lr=%u qfall=%u q=%d rto_rd=%d rmin=%u burst=%u app=%d lt=%d lt.rate=%u lt.k=%u lt.span=%u rto=%d qflat=%u probed=%d",
                     g_anl->btl_bw, g_anl->bw_lo, (unsigned long long)g_anl->inflight_hi, g_anl->probe_phase, g_anl->loss_rate,
-                    g_anl->qfall, bbr_queue_signal(g_anl), tdiff(g_anl->round_count, g_anl->rto_round) < 0, g_anl->prev_round_min_rtt,
-                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt.state, g_anl->lt.rate, g_anl->lt.k, g_anl->lt.span, g_anl->rx_rto, g_anl->qflat, g_anl->min_rtt_probed);
+                    g_anl->path.qfall, bbr_queue_signal(g_anl), tdiff(g_anl->round_count, g_anl->rto_round) < 0, g_anl->prev_round_min_rtt,
+                    g_anl->burst_bw, g_anl->app_limited != 0, g_anl->lt.state, g_anl->lt.rate, g_anl->lt.k, g_anl->lt.span, g_anl->rx_rto, g_anl->path.qflat, g_anl->path.min_rtt_probed);
             fprintf(stderr, " lt.hold=%u lt.bad=%d lt.from=%u lt.tail=%u lt.skip=%u lt.res=%u lt.prev_rate=%u lt.prev_loss=%u lt.post_startup=%u qprobe=%u",
                     g_anl->lt.hold, g_anl->lt.bad, g_anl->lt.from, g_anl->lt.tail, g_anl->lt.skip, g_anl->lt.res,
-                    g_anl->lt.prev_rate, g_anl->lt.prev_loss, g_anl->lt.post_startup, g_anl->qflat_probe);
+                    g_anl->lt.prev_rate, g_anl->lt.prev_loss, g_anl->lt.post_startup, g_anl->path.qflat_probe);
 #endif
             fprintf(stderr, "\n");
         }
@@ -1331,7 +1331,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "LTEV t=%.3f st=%d lt=%d k=%u rate=%u prev_rate=%u prev_loss=%u res=%u hold=%u bad=%d from=%u tail=%u skip=%u rounds=%u btl=%u lo=%u pace=%u minrtt=%u lr=%u q=%d rtx=%u lt.post_startup=%u qprobe=%u now=%u\n",
                         (t - start_us) / 1e6, ev_st, ev_lt, ev_k, ev_rate, ev_prev, g_anl->lt.prev_loss, g_anl->lt.res, ev_hold, ev_bad,
                         g_anl->lt.from, ev_tail, ev_skip, g_anl->lt.rounds, g_anl->btl_bw, g_anl->bw_lo, es.pace_rate, g_anl->min_rtt,
-                        g_anl->loss_rate, bbr_queue_signal(g_anl), es.retrans, g_anl->lt.post_startup, g_anl->qflat_probe, g_anl->current);
+                        g_anl->loss_rate, bbr_queue_signal(g_anl), es.retrans, g_anl->lt.post_startup, g_anl->path.qflat_probe, g_anl->current);
             }
         }
 #endif
