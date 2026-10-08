@@ -12,6 +12,13 @@
 
 ## 2026-10-08
 
+- BBR 之上的启发式拆结构（评审第 6 项，3 个提交）。`anl_s` 的 238 个字段里拥塞控制占 143 个，核心 BBR 53 个，其余是叠在上面的四套启发式；按耦合度处理：
+  - 限速器检测：27 个 `lt_*` 字段（含 `post_startup`、输入中断时间戳）收进嵌套结构 `lt`，去掉前缀；260 处引用中 241 处在 `bbr_policer` 内，核心 BBR 只在 `bbr_bw`、`compute_pace_rate` 读它。`test.c`、`bench/` 的直接读取随之改名。
+  - 码率接口：`capacity_short`、`cs_*`、`rate_*`、载荷计数与平滑均值共 38 个字段收进嵌套结构 `rate`，去掉 `rate_` 前缀；唯一的写者是 `rate_update`，其余只读 `capacity_short`、`target`、`par_queue_ts` 和均值。`RATE_AVG` 宏随之改为拼接到子结构。
+  - 传播时延变化识别：原来埋在 `bbr_round_end` 中段的两段逻辑（连续拥塞轮次交付随降速下降；平坦排队 RTT 触发 PROBE_RTT）抽成 `bbr_path_rtt`，8 个字段收进嵌套结构 `path`；三条轮次簿记赋值挪到调用之后（它们不读这些），BBRv2 拥塞丢包的注释挪回它描述的代码前。
+  - 不动：突发与交付窗口测量（`burst_*` / `dw_*`，19 个字段）引用分散在发送路径，`anl_flush_internal` 自己 15 处，拆成子结构只是改名；`realnet.c` 诊断输出对这些内部状态的 18 处直接读取保留，改走 `ANL_TRACE` 需要库为一个工具提供一次倾倒十几个 BBR 内部量的跟踪点，不值。
+  - 已验证：每个提交单元测试默认种子输出与改动前逐字节相同；三步合计 30 个种子（0..29）新旧输出全部逐字节相同；ASan/UBSan CTest 6/6，Clang 含模糊测试冒烟 7/7；`bench/` 全部工具编译无新警告。内存不是理由：五组启发式合计 536 字节，`anl_t` 5640 字节。
+
 - 按"单连接并发子流 ≤ 128"的尺度清理过度设计（评审第 1–5 项，5 个提交）：
   - sid 生命周期：流表之外的四张表（关闭中数组、动态扩容到 1024 槽的保留期哈希、RST 队列）并为一张 128 项定长记录表（关闭中 / 保留期）加一个无状态 RST 列表；sid 改为本端奇偶的下一个值、连接内不复用，6 位代号、带代号的 RST / CLOSE 体和"对上一代 RST 再发 STREAM_OPEN"随之删除，本端自己的 sid 不再需要保留期。每端 2²⁴ 次打开后 `anl_stream_open` 返回新增的 `ANL_ENOSID`。DESIGN 5.2 / 5.5 / 6.1、`anliu.h`、README、`test.c`（`test_sid_lifecycle` / `test_sid_hold` 替换原 sid 复用测试，开关 9000 次的测试改为检验 sid 不复用）、`bench/churn.c` 同步。
   - 重复代码合并：`fec_ok_prob`（二项分布尾概率此前三份）、`fec_repair_ms` 加单次重传参数（`fec_one_retry` 是它的前半）、`srtt_or_def`、`ack_jitter_ms`、`wnd_open`、`open_backoff`（OPEN 与 CLOSE 同一退避）、`fec_pcache_expire`（校验包缓存此前在两处过期）。行为不变：单元测试输出逐字节相同。
