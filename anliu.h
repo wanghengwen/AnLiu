@@ -189,8 +189,8 @@ typedef struct anl_stream_opt {
                                    Set the receiver's local options in the accept callback. */
     int rcv_drop_until_key;     /* semi only: after a lost frame discard non-key frames until the
                                    next key frame (they cannot be decoded); 0 = off */
-    int report;                 /* receiver: send delay reports to the peer (DESIGN 6.9);
-                                   semi 1, reliable 0 */
+    int report;                 /* receiver: send delay reports to the peer (DESIGN 6.9); 1 by
+                                   default in both modes (the sender's policer detection uses them) */
 } anl_stream_opt;
 
 typedef struct anl_frame_info {
@@ -247,6 +247,8 @@ typedef struct anl_delay_report {
     uint32_t frames_skipped;    /* receiver skip operations, possibly spanning several frames;
                                    cumulative, mod 65536 in reports; not an exact lost-frame count */
     uint32_t fec_recovered;     /* receiver's total (mod 65536 in reports) */
+    uint32_t rx_bytes;          /* the receiver's whole connection: data and parity bytes arrived from
+                                   the network, wire estimate, cumulative mod 2^32 */
 } anl_delay_report;
 
 typedef struct anl_stream_stats {

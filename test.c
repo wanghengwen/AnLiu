@@ -2811,7 +2811,101 @@ static int input_test_report(anl_t *w, anl_stream_t *st, uint32_t ts, uint16_t r
     p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
     for (i = 0; i < 7; i++) p = enc16(p, 0);
     p = enc16(p, recovered);
+    p = enc32(p, w->prx_last);
+    p = enc16(p, (uint16_t)w->current);
     return anl_input_plain(w, buf, (long)(p - buf));
+}
+
+/* a REPORT with the connection's rx_bytes after the delay/FEC fields */
+static int input_test_report_rx_echo(anl_t *w, anl_stream_t *st, uint32_t ts, uint32_t rx, uint32_t echo)
+{
+    char buf[128], *p;
+    int i;
+    p = plain_hdr(buf, NULL, w->conv, ANL_VERSION << 6, (uint16_t)ts);
+    p = enc_sid(p, SEG_CTRL, st->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
+    for (i = 0; i < 8; i++) p = enc16(p, 0);
+    p = enc32(p, rx);
+    p = enc16(p, (uint16_t)echo);
+    return anl_input_plain(w, buf, (long)(p - buf));
+}
+
+static int input_test_report_rx(anl_t *w, anl_stream_t *st, uint32_t ts, uint32_t rx)
+{
+    return input_test_report_rx_echo(w, st, ts, rx, w->current);
+}
+
+/* rx_bytes (DESIGN 6.9): the newest report by the peer's clock moves the
+ * connection's count on; older and duplicate reports do not;
+ * lost reports are covered by the next one; the count wraps */
+static void test_report_rx_bytes(void)
+{
+    anl_config c;
+    anl_stream_opt o;
+    anl_t *w;
+    anl_stream_t *a, *b;
+    int err;
+    printf("[reports: rx_bytes - newest only, lost / reordered / duplicate, wrap]\n");
+    anl_config_default(&c, ANL_ROLE_CLIENT);
+    w = anl_create(1, &c, NULL);
+    CHECK(w != NULL, "create connection");
+    if (!w) return;
+    anl_update(w, 1000);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    CHECK(o.report == 1, "reliable streams report by default");
+    anl_stream_opt_default(&o, ANL_SEMI);
+    a = anl_stream_open(w, &o, &err); b = anl_stream_open(w, &o, &err);
+    CHECK(a && b, "open two streams");
+    if (!a || !b) { anl_release(w); return; }
+    CHECK(input_test_report_rx(w, a, 100, 0xffff0000u) == 0, "first report");
+    CHECK(w->prx_valid && w->prx_bytes == 0 && w->prx_ms == 0, "the first report is the baseline");
+    CHECK(input_test_report_rx(w, a, 200, 0xffff0000u + 50000) == 0 && w->prx_bytes == 50000 && w->prx_ms == 100,
+          "100 ms later, 50000 more (%llu bytes, %llu ms)", (unsigned long long)w->prx_bytes, (unsigned long long)w->prx_ms);
+    CHECK(input_test_report_rx(w, a, 150, 0xffff0000u + 30000) == 0 && w->prx_bytes == 50000 && w->prx_ms == 100,
+          "a reordered older report changes nothing");
+    CHECK(input_test_report_rx(w, a, 200, 0xffff0000u + 50000) == 0 && w->prx_bytes == 50000 && w->prx_ms == 100,
+          "a duplicate changes nothing");
+    CHECK(input_test_report_rx(w, b, 180, 0xffff0000u + 40000) == 0 && w->prx_bytes == 50000 && w->prx_ms == 100,
+          "another stream's report older than the newest changes nothing");
+    /* reports at 300 and 400 lost: the next covers them; across the 2^32 wrap */
+    CHECK(input_test_report_rx(w, b, 500, 0xffff0000u + 250000) == 0 && w->prx_bytes == 250000 && w->prx_ms == 400,
+          "a later report covers the lost ones, across the wrap (%llu bytes, %llu ms)",
+          (unsigned long long)w->prx_bytes, (unsigned long long)w->prx_ms);
+    anl_release(w);
+}
+
+/* rx_bytes counts what arrives from the network, whatever becomes of it:
+ * without loss every data and parity segment sent once arrives once (the
+ * same estimate as sent_wire); with loss less, never more */
+static void test_report_rx_count(int loss_pct)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    static char buf[4000];
+    anl_frame_info fi;
+    int i;
+    printf("[reports: rx_bytes against sent_wire, %d%% loss]\n", loss_pct);
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 40;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.max_age_ms = 300; o.drop_until_key = 1;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    n.loss_pct = loss_pct;
+    for (i = 0; i < 10000; i++) {
+        if (i % 33 == 0) anl_stream_send_frame(a, i % 990 == 0 ? ANL_FRAME_KEY : 0, buf, i % 990 == 0 ? 3000 : 1000, NULL);
+        net_tick(&n);
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) ;
+    }
+    n.loss_pct = 0;
+    for (i = 0; i < 2000; i++) { net_tick(&n); while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) ; }
+    printf("  sent_wire %u, rx_bytes %u, reported to the sender %llu over %llu ms\n", n.ep[0]->sent_wire, n.ep[1]->rx_net,
+           (unsigned long long)n.ep[0]->prx_bytes, (unsigned long long)n.ep[0]->prx_ms);
+    if (loss_pct == 0) CHECK(n.ep[1]->rx_net == n.ep[0]->sent_wire, "no loss: everything sent arrived (%u / %u)", n.ep[1]->rx_net, n.ep[0]->sent_wire);
+    else CHECK(n.ep[1]->rx_net < n.ep[0]->sent_wire, "with loss: less arrived than was sent (%u / %u)", n.ep[1]->rx_net, n.ep[0]->sent_wire);
+    CHECK(n.ep[0]->prx_valid && n.ep[0]->prx_bytes <= n.ep[1]->rx_net && n.ep[0]->prx_ms > 9000,
+          "the sender learns it from the reports (%llu bytes over %llu ms)", (unsigned long long)n.ep[0]->prx_bytes, (unsigned long long)n.ep[0]->prx_ms);
+    net_stop(&n);
 }
 
 static int ordered_report_callbacks;
@@ -2902,6 +2996,164 @@ static void policer_interval(anl_t *w, uint32_t dur, uint32_t sent,
     w->avg_seg = 1;
     w->inflight_segs = infl1;
     bbr_policer(w, delivered, lost, 0);
+}
+
+/* The rate from the peer's reports (rx_bytes) when they cover at least half
+ * the interval, ACK-based otherwise; an initial test fed at its rate that
+ * delivered under 7/8 of it is repeated once at what it delivered */
+static void test_bbr_policer_reports(void)
+{
+    anl_t w;
+    printf("[bbr: policer rate from the peer's reports; one retest below a draining bucket]\n");
+    memset(&w, 0, sizeof(w));
+    /* watching, 40% lost: the interval's rate becomes prev_rate */
+    w.prx_bytes = 600000; w.prx_ms = 400;           /* the reports: 1.5 MB/s over the whole interval */
+    w.lt.prx_valid = 1; w.prx_at = 401;
+    policer_interval(&w, 400, 800000, 0, 0, 300000, 200000);
+    CHECK(w.lt.state == 0 && w.lt.prev_rate == 1500000, "covered by reports: their rate (%u)", w.lt.prev_rate);
+    memset(&w, 0, sizeof(w));
+    w.prx_bytes = 600000; w.prx_ms = 150;           /* under half the interval */
+    w.lt.prx_valid = 1; w.prx_at = 401;
+    policer_interval(&w, 400, 800000, 0, 0, 300000, 200000);
+    CHECK(w.lt.prev_rate == 750000, "too little coverage: ACK-based (%u)", w.lt.prev_rate);
+
+    /* the initial test at 2 MB/s, fed, delivers 1.5 MB/s with 25% lost */
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 1; w.lt.from = 1; w.lt.rate = 2000000; w.lt.ref_loss = 300;
+    w.prx_bytes = 450000; w.prx_ms = 300;
+    policer_interval(&w, 300, 600000, 0, 0, 450000, 150000);
+    CHECK(w.lt.state == 1 && w.lt.retest && w.lt.rate == 1500000, "retest at what it delivered (%d, %u)", w.lt.state, w.lt.rate);
+    /* ... where the loss is gone: confirmed */
+    w.prx_bytes = 0; w.prx_ms = 0;
+    w.lt.prx_b0 = w.lt.prx_ms0 = 0;
+    w.prx_bytes = 449000; w.prx_ms = 300;
+    policer_interval(&w, 300, 450000, 0, 0, 449000, 1000);
+    CHECK(w.lt.state == 3 && w.lt.from == 1, "the retest passes: probe (%d)", w.lt.state);
+
+    /* random loss over an eighth (15%): the retest fails as well - no further retest */
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 1; w.lt.from = 1; w.lt.rate = 2000000; w.lt.ref_loss = 150;
+    w.prx_bytes = 510000; w.prx_ms = 300;
+    policer_interval(&w, 300, 600000, 0, 0, 510000, 90000);
+    CHECK(w.lt.state == 1 && w.lt.retest && w.lt.rate == 1700000, "15%% lost at the test rate: one retest (%u)", w.lt.rate);
+    w.lt.prx_b0 = w.lt.prx_ms0 = 0;
+    w.prx_bytes = 433500; w.prx_ms = 300;
+    policer_interval(&w, 300, 510000, 0, 0, 433500, 76500);
+    CHECK(w.lt.state == 0 && w.lt.hold == 48, "still 15%% lost: random, no second retest (%d, %u)", w.lt.state, w.lt.hold);
+
+    /* an app-limited test that sent under 7/8 of its rate: no retest */
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 1; w.lt.from = 1; w.lt.rate = 1500000; w.lt.ref_loss = 300;
+    w.prx_bytes = 80000; w.prx_ms = 300;
+    policer_interval(&w, 300, 120000, 0, 0, 80000, 40000);
+    CHECK(!w.lt.retest && w.lt.state == 0, "underfed: no retest (%d)", w.lt.state);
+
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 1; w.lt.from = 1; w.lt.rate = 1500000; w.lt.ref_loss = 300;
+    w.lt.ts = 1; w.current = 301; w.lt.rounds = BBR_LT_ROUNDS - 1;
+    w.sent_wire = 120000;
+    bbr_policer(&w, 80000, 40000, 1);
+    CHECK(w.lt.state == 1 && w.lt.feed_wait && !w.lt.skip && w.lt.rate == 1500000,
+          "underfed media test waits once at the same pace");
+    w.current = 601; w.lt.rounds = BBR_LT_ROUNDS - 1; w.sent_wire += 120000;
+    bbr_policer(&w, 80000, 40000, 1);
+    CHECK(w.lt.state == 0 && w.lt.hold == BBR_LT_SPAN, "a second underfed interval ends the test");
+}
+
+/* Drive real REPORT parsing across a missing-report gap and a new pace.
+ * A newly arriving snapshot may cover old traffic; it is only a baseline.
+ * Two snapshots from the new interval can measure its delivery instead. */
+static void test_bbr_report_intervals(void)
+{
+    anl_config c; anl_stream_opt o;
+    anl_t *w; anl_stream_t *s; int err;
+    char buf[128], *p;
+    printf("[bbr: missing reports and pace changes cannot reuse old delivery]\n");
+    anl_config_default(&c, ANL_ROLE_CLIENT);
+    w = anl_create(1, &c, NULL);
+    CHECK(w != NULL, "create");
+    if (!w) return;
+    anl_update(w, 100);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    s = anl_stream_open(w, &o, &err);
+    CHECK(s != NULL, "open");
+    if (!s) { anl_release(w); return; }
+    CHECK(input_test_report_rx(w, s, 100, 100000) == 0, "old snapshot");
+    w->current = 1001; bbr_lt_begin(w, 1);
+    w->current = 1301;
+    CHECK(input_test_report_rx(w, s, 1300, 2050000) == 0, "report after the gap");
+    w->lt.rounds = BBR_LT_ROUNDS - 1;
+    w->sent_wire += 250000;
+    bbr_policer(w, 150000, 100000, 0);
+    CHECK(w->lt.prev_rate == 500000, "one snapshot cannot turn old traffic into this interval's rate (%u)", w->lt.prev_rate);
+
+    w->current = 2001; w->lt.prev_rate = 0; bbr_lt_begin(w, 1);
+    w->current = 2051;
+    CHECK(input_test_report_rx_echo(w, s, 2000, 2900000, 1900) == 0,
+          "delayed snapshot from before the new pace");
+    CHECK(!w->lt.prx_valid, "arrival after the transition is not proof of a new snapshot");
+    w->current = 2101;
+    CHECK(input_test_report_rx(w, s, 2100, 3000000) == 0, "new baseline");
+    w->current = 2301;
+    CHECK(input_test_report_rx(w, s, 2300, 3100000) == 0, "200 ms at 500 kB/s");
+    CHECK(input_test_report_rx(w, s, 2200, 3050000) == 0, "reordered snapshot ignored");
+    w->current = 2401;
+    w->lt.rounds = BBR_LT_ROUNDS - 1;
+    w->sent_wire += 250000;
+    bbr_policer(w, 150000, 100000, 0);
+    CHECK(w->lt.prev_rate == 500000, "two new snapshots recover network delivery despite missing ACK credit (%u)", w->lt.prev_rate);
+
+    w->current = 3001; w->lt.prev_rate = 0; w->lt.skip = 1; w->lt.pace_ts = 3000;
+    bbr_policer(w, 100000, 10000, 0);
+    CHECK(!w->lt.prx_valid, "pace transition discards the report baseline");
+    w->current = 3301;
+    CHECK(input_test_report_rx(w, s, 3300, 9000000) == 0, "first snapshot after transition");
+    w->lt.rounds = BBR_LT_ROUNDS - 1; w->sent_wire += 250000;
+    bbr_policer(w, 150000, 100000, 0);
+    CHECK(w->lt.prev_rate == 500000, "transition also excludes the old report interval (%u)", w->lt.prev_rate);
+
+    w->current = 20001; bbr_lt_begin(w, 1);
+    w->current = 20301;
+    w->last_rx = w->current;       /* keepalives continued while reports were idle */
+    CHECK(input_test_report_rx(w, s, 20300, 16000000) == 0, "first report after idling");
+    w->lt.prev_rate = 0; w->lt.rounds = BBR_LT_ROUNDS - 1; w->sent_wire += 250000;
+    bbr_policer(w, 150000, 100000, 0);
+    CHECK(w->lt.prev_rate == 500000, "idle time is not a measurement of the resumed path (%u)", w->lt.prev_rate);
+
+    p = plain_hdr(buf, NULL, w->conv, ANL_VERSION << 6, 20400);
+    p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, 16);
+    memset(p, 0, 16); p += 16;
+    CHECK(anl_input_plain(w, buf, (long)(p - buf)) == ANL_EFORMAT, "REPORT requires all 22 bytes");
+    anl_release(w);
+}
+
+static void test_report_epoch_wrap(void)
+{
+    anl_config c; anl_stream_opt o; anl_t *w; anl_stream_t *s; int err;
+    printf("[reports: sender echo across 16-bit and local 32-bit clock wrap]\n");
+    anl_config_default(&c, ANL_ROLE_CLIENT);
+    w = anl_create(1, &c, NULL);
+    CHECK(w != NULL, "create");
+    if (!w) return;
+    anl_update(w, 0xffffff00u);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    s = anl_stream_open(w, &o, &err);
+    CHECK(s != NULL, "open");
+    if (!s) { anl_release(w); return; }
+    CHECK(input_test_report_rx(w, s, 1000, 0) == 0, "initial snapshot");
+    w->current = 0xfffffff0u; bbr_lt_begin(w, 1);
+    w->current = 0x10;
+    CHECK(input_test_report_rx_echo(w, s, 1200, 200000, 0xffffffd0u) == 0, "delayed pre-wrap snapshot");
+    CHECK(!w->lt.prx_valid, "old phase stays old across wrap");
+    w->current = 0x30;
+    CHECK(input_test_report_rx_echo(w, s, 1220, 220000, 0x20) == 0 && w->lt.prx_valid,
+          "post-wrap echo establishes the new baseline");
+    w->current = 0x130;
+    CHECK(input_test_report_rx_echo(w, s, 1476, 348000, 0x120) == 0, "second eligible snapshot");
+    w->current = 0x1f1; w->sent_wire += 250000; w->lt.rounds = BBR_LT_ROUNDS - 1;
+    bbr_policer(w, 128000, 50000, 0);
+    CHECK(w->lt.prev_rate == 500000, "wrapped interval uses the two new snapshots (%u)", w->lt.prev_rate);
+    anl_release(w);
 }
 
 static void test_bbr_policer_probes(void)
@@ -3415,6 +3667,7 @@ static void test_fec_expiry(void)
                 p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
                 p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0); p = enc16(p, 0);
                 p = enc16(p, 10); p = enc16(p, (uint16_t)(i * 2)); p = enc16(p, 0);
+                p = enc32(p, 0); p = enc16(p, (uint16_t)w->current);
                 CHECK(anl_input_plain(w, body, (long)(p - body)) == 0, "report %d", i);
             }
             CHECK(s->fec_ratio > FEC_AUTO_START, "four peer skips raise the ratio (%d)", s->fec_ratio);
@@ -3682,6 +3935,18 @@ static void test_fec_capacity_recovery(int loss_pct)
     CHECK(stable_short == 0, "shortage stays cleared throughout the final 10 s (%u ms)", stable_short);
     net_stop(&n);
     g_seed = saved_seed;
+}
+
+/* These FIFO recovery paths falsely acquired a persistent policer ceiling
+ * when rx_bytes first replaced the ACK rate. Keep the original deadlines. */
+static void test_report_capacity_recovery(void)
+{
+    uint64_t saved = g_seed0;
+    g_seed0 = 0x9E3779B97F4A7C15ULL * 11;    /* seed 10 */
+    test_fec_capacity_recovery(10);
+    g_seed0 = 0x9E3779B97F4A7C15ULL * 10;    /* seed 9 */
+    test_fec_capacity_recovery(15);
+    g_seed0 = saved;
 }
 
 /* No loss, no parity (DESIGN 8.6): audio + video over 20 Mbit / 170 ms
@@ -4489,6 +4754,9 @@ int main(void)
     RUN(test_report_late_clock());
     RUN(test_fec_repair());
     RUN(test_fec_report_order());
+    RUN(test_report_rx_bytes());
+    RUN(test_report_rx_count(0));
+    RUN(test_report_rx_count(5));
     RUN(test_fec_auto());
     RUN(test_fec_auto_shared());
     RUN(test_fec_expiry());
@@ -4508,6 +4776,9 @@ int main(void)
     RUN(test_bbr_delivery_window());
     RUN(test_bbr_app_limited_loss());
     RUN(test_bbr_policer_probes());
+    RUN(test_bbr_policer_reports());
+    RUN(test_bbr_report_intervals());
+    RUN(test_report_epoch_wrap());
     RUN(test_bbr_policer_plateau());
     RUN(test_bbr_policer_pacing());
     RUN(test_bbr_policer_capacity_change());
@@ -4530,6 +4801,7 @@ int main(void)
     RUN(test_fec_capacity_recovery(5));
     RUN(test_fec_capacity_recovery(10));
     RUN(test_fec_capacity_recovery(15));     /* loss at most 15% (the test range) */
+    RUN(test_report_capacity_recovery());
     RUN(test_review_scheduler(3));
     RUN(test_review_scheduler(0));
     RUN(test_review_timers());
