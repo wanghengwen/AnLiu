@@ -50,10 +50,10 @@ static int g_lt_trace = -1;
 #define ANL_TRACE_policer(w, dur, rate, loss, counted, after) do { \
     if (g_lt_trace < 0) g_lt_trace = getenv("MEDIA_LOSS_LT") != NULL; \
     if (g_lt_trace && !(after) && (w)->sent_wire > 0 && (rate) > 20000) \
-        printf("LTINT ms=%u lt=%d from=%u k=%u tail=%u bad=%d hold=%u rate=%u send=%u lt_rate=%u loss=%u counted=%u res=%u pace=%u\n", \
+        printf("LTINT ms=%u lt=%d from=%u k=%u tail=%u bad=%d hold=%u rate=%u send=%u lt_rate=%u loss=%u counted=%u res=%u pace=%u st=%d btl=%u\n", \
                (w)->current, (w)->lt.state, (w)->lt.from, (w)->lt.k, (w)->lt.tail, (w)->lt.bad, (w)->lt.hold, (rate), \
                (unsigned)((uint64_t)(uint32_t)((w)->sent_wire - (w)->lt.sent0) * 1000 / (dur)), (w)->lt.rate, (loss), (counted), \
-               (w)->lt.res, (w)->pace_rate); \
+               (w)->lt.res, (w)->pace_rate, (w)->bbr_state, (w)->btl_bw); \
 } while (0)
 #include "anl_trace.h"
 #include "../anliu.c"

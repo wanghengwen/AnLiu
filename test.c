@@ -3226,6 +3226,23 @@ static void test_bbr_policer_probes(void)
     w.min_rtt = 20; w.prev_round_min_rtt = 60;
     policer_interval(&w, 300, 30000, 0, 0, 27000, 3000);
     CHECK(w.lt.state == 2 && w.lt.rate == 1200000 && w.lt.left == 8, "queued stall in the first probe: tested rate kept (%d, %u)", w.lt.state, w.lt.rate);
+    /* STARTUP: two intervals over a quarter lost at the encoder's ramp
+       (real network, 1.6 / 2.0 s, 46 / 50 kB/s on a 30 Mbit path) start no
+       test; the same after STARTUP do */
+    memset(&w, 0, sizeof(w));
+    w.bbr_state = ANL_BBR_STARTUP;
+    policer_interval(&w, 420, 48000, 0, 0, 19000, 21000);
+    policer_interval(&w, 420, 99000, 0, 0, 21000, 29000);
+    CHECK(w.lt.state == 0, "no policer test in STARTUP (%d)", w.lt.state);
+    /* a STARTUP interval is evidence: paired with one after STARTUP, the
+       test starts (a 1 MB bucket at 100 ms in simulation, STARTUP's exit
+       between the two) */
+    memset(&w, 0, sizeof(w));
+    w.bbr_state = ANL_BBR_STARTUP;
+    policer_interval(&w, 420, 1200000, 0, 0, 680000, 500000);
+    w.bbr_state = ANL_BBR_PROBE_BW;
+    policer_interval(&w, 420, 1250000, 0, 0, 620000, 600000);
+    CHECK(w.lt.state == 1, "a pair across STARTUP's exit starts the test (%d)", w.lt.state);
     /* a FIFO's queue: delivery at about the rate - congestion control's */
     memset(&w, 0, sizeof(w));
     w.lt.state = 3; w.lt.from = 1; w.lt.k = 1; w.lt.rate = 1200000; w.lt.span = 8;

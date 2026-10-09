@@ -3013,7 +3013,18 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            random loss does that - a small flow's 5% reads over 10% in an
            interval now and then, and the test's loss regresses to the mean
            (TUNING.md 55) */
-        if (w->lt.prev_rate != 0 && rate + w->lt.prev_rate / 4 >= w->lt.prev_rate && rate <= w->lt.prev_rate + w->lt.prev_rate / 4) {
+        /* The test starts after STARTUP: a STARTUP interval is evidence, the
+           second of the pair and the test are not. In STARTUP the encoder
+           is still ramping (tens of kB/s) and the losses are STARTUP's own
+           overshoot - real network, a 30 Mbit path at 100 ms: 53..72% lost
+           at 1.6..2.0 s, tested at 48 kB/s, which the encoder's ramp could
+           not exceed, so confirmed, and every probe after it underfed:
+           video at 0.3 Mbit for the whole round. A policer's pair spans
+           STARTUP's exit (a 1 MB bucket at 100 ms: 16.1 s in STARTUP, 16.5
+           s after it, simulation) or follows it (19 of 19 real ones were
+           tested after it) (TUNING.md 59) */
+        if (w->bbr_state != ANL_BBR_STARTUP && w->lt.prev_rate != 0 &&
+            rate + w->lt.prev_rate / 4 >= w->lt.prev_rate && rate <= w->lt.prev_rate + w->lt.prev_rate / 4) {
             w->lt.state = 1;
             w->lt.from = 1;
             w->lt.retest = 0;
