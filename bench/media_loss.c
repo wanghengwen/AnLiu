@@ -9,14 +9,17 @@
  * MEDIA_LOSS_VIDEO_MAX=<per mille> lets the encoder follow the target up to that
  * scale (default 1000, ~940 kbit/s of video; 8000 ~7.5 Mbit/s);
  * MEDIA_LOSS_AUDIO_ONLY=1 sends no video; MEDIA_LOSS_TBF_KB=<n> makes the
- * bottleneck a token-bucket shaper with an n KB bucket (tc tbf); MEDIA_LOSS_BURST=<n>
+ * bottleneck a token-bucket shaper with an n KB bucket (tc tbf); MEDIA_LOSS_QDELAY=<ms>
+ * sets the queue depth (default 100; tbf: its latency); MEDIA_LOSS_POLICER=<kbps>
+ * puts a token-bucket policer (tc police: drops once its MEDIA_LOSS_POLICER_KB
+ * bucket, default 64, is empty; no queue) in front of the link; MEDIA_LOSS_BURST=<n>
  * loses in Gilbert-Elliott bursts of mean length n (same average loss).
  * MEDIA_LOSS_RATE=gcc|gccd: the encoder follows a model of WebRTC's GCC
  * (bench/gcc_model.h; gccd without its loss-based part) instead of AnLiu's
  * target, and AnLiu's pace is capped at 2.5x the GCC target (WebRTC's pacer);
  * the transport, its window and FEC stay AnLiu's. Event "bw" sets
  * the bottleneck to extra_one_way_ms kbit/s for the event's duration.
- * The link has 100 ms queue depth and independent loss in both directions.
+ * The link has 100 ms queue depth by default and independent loss in both directions.
  * Timely media uses the original propagation delay as its minimum baseline;
  * an event's extra delay consumes that same delivery budget. A delivery pause
  * retains datagrams instead of adding random packet loss.
@@ -41,6 +44,16 @@ static void loss_dup(const anl_t *, const anl_stream_t *, uint32_t, int);
 #define ANL_TRACE_dup loss_dup
 static unsigned fec_counts[2][4];
 #define ANL_TRACE_fec_count(w, st, lost) do { if ((st)->tag <= 1 && (lost) >= 0 && (lost) < 4) fec_counts[(st)->tag][lost]++; } while (0)
+/* MEDIA_LOSS_LT=1: each completed policer-detection interval of the media sender, before its verdict */
+static int g_lt_trace = -1;
+#define ANL_TRACE_policer(w, dur, rate, loss, counted, after) do { \
+    if (g_lt_trace < 0) g_lt_trace = getenv("MEDIA_LOSS_LT") != NULL; \
+    if (g_lt_trace && !(after) && (w)->sent_wire > 0 && (rate) > 20000) \
+        printf("LTINT ms=%u lt=%d from=%u k=%u tail=%u bad=%d hold=%u rate=%u send=%u lt_rate=%u loss=%u counted=%u res=%u pace=%u\n", \
+               (w)->current, (w)->lt.state, (w)->lt.from, (w)->lt.k, (w)->lt.tail, (w)->lt.bad, (w)->lt.hold, (rate), \
+               (unsigned)((uint64_t)(uint32_t)((w)->sent_wire - (w)->lt.sent0) * 1000 / (dur)), (w)->lt.rate, (loss), (counted), \
+               (w)->lt.res, (w)->pace_rate); \
+} while (0)
 #include "anl_trace.h"
 #include "../anliu.c"
 #include "gcc_model.h"
@@ -53,6 +66,10 @@ static gcc_t g_gcc;
 static const anl_t *owner;
 static uint64_t first_bytes[2], retry_bytes[2], parity_bytes[2];
 static unsigned max_xmit[2][30001], latency_ms[2][30001], frame_bytes[2][30001];
+/* frames anl_stream_send_frame refused before this one (ANL_ETOOBIG: more
+   fragments than the window - a key frame near MEDIA_LOSS_VIDEO_MAX 20000);
+   a refused frame takes no frame number, the later ones arrive this many lower */
+static unsigned fno_lag[2][30001], refused[2];
 static unsigned sent_ms[2][30001], received_ms[2][30001];
 static unsigned blocks[2], small_blocks[2];
 static uint64_t block_data[2], block_parities[2];
@@ -181,6 +198,9 @@ int main(int argc, char **argv)
     if (getenv("MEDIA_LOSS_TBF_KB")) g_tbf_kb = atoi(getenv("MEDIA_LOSS_TBF_KB"));
     g_fast = interval == 10;
     lc.delay = rtt / 2; lc.bw_kbps = bw; lc.loss = loss / 100.0; lc.qdelay = 100;
+    if (getenv("MEDIA_LOSS_POLICER")) g_pol_kbps = atoi(getenv("MEDIA_LOSS_POLICER"));
+    if (getenv("MEDIA_LOSS_POLICER_KB")) g_pol_kb = atoi(getenv("MEDIA_LOSS_POLICER_KB"));
+    if (getenv("MEDIA_LOSS_QDELAY")) lc.qdelay = atoi(getenv("MEDIA_LOSS_QDELAY"));
     if (getenv("MEDIA_LOSS_BURST")) lc.burst = atof(getenv("MEDIA_LOSS_BURST"));
     sim_init(&s, &V_ANLF, &lc, 1000, g_seed);
     owner = s.e[0].anl;
@@ -250,7 +270,10 @@ int main(int argc, char **argv)
                 frame_bytes[i][f[i].seq] = (unsigned)len;
                 sent_ms[i][f[i].seq] = (unsigned)s.t;
                 drv_touch(&s, 0, now32(&s));
-                if (gen_one(&s, &f[i], len, key) < 0) errors++;
+                fno_lag[i][f[i].seq] = refused[i];
+                k = gen_one(&s, &f[i], len, key);
+                if (k == ANL_ETOOBIG) refused[i]++;
+                else if (k < 0) errors++;
                 if (drive_check) drv_rearm(&s, 0, now32(&s));
                 f[i].next_t = i ? (uint64_t)f[i].seq * 1000 / 30 : (uint64_t)f[i].seq * 20;
             }
@@ -269,7 +292,7 @@ int main(int argc, char **argv)
             int len;
             while ((len = ep_recv(&s.e[1], &f[i], g_buf, sizeof(g_buf), &fi)) >= 0) {
                 uint32_t seq = r32(g_buf);
-                if (!check_payload(g_buf, len, i) || seq >= 30001 || fi.frame_no != seq ||
+                if (!check_payload(g_buf, len, i) || seq >= 30001 || fi.frame_no + fno_lag[i][seq] != seq ||
                     (f[i].rcv_any && seq <= f[i].rcv_last)) { errors++; continue; }
                 f[i].rcv_any = 1; f[i].rcv_last = seq;
                 latency_ms[i][seq] = (uint32_t)s.t - r32(g_buf + 4) + 1;
@@ -367,10 +390,10 @@ int main(int argc, char **argv)
     }
     if (g_gcc.on) printf("GCCSUM overuses=%u decreases=%u\n", g_gcc.overuses, g_gcc.decreases);
     printf("DRIVE mode=%s updates_sender=%llu updates_receiver=%llu\n", drive_check ? "check" : order_legacy ? "1ms-legacy" : "1ms", drv_updates[0], drv_updates[1]);
-    printf("TOTAL wire=%llu queue_drop=%llu scale=%.3f gate_ms=%llu short_ms=%llu errors=%d pkts=%llu rev_wire=%llu rev_pkts=%llu\n",
+    printf("TOTAL wire=%llu queue_drop=%llu scale=%.3f gate_ms=%llu short_ms=%llu errors=%d pkts=%llu rev_wire=%llu rev_pkts=%llu too_big=%u\n",
         (unsigned long long)(s.d[0].bytes + s.d[0].pkts * IPUDP_HDR), (unsigned long long)s.d[0].lost_queue,
         scale_sum / (duration * 1000.0), (unsigned long long)gate_ms, (unsigned long long)short_ms, errors,
-        (unsigned long long)s.d[0].pkts, (unsigned long long)(s.d[1].bytes + s.d[1].pkts * IPUDP_HDR), (unsigned long long)s.d[1].pkts);
+        (unsigned long long)s.d[0].pkts, (unsigned long long)(s.d[1].bytes + s.d[1].pkts * IPUDP_HDR), (unsigned long long)s.d[1].pkts, refused[0] + refused[1]);
     ep_release(&s.e[0]); ep_release(&s.e[1]); dir_free(&s.d[0]); dir_free(&s.d[1]);
     return errors != 0;
 }

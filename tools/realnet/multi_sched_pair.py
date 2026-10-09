@@ -5,13 +5,15 @@ Usage: multi_sched_pair.py JOBFILE LOGDIR
 
 JOBFILE: one JSON object per line - snd rcv variant seed rate, optional loss,
 fixed (video per mille, no encoder feedback), unlimited, audio_only,
-audio_max_age, delay, burst, video_max, drive ("check"), charge (the
+audio_max_age, delay, burst, queue_ms, video_max, drive ("check"), tc_loss (loss by
+tc, true), fec_off (true), police (true: tc police at rate, bucket burst, in front of
+a line of `line` kbit, default 40000; charge it the line), charge (the
 bandwidth the job takes instead of rate - an unlimited round's real peak).
 
 Budget per host (hosts.py: cap_kbps, slots, pool): the concurrent jobs'
 rates stay 5 Mbit below cap_kbps, charged on the sender and the receiver;
 at most `slots` processes per pool (hosts on one machine share a pool).
-Consecutive jobs that differ only in variant form a group that starts
+Consecutive jobs that differ only in variant (or fec_off) form a group that starts
 together (both fit or neither starts) - baseline and candidate share the
 path at the same time - and is run again as a whole when any member fails
 (at most twice). The first start waits until no multi_round.py of an
@@ -46,8 +48,9 @@ def command(j):
             + ([str(j['fixed'])] if j.get('fixed') else []) + (['--loss', str(j['loss'])] if 'loss' in j else [])
             + (['--unlimited'] if j.get('unlimited') else []) + (['--audio-max-age', str(j['audio_max_age'])] if j.get('audio_max_age') else [])
             + (['--delay', str(j['delay'])] if j.get('delay') else []) + (['--audio-only'] if j.get('audio_only') else [])
-            + (['--video-max', str(j['video_max'])] if j.get('video_max') else []) + (['--burst', str(j['burst'])] if j.get('burst') else [])
-            + (['--drive-check'] if j.get('drive') == 'check' else []))
+            + (['--video-max', str(j['video_max'])] if j.get('video_max') else []) + (['--burst', str(j['burst'])] if j.get('burst') else []) + (['--queue-ms', str(j['queue_ms'])] if j.get('queue_ms') else [])
+            + (['--drive-check'] if j.get('drive') == 'check' else []) + (['--tc-loss'] if j.get('tc_loss') else [])
+            + (['--fec-off'] if j.get('fec_off') else []) + (['--police', '--line', str(j.get('line', 40000))] if j.get('police') else []))
 
 
 def one(j, k, attempt):
@@ -73,7 +76,9 @@ def run_group(g):
         for k, j in g: take(j, -1); running.remove(j)
 
 
-def key(j): return json.dumps({k: v for k, v in j.items() if k not in ('variant', 'port', 'audio_max_age')}, sort_keys=True)
+# a group: consecutive jobs that differ only in the variant or in fec_off (lanes
+# compared on the same path at the same time)
+def key(j): return json.dumps({k: v for k, v in j.items() if k not in ('variant', 'port', 'audio_max_age', 'fec_off')}, sort_keys=True)
 
 
 groups = []

@@ -28,6 +28,8 @@ export ANL_REALNET_HOSTS=~/realnet-hosts.json ANL_REALNET_WORK=~/realnet-work
 # 打包并部署两个版本（库取自 git 版本，测试工具取自工作区）
 python3 tools/realnet/deploy.py base  main
 python3 tools/realnet/deploy.py cand  WORKTREE
+# realnet.c 直接包含 anliu.c、读内部字段：旧版本的库可能无法和当前工具一起编译，对照时两个版本都用各自提交里的工具
+python3 tools/realnet/deploy.py base  44a963c --tools-from-rev
 
 # 单轮：发送端 a、接收端 b、变体、种子、限速 kbit、端口
 python3 tools/realnet/multi_round.py a b cand 901 2000 9900 --loss 5 --drive-check
@@ -36,16 +38,20 @@ python3 tools/realnet/multi_round.py a b cand 901 2000 9900 --loss 5 --drive-che
 python3 tools/realnet/multi_sched_pair.py jobs.jsonl sched-log/
 ```
 
-`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，默认 20）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。
+`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，默认 20）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE）、`--tc-loss`（`--loss` 改由 tc 在发送端两个方向丢包，应用内不丢）、`--fec-off`（关闭 FEC，只靠重传）、`--queue-ms MS`（TBF 的队列，默认 100）、`--police`（令牌桶限速器：tc police 按 RATE_KBPS 限速，桶为 `--burst`，默认 64 KB，超出即丢、不排队；它后面是 `--line KBPS` 的线路，默认 40000，即本频段的 TBF 及其 `--queue-ms` 队列），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。
 
-结果在 `$ANL_REALNET_WORK/results/<tag>.{json,srv,cli,bw}`；`analysis/` 里是 performance.md 各批次用过的成对分析脚本。
+测试用例（场景、轮次与通过规则）见 [docs/testcases/realnet](../../docs/testcases/realnet/README.md)。
+
+结果在 `$ANL_REALNET_WORK/results/<tag>.{json,srv,cli,bw}`，两个变体成对轮次的差值用 `multi_pair.py BASE CAND`（tc、TBF 与限速器之外的丢包超过发送数 2% 的轮次判为 SKIP）；
+
+TBF 不是限速器：tc 的 TBF 队列上限是"速率 × latency + 桶"，1 MB 桶就是 1 MB 的排队；加 `--delay` 时 netem 是 TBF 的子队列，队列又被 netem 的 limit 截断。要模拟"线速很高、按令牌限速、超出即丢"的网络，用 `--police`。`analysis/` 里是 performance.md 各批次用过的成对分析脚本。
 
 ## 流的打开与关闭（`churn_round.py`）
 
 `bench/churn.c` 在一条真实路径上不停地打开、关闭流，检验关闭握手（CLOSE 重发到对端回 RST，DESIGN 6.1）。两端各自保持最多 N 个本端打开的流（默认 31，两端合计 62 个加默认流不超过 64），按六种方式关闭：可靠流全部确认后关闭（对端必须读到全部消息再得到 `ANL_ECLOSED`）、半可靠流随时关闭、可靠流带在途数据关闭、接收方关闭、两端几乎同时关闭、打开后立即关闭。本端名额计入尚未确认的关闭，因此新开的流不应被对端以表满拒绝；被拒绝、消息缺失或错序、关闭未确认、结束时两端还有残留的流，都算失败。
 
 ```sh
-python3 tools/realnet/churn_round.py deploy close WORKTREE g5 rb        # 构建 churn
+python3 tools/realnet/churn_round.py deploy close WORKTREE g5 rb        # 构建 churn（旧版本的库加 --tools-from-rev）
 python3 tools/realnet/churn_round.py run g5 rb close 1 9850 --loss 5     # 600 s，31 个流，tc 双向 5% 丢包
 python3 tools/realnet/churn_round.py run g5 rb close 1 9850 --loss 5 --delay 100 --conc 12
 python3 tools/realnet/churn_ana.py                                       # 汇总 results/churn_*.json
@@ -53,7 +59,7 @@ python3 tools/realnet/churn_ana.py                                       # 汇�
 
 服务端用 `multi_tc.py` 独占一个频段：TBF 默认 8000 kbit（只是上限），`--loss` 两个方向随机丢包，`--delay` 增加单向时延。每端输出关闭确认时间的分布（从本端关闭到收到对端 RST）、被拒绝的打开数、对端读到的数据，以及结束时的检查（`CHURN_FINAL ok=1`：两端只剩默认流、没有待确认的关闭）。
 
-sid 会复用（DESIGN 6.1），每条消息因此带打开方的流编号（`uid`，本端打开次数的低 16 位）：接收方记下第一条消息的编号，之后编号不同的消息是同一 sid 上一代流的数据，记为 `gen_errors`。`CHURN_OPEN max_sid` 是本端用到的最大 sid，`CHURN_NET replays` 是路径重复的数据报（`ANL_EREPLAY`，不算错误）。连接在收到握手包时才创建，启动慢的客户端不会让服务端先空闲超时。
+每条消息带打开方的流编号（`uid`，本端打开次数的低 16 位）：接收方记下第一条消息的编号，之后编号不同的消息是另一个流的数据串入，记为 `gen_errors`（sid 在连接内不复用，DESIGN 6.1；2026-10-08 之前的版本复用 sid，这项检查针对上一代流）。`CHURN_OPEN max_sid` 是本端用到的最大 sid，`CHURN_NET replays` 是路径重复的数据报（`ANL_EREPLAY`，不算错误）。连接在收到握手包时才创建，启动慢的客户端不会让服务端先空闲超时。
 
 ## 与 SRT 对比（`srt/`）
 
@@ -69,6 +75,8 @@ g++ -O2 -static -x c tools/realnet/srt/srtnet.c -x none -Isrt-install/include -L
 python3 tools/realnet/srt/deploy_srt.py ./srtnet
 python3 tools/realnet/srt/cmp_round.py a b 2000 5 501 9960 --anl base   # AnLiu 与三种 SRT 配置同时运行
 python3 tools/realnet/srt/cmp_ana.py
+(cd tools/realnet/srt && python3 cmp_pair.py anl-nf anl-nf@cand --limits)   # 两个 AnLiu lane 的成对差值与回归限值
+python3 tools/realnet/capacity_probe.py a b 9940 2,4,8,12,16      # 批次前：发送端出口容量（主机表的 cap_kbps 可能过时）
 ```
 
 `cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；统计口径见 COMPARISON.md 2.1。

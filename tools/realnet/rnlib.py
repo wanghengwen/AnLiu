@@ -37,7 +37,17 @@ def ssh(h, command, timeout=45, check=True, retries=4):
 
 
 def upload(h, src, dst):
-    sp.run(['scp', '-q', '-o', 'BatchMode=yes', str(src), h['ssh'] + ':' + dst], check=True, timeout=120)
+    """scp, retried: a public sshd drops some new logins (MaxStartups), and an
+    upload can stall for minutes (2026-10-09: 128 KB timed out at 120 s to
+    two hosts, then took 5..8 s)"""
+    for attempt in range(4):
+        try:
+            # over ssh()'s master connection (SSH options without 'ssh -x'): no new login
+            sp.run(['scp', '-q'] + SSH[2:] + [str(src), h['ssh'] + ':' + dst], check=True, timeout=120)
+            return
+        except (sp.CalledProcessError, sp.TimeoutExpired):
+            if attempt == 3: raise
+            time.sleep(10 + 10 * attempt)
 
 
 def fetch(h, path, timeout=300):
@@ -70,10 +80,12 @@ def metrics(meta, s, c, manifest_files):
             if not re.search(r'^'+manifest_files[name]+r'\s+'+re.escape(label)+r'$',t,re.M): errors.append(f'{role} source mismatch {name}')
     ping=re.search(r'^PATH ping .*replies=(\d+)/20',c,re.M)
     if not ping or int(ping[1])==0: errors.append('zero/missing ping')
-    def start(t):
+    off=meta.get('clock_offset_us',{})
+    def start(t,role):
         m=re.search(r'^TIMEBASE event=traffic_start .*wall_us=(\d+)',t,re.M)
-        return int(m[1]) if m else None
-    if not start(s) or not start(c) or start(s)>start(c): errors.append('missing/late server start')
+        return int(m[1])-off.get(role,0) if m else None
+    ss,cs=start(s,'srv'),start(c,'cli')
+    if not ss or not cs or ss>cs: errors.append('missing/late server start')
     row={k:meta[k] for k in ['tag','sender','receiver','workload','rate_kbps','duration_s']}
     row['ping']=ping[0] if ping else None
     fec=re.search(r'^FECCOST total (.*)$',sender,re.M)
@@ -130,7 +142,8 @@ def more_metrics(meta,s,c,bw,row,errors):
  for role,t in [('sender',sender),('receiver',receiver)]:
   mm=re.search(r'^RXLOSS (.*)$',t,re.M)
   conf=re.search(r'^RXLOSS_CONFIG probability_pct=(\S+)',t,re.M)
-  if not mm or not conf or float(conf[1])!=meta['loss_pct']:
+  want=0 if meta.get('tc_loss') else meta['loss_pct']   # tc drops the datagrams before realnet sees them
+  if not mm or not conf or float(conf[1])!=want:
    errors.append(f'{role} RXLOSS configuration/counters missing');continue
   v=fields(mm[1]);n=int(v['proto_packets']);d=int(v['dropped_packets'])
   losses[role]=dict(packets=n,dropped=d,observed_pct=round(100*d/max(1,n),3))

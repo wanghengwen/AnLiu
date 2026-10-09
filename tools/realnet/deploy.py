@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Package a variant and deploy it to the test hosts.
 
-Usage: deploy.py VARIANT REV [HOST ...]
+Usage: deploy.py VARIANT REV [--tools-from-rev] [HOST ...]
 
 The library (anliu.c, anliu.h) is taken from git revision REV ("WORKTREE":
 the working tree); the test tool (bench/realnet.c, ikcp, the diagnostics
-headers) from the working tree. The variant goes to ANL_REALNET_WORK/VARIANT
+headers) from the working tree, or with --tools-from-rev from REV as well
+(realnet.c reaches into the library's internals, so an older library may
+not build with the current tool; a header the revision lacks is left out). The variant goes to ANL_REALNET_WORK/VARIANT
 (src/, deployment-manifest.json, src.tgz) and to every host (or those named)
 under base/ANL_REALNET_REMOTE_DIR/VARIANT, where realnet_trace is built
 (-DREALNET_INTERNAL: TRACE lines show BBR internals) and the sources are
@@ -15,20 +17,29 @@ import hosts as H
 import rnlib as R
 
 REPO = H.Path(__file__).resolve().parents[2]
-TOOL = ['bench/realnet.c', 'bench/ikcp.c', 'bench/ikcp.h', 'bench/fec_diag.h', 'bench/tx_diag.h']
+TOOL = ['bench/realnet.c', 'bench/ikcp.c', 'bench/ikcp.h', 'bench/fec_diag.h', 'bench/tx_diag.h', 'bench/anl_trace.h']
 
 
 def git_file(rev, path):
-    if rev == 'WORKTREE': return (REPO / path).read_bytes()
-    return sp.run(['git', '-C', str(REPO), 'show', f'{rev}:{path}'], capture_output=True, check=True).stdout
+    """the file at REV, None when the revision has no such file"""
+    if rev == 'WORKTREE':
+        f = REPO / path
+        return f.read_bytes() if f.exists() else None
+    r = sp.run(['git', '-C', str(REPO), 'show', f'{rev}:{path}'], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
 
 
-def package(variant, rev):
+def package(variant, rev, tool_rev='WORKTREE'):
     d = H.WORK / variant; src = d / 'src'
     (src / 'bench').mkdir(parents=True, exist_ok=True)
-    for p in ('anliu.c', 'anliu.h'): (src / p).write_bytes(git_file(rev, p))
-    for p in TOOL: (src / p).write_bytes((REPO / p).read_bytes())
-    files = {p: hashlib.sha256((src / p).read_bytes()).hexdigest() for p in ['anliu.c', 'anliu.h'] + TOOL}
+    have = []
+    for p in ['anliu.c', 'anliu.h'] + TOOL:
+        data = git_file(rev if p.startswith('anliu') else tool_rev, p)
+        if data is None:
+            if p in ('anliu.c', 'anliu.h', 'bench/realnet.c'): raise SystemExit(f'{p} missing')
+            (src / p).unlink(missing_ok=True); continue
+        (src / p).write_bytes(data); have.append(p)
+    files = {p: hashlib.sha256((src / p).read_bytes()).hexdigest() for p in have}
     desc = 'working tree' if rev == 'WORKTREE' else sp.run(['git', '-C', str(REPO), 'log', '-1', '--format=%h %s', rev],
                                                             capture_output=True, text=True, check=True).stdout.strip()
     (d / 'deployment-manifest.json').write_text(json.dumps(dict(revision=desc, time=datetime.datetime.now().astimezone().isoformat(),
@@ -49,9 +60,12 @@ def deploy(h, variant, files):
 
 
 if __name__ == '__main__':
-    variant, rev = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    tools_from_rev = '--tools-from-rev' in args
+    if tools_from_rev: args.remove('--tools-from-rev')
+    variant, rev = args[0], args[1]
     hosts = H.load()
-    names = sys.argv[3:] or list(hosts)
-    files = package(variant, rev)
+    names = args[2:] or list(hosts)
+    files = package(variant, rev, rev if tools_from_rev else 'WORKTREE')
     with cf.ThreadPoolExecutor(len(names)) as ex:
         for line in ex.map(lambda n: deploy(hosts[n], variant, files), names): print(line)

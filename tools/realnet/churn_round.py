@@ -2,9 +2,10 @@
 """Stream open/close churn on a real path (bench/churn.c): the close
 handshake, the places it holds and what the peer reads, under tc loss/delay.
 
-  churn_round.py deploy VARIANT REV HOST...
+  churn_round.py deploy VARIANT REV [--tools-from-rev] HOST...
       package anliu.c / anliu.h from git REV ("WORKTREE": the working tree) and
-      bench/churn.c from the working tree; build `churn` on the hosts
+      bench/churn.c from the working tree (--tools-from-rev: from REV too, for a
+      library the current churn.c does not build with); build `churn` on the hosts
   churn_round.py run SERVER CLIENT VARIANT SEED PORT [--loss PCT] [--delay MS]
       [--conc N] [--dur S] [--rate KBPS]
       one round: the server (a host that can shape) gets its own multi_tc.py
@@ -21,20 +22,30 @@ import rnlib as R
 
 HERE = H.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-FILES = ['anliu.c', 'anliu.h', 'bench/churn.c']
+FILES = ['anliu.c', 'anliu.h', 'bench/churn.c', 'bench/anl_trace.h']   # anl_trace.h: when the revision has it
 
 
 def git_file(rev, path):
-    if rev == 'WORKTREE' or path.startswith('bench/'): return (REPO / path).read_bytes()
-    return sp.run(['git', '-C', str(REPO), 'show', f'{rev}:{path}'], capture_output=True, check=True).stdout
+    """the file at REV, None when the revision has no such file"""
+    if rev == 'WORKTREE':
+        f = REPO / path
+        return f.read_bytes() if f.exists() else None
+    r = sp.run(['git', '-C', str(REPO), 'show', f'{rev}:{path}'], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
 
 
-def deploy(variant, rev, names):
+def deploy(variant, rev, names, tools_from_rev=False):
     hs = H.load()
     d = H.WORK / variant; src = d / 'src'
     (src / 'bench').mkdir(parents=True, exist_ok=True)
-    for p in FILES: (src / p).write_bytes(git_file(rev, p))
-    files = {p: hashlib.sha256((src / p).read_bytes()).hexdigest() for p in FILES}
+    have = []
+    for p in FILES:
+        data = git_file(rev if p.startswith('anliu') or tools_from_rev else 'WORKTREE', p)
+        if data is None:
+            if p != 'bench/anl_trace.h': raise SystemExit(f'{p} missing')
+            (src / p).unlink(missing_ok=True); continue
+        (src / p).write_bytes(data); have.append(p)
+    files = {p: hashlib.sha256((src / p).read_bytes()).hexdigest() for p in have}
     desc = 'working tree' if rev == 'WORKTREE' else sp.run(['git', '-C', str(REPO), 'log', '-1', '--format=%h %s', rev],
                                                             capture_output=True, text=True, check=True).stdout.strip()
     (d / 'deployment-manifest.json').write_text(json.dumps(dict(revision=desc, time=datetime.datetime.now().astimezone().isoformat(),
@@ -130,9 +141,10 @@ def run(argv):
         for h, rd in ((S, RS), (C, RC)):
             if h is S and R.ssh(h, f"(ss -uan 2>/dev/null || netstat -an -p udp) | grep -E '[:.]{port}[[:space:]]' || true").stdout.strip():
                 raise RuntimeError(f"{h['name']} port {port} busy")
+            want = [f for f in FILES if f in manifest['files']]
             got = R.ssh(h, f'cd {rd}/src && python3 -c "import hashlib,sys;[print(hashlib.sha256(open(f,\'rb\').read()).hexdigest()) for f in sys.argv[1:]]" '
-                           + ' '.join(FILES)).stdout.decode().split()
-            if got != [manifest['files'][f] for f in FILES]: raise RuntimeError(f"{h['name']} source mismatch")
+                           + ' '.join(want)).stdout.decode().split()
+            if got != [manifest['files'][f] for f in want]: raise RuntimeError(f"{h['name']} source mismatch")
         R.upload(S, HERE / 'multi_tc.py', f'{RS}/multi_tc.py')
         started = True
         out = R.ssh(S, tcbase + ' setup' + tcargs).stdout.decode()
@@ -198,6 +210,9 @@ def run(argv):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == 'deploy': deploy(sys.argv[2], sys.argv[3], sys.argv[4:])
+    if len(sys.argv) > 1 and sys.argv[1] == 'deploy':
+        a = sys.argv[2:]; tr = '--tools-from-rev' in a
+        if tr: a.remove('--tools-from-rev')
+        deploy(a[0], a[1], a[2:], tr)
     elif len(sys.argv) > 1 and sys.argv[1] == 'run': run(sys.argv[2:])
     else: raise SystemExit(__doc__)
