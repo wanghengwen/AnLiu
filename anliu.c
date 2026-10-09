@@ -3446,16 +3446,24 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
            round: measured worse on shared bottlenecks.) */
         if (w->min_rtt > 0 && w->lt.state == 0 && send_el > 0 && send_el >= (int32_t)(w->min_rtt / 2) && w->last_rtt > 0 &&
             (uint32_t)w->last_rtt <= bbr_rtt(w) + umax32(bbr_rtt(w) / 16, 3)) {
-            /* data against data: the parities are in the send rate in full
+            /* What was lost is the bytes sent over the sample's send interval
+               less those delivered, not the send rate over the delivery rate:
+               a burst (a key frame) leaves at up to the STARTUP gain and the
+               bottleneck spreads it out, so its send interval is a fraction
+               of its ACKs' - the rates differed by 2.9x without any loss, its
+               first ACKs came back before the queue it built, and the credit
+               put the estimate at 1.1..1.4x the link at 200..300 ms
+               (closed-loop encoder, no random loss), which the STARTUP gain
+               then tripled (TUNING.md 54).
+               data against data: the parities are in the send rate in full
                but in the delivery rate only as their fec_share credit - at a
                high ratio the difference alone passed for loss, and on a
                shallow queue (overflow shows no queue) the estimate rose
                above the link, 323..362 KB/s on 250 (real network) */
             uint64_t dd = w->delivered - rs->prior_delivered;
-            uint64_t sr = (uint64_t)(rs->sent - umin32(rs->par, rs->sent)) * 1000 / (uint32_t)send_el;
-            uint64_t dr = dd * 1000 / interval;
-            if (dr > 0 && sr > dr) {
-                uint64_t credit = bw * sr / dr;
+            uint64_t sb = rs->sent - umin32(rs->par, rs->sent);
+            if (dd > 0 && sb > dd) {
+                uint64_t credit = bw * sb / dd;
                 if (credit > bw * 3 / 2) credit = bw * 3 / 2;
                 bw = credit;
             }
@@ -3477,8 +3485,18 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
            after a network-limited sample - no STARTUP-gain headroom for
            BBR_BW_ROUNDS (bbr_headroom) (TUNING.md 30) */
         if (rs->app_limited && w->min_rtt > 0 && w->last_rtt > 0 &&
-            (uint32_t)w->last_rtt > bbr_rtt(w) + umax32(bbr_rtt(w) / 4, 5))
+            (uint32_t)w->last_rtt > bbr_rtt(w) + umax32(bbr_rtt(w) / 4, 5)) {
             w->net_round = w->round_count | 1;
+            /* ... and ends STARTUP: an encoder following target_rate keeps
+               the sender app-limited, and the bandwidth plateau counts only
+               network-limited rounds - STARTUP never ended, every key frame
+               went out at 2.9x the path into its queue (closed loop 2 Mbit
+               200 ms: video on time 70%, key frames 24%). Once a
+               network-limited sample has been seen (test_pacing: not on the
+               initial window's own queue) (TUNING.md 53) */
+            if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && w->net_sample_ts != 0)
+                w->full_bw_reached = 1;
+        }
         if (!rs->app_limited) { w->round_net_sample = 1; w->net_round = w->round_count | 1; w->net_sample_ts = w->current | 1; }
         if (!rs->app_limited || bw >= w->btl_bw) {
             if (bw > *slot) *slot = (uint32_t)bw;

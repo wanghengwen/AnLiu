@@ -320,3 +320,15 @@ Not while capacity is short and the path is losing what is sent (rate_update): t
 `anliu.c`: handle_report, handle_ack
 
 Before the peer's first report the sender counts an original acknowledged after a higher sn (and a RACK mark the original's ACK proves wrong) as a loss: rebuilt from parity, or reordered - it cannot tell. On a reordering path without loss (unit test, 60..110 ms jitter) one reordered packet at 1.27 s, 10 ms before the first report, made the first window (50 packets) read 2%; the warm-up takes a higher measurement as it is and the later windows smooth by a quarter, so the estimate was still 0.85% at 15 s (the gate closes below 0.25%). It took a STARTUP change's timing to put the packet there. Now these counts are provisional per stream: at the first report, while their window is still open, no more of them stay than the rebuilds it reports (net of rebuilds whose original came after all). The report stays a baseline - nothing is added from it. Media regression (ASan, 24 scenarios): output unchanged.
+
+## 53. a queued app-limited sample ends STARTUP
+
+`anliu.c`: bbr_on_ack
+
+An encoder following target_rate keeps the sender app-limited, and STARTUP's bandwidth plateau counts only network-limited rounds: STARTUP never ended, and every key frame went out at the STARTUP gain (2.9x the path) into its queue (closed loop, 2 Mbit, 200 ms: video on time 70%, key frames 24%). An app-limited sample that came back queued (TUNING.md 30) has filled the path: it ends STARTUP too, once a network-limited sample has been seen (not on the initial window's own queue, test_pacing).
+
+## 54. the loss credit in bytes
+
+`anliu.c`: bbr_on_ack
+
+The send-rate credit (a sample with loss counts what was sent, not only what was delivered, so random loss does not drag the estimate down) took the send rate over the delivery rate. A burst (a key frame) leaves at up to the STARTUP gain and the bottleneck spreads it out: its send interval is a fraction of its ACKs', the two rates differed by 2.9x without any loss, and the credit put the estimate at 1.1..1.4x the link at 200..300 ms (closed loop, no random loss), which the STARTUP gain then tripled. Now the bytes sent over the sample's send interval against those delivered, capped at 1.5x as before. Simulation (FIFO, TBF and policers) and real network (F>G, emulated policer and TBF, 14 pairs against the previous version): audio +0.11 +-0.23, video -0.18 +-1.21, key frames -0.39 +-1.82 points, on-time video bitrate -0.00 +-1.13% - no regression.
