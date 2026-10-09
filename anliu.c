@@ -711,7 +711,7 @@ struct anl_s {
     uint64_t prx_bytes, prx_ms;         /* sender: what arrived at the peer by its reports, and over how
                                            much of its time (ms) - deltas of the newest reports */
     uint32_t prx_last, prx_ts, prx_at, prx_echo;  /* count, peer time, local arrival, echoed local time */
-    int prx_valid;
+    uint8_t prx_valid;
     uint64_t delivered_fec;             /* parity bytes counted with them (fec_share): rate samples only */
     uint32_t delivered_ts;              /* time of the last acknowledgement */
     uint32_t first_sent_ts;             /* send time of the packet starting the sampling interval */
@@ -1404,7 +1404,7 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
     r->frames_skipped = dec16(&p);
     r->fec_recovered = dec16(&p);
     r->rx_bytes = dec32(&p);
-    echo = w->current + (uint32_t)(int32_t)(int16_t)(uint16_t)(dec16(&p) - (uint16_t)w->current);
+    echo = extend16(dec16(&p), w->current);
     if (!w->prx_valid || tdiff(ts, w->prx_ts) > 0) {
         /* the connection's count, in every stream's reports: the newest by
            the peer's clock moves it on; an older one (another stream's,
@@ -2615,11 +2615,25 @@ static void bbr_reset_filter(anl_t *w, uint32_t rate)
     w->bw_lo = 0;
 }
 
-/* A receive-only peer has no ACK RTT and reports at RTO_DEF, even when
-   our own measured RTT is much shorter. */
+/* How old a report may be and still count as recent: its period is
+   max(srtt, REPORT_MIN_MS), but a receive-only peer has no ACK RTT of its
+   own and reports at RTO_DEF (200 ms), even when our RTT is much shorter */
 static uint32_t bbr_report_age(const anl_t *w)
 {
-    return umax32(srtt_or_def(w), umax32(RTO_DEF, REPORT_MIN_MS));
+    return umax32(srtt_or_def(w), RTO_DEF);
+}
+
+/* the newest report arrived within that age */
+static int bbr_report_fresh(const anl_t *w)
+{
+    return tdiff(w->current, w->prx_at) <= (int32_t)bbr_report_age(w);
+}
+
+/* the pace the policer detector sets (compute_pace_rate): the rate while
+   testing or policed, the step while probing; 0 while only watching */
+static uint32_t bbr_lt_pace(const anl_t *w)
+{
+    return w->lt.state == 3 ? bbr_lt_probe_rate(w) : w->lt.state != 0 ? w->lt.rate : 0;
 }
 
 static void bbr_lt_begin(anl_t *w, int transition)
@@ -2631,8 +2645,10 @@ static void bbr_lt_begin(anl_t *w, int transition)
     w->lt.sent0 = w->sent_wire;
     w->lt.infl0 = bbr_inflight_bytes(w);
     if (transition) w->lt.pace_ts = w->current;
-    w->lt.prx_valid = w->prx_valid && tdiff(w->prx_echo, w->lt.pace_ts) >= 0 &&
-        tdiff(w->current, w->prx_at) <= (int32_t)bbr_report_age(w);
+    /* after a pace change no report has seen the new pace yet: the first
+       one that has is the baseline (handle_report) */
+    w->lt.prx_valid = !transition && w->prx_valid && tdiff(w->prx_echo, w->lt.pace_ts) >= 0 &&
+        bbr_report_fresh(w);
     w->lt.prx_b0 = w->prx_bytes;
     w->lt.prx_ms0 = w->prx_ms;
     ANL_TRACE(policer_begin, w);
@@ -2640,8 +2656,7 @@ static void bbr_lt_begin(anl_t *w, int transition)
 
 static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
 {
-    uint32_t dur, rate, loss, counted, prior_rate, prior_k;
-    int prior_state;
+    uint32_t dur, rate, loss, counted, prior_pace;
     if (w->lt.ts == 0) {
         bbr_lt_begin(w, 1);
     }
@@ -2704,10 +2719,16 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
        without sufficient report coverage (TUNING.md 56, 57) */
     {
         uint64_t ms = w->prx_ms - w->lt.prx_ms0;
-        int fresh = w->lt.prx_valid && ms * 2 >= dur && ms <= dur + bbr_report_age(w) &&
-                    tdiff(w->current, w->prx_at) <= (int32_t)bbr_report_age(w);
+        int fresh = w->lt.prx_valid && ms * 2 >= dur && ms <= dur + bbr_report_age(w) && bbr_report_fresh(w);
         rate = fresh ? sat32((w->prx_bytes - w->lt.prx_b0) * 1000 / ms) : sat32(w->lt.rd * 1000 / dur);
+        /* the peer's count is not checked against anything else: not above
+           twice what was sent here meanwhile (a peer can only receive what
+           was sent; twice leaves room for the reports' lag) */
+        if (fresh) rate = umin32(rate, sat32((uint64_t)(uint32_t)(w->sent_wire - w->lt.sent0) * 2000 / dur));
     }
+    /* Two bases: the rate may be the reports' (what arrived), counted and
+       loss below are ACK-based (what was acknowledged and marked lost), and
+       the test's supply is what was sent here - TUNING.md 56, 57 */
     counted = w->lt.rd + w->lt.lost > 0 ? (uint32_t)(w->lt.lost * 1000 / (w->lt.rd + w->lt.lost)) : 0;
     /* The interval's loss from what it sent and what was delivered - what is
        still in flight at its end was sent but could not be delivered yet,
@@ -2723,7 +2744,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     }
     /* the completed interval before the decision, and (below) after it while
        its counters are still intact */
-    prior_state = w->lt.state; prior_rate = w->lt.rate; prior_k = w->lt.k;
+    prior_pace = bbr_lt_pace(w);
     ANL_TRACE(policer, w, dur, rate, loss, counted, 0);
     if (w->lt.state != 3) w->lt.queue = 0;
     if (w->lt.state != 2) w->lt.res_low = 0;
@@ -2764,9 +2785,14 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            random loss does not halve at any rate, and the probe that
            follows measures the ceiling (TUNING.md 55) */
         uint64_t sent = w->sent_wire - w->lt.sent0;
-        int fed = w->lt.from != 2 ? sent * 2000 >= (uint64_t)w->lt.rate * dur
-                                  : !(w->lt.bad & 2) && sent * 8000 / 7 >= (uint64_t)w->lt.rate * dur;
-        if (loss * 2 < w->lt.ref_loss && (!(w->lt.bad & 1) || fed) && (w->lt.from != 2 || fed)) {
+        /* supplied: enough was sent to judge the test - half its rate for
+           the initial one (an app-limited encoder), 7/8 and no queue for a
+           retest; a verdict needs a network-limited interval or a supplied
+           one, a retest always a supplied one */
+        int supplied = w->lt.from != 2 ? sent * 2000 >= (uint64_t)w->lt.rate * dur
+                                       : !(w->lt.bad & 2) && sent * 8000 / 7 >= (uint64_t)w->lt.rate * dur;
+        int verdict_ok = w->lt.from == 2 ? supplied : !(w->lt.bad & 1) || supplied;
+        if (loss * 2 < w->lt.ref_loss && verdict_ok) {
             /* what is still lost at the policer's rate is random loss: send
                that much more, or random loss on top would pace below the
                rate. The smaller of the two measures: what was sent includes
@@ -2786,7 +2812,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
             w->lt.skip = 1;
             if (w->lt.span == 0) w->lt.span = BBR_LT_SPAN;
         }
-        else if (w->lt.from == 1 && !fed && (w->lt.bad & 1) && !(w->lt.bad & 2) && !w->lt.feed_wait) {
+        else if (w->lt.from == 1 && !supplied && (w->lt.bad & 1) && !(w->lt.bad & 2) && !w->lt.feed_wait) {
             /* A short test can fall between key frames after the encoder
                has cut back. Keep this same test pace for one more interval
                before giving it up; never extend an above-rate probe. */
@@ -2820,7 +2846,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
             w->lt.state = 0;
             /* an app-limited interval short of half the rate is no verdict:
                a short hold, not the 48 intervals of a random-loss verdict */
-            w->lt.hold = (w->lt.bad & 1) && !fed ? BBR_LT_SPAN : 48;
+            w->lt.hold = (w->lt.bad & 1) && !supplied ? BBR_LT_SPAN : 48;
             /* the loss is random: the estimate from before the test stands
                for another filter window (the test's samples, paced at the
                rate, had taken the filter down to it - heavy20 video on time
@@ -3004,8 +3030,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         w->lt.prev_rate = 0;
     }
     ANL_TRACE(policer, w, dur, rate, loss, counted, 1);
-    bbr_lt_begin(w, w->lt.skip || prior_state != w->lt.state ||
-                   prior_rate != w->lt.rate || prior_k != w->lt.k);
+    bbr_lt_begin(w, bbr_lt_pace(w) != prior_pace);
 }
 
 /* The RTT the model works with: min_rtt, but not below the update interval.
@@ -3647,6 +3672,15 @@ static void update_ack(anl_t *w, int32_t rtt)
 /* una + SACK ranges (DESIGN 5.3), then RACK loss detection (DESIGN 6.3).
  * rng holds n (gap, len) pairs. Returns the number of segments acknowledged;
  * *lost counts the segments newly declared lost. */
+/* a loss counted from ACK order before the peer's first report: provisional
+   for the estimate window it is in (handle_report) */
+static void fl_prov_add(anl_t *w, anl_stream *st)
+{
+    if (st->fl_prov_win != w->fl_win) st->fl_prov = 0;
+    st->fl_prov++;
+    st->fl_prov_win = w->fl_win;
+}
+
 static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint16_t wnd,
                       uint32_t ts_echo, const uint32_t *rng, uint32_t n, int *lost, bbr_sample *rs)
 {
@@ -3696,9 +3730,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                         /* before the first report the mark stays, until the
                            report says whether it was rebuilt (handle_report) */
                         else if (st->fec && !st->peer_rp.valid) {
-                            if (st->fl_prov_win != w->fl_win) st->fl_prov = 0;
-                            st->fl_prov++;
-                            st->fl_prov_win = w->fl_win;
+                            fl_prov_add(w, st);
                         }
                     }
                     /* acknowledged after a higher sn was (the last ACK's high
@@ -3709,9 +3741,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                     else if (s->xmit == 1 && st->fec && !st->peer_rp.valid && st->rack_valid &&
                              tdiff(s->sn, st->rack_hi) < 0) {
                         /* until a first report says otherwise (handle_report) */
-                        if (st->fl_prov_win != w->fl_win) st->fl_prov = 0;
-                        st->fl_prov++;
-                        st->fl_prov_win = w->fl_win;
+                        fl_prov_add(w, st);
                         fec_loss_add(w, 0, 1, 0);
                     }
                 }
@@ -4137,8 +4167,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
                 sid_hold(w, sid);
                 rstq_push(w, sid);
                 urgent = 1;
-            } else if (sub == CTRL_REPORT) {
-                if (blen != REPORT_BODY) return ANL_EFORMAT;
+            } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
                 st = stream_for_input(w, sid);
                 if (st) handle_report(w, st, p, ts);
             } else if (sub == CTRL_ECHO && blen >= ECHO_BODY && w->updated) {

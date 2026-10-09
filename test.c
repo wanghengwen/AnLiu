@@ -3120,10 +3120,20 @@ static void test_bbr_report_intervals(void)
     bbr_policer(w, 150000, 100000, 0);
     CHECK(w->lt.prev_rate == 500000, "idle time is not a measurement of the resumed path (%u)", w->lt.prev_rate);
 
-    p = plain_hdr(buf, NULL, w->conv, ANL_VERSION << 6, 20400);
-    p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, 16);
-    memset(p, 0, 16); p += 16;
-    CHECK(anl_input_plain(w, buf, (long)(p - buf)) == ANL_EFORMAT, "REPORT requires all 22 bytes");
+    /* a short REPORT is skipped like any short control segment: the rest
+       of the datagram (here a full REPORT) still counts */
+    {
+        uint32_t last0 = w->prx_last, ts0 = w->prx_ts;
+        p = plain_hdr(buf, NULL, w->conv, ANL_VERSION << 6, 20400);
+        p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, 16);
+        memset(p, 0, 16); p += 16;
+        p = enc_sid(p, SEG_CTRL, s->sid); p = enc8(p, CTRL_REPORT); p = enc_varint(p, REPORT_BODY);
+        memset(p, 0, REPORT_BODY - 6); p += REPORT_BODY - 6;
+        p = enc32(p, 16100000); p = enc16(p, (uint16_t)w->current);
+        CHECK(anl_input_plain(w, buf, (long)(p - buf)) == 0, "a short REPORT is skipped, not a format error");
+        CHECK(w->prx_last == 16100000 && w->prx_ts != ts0 && last0 != w->prx_last,
+              "the full REPORT after it in the same datagram still counts (%u)", w->prx_last);
+    }
     anl_release(w);
 }
 
