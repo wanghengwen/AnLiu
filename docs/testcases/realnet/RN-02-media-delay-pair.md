@@ -2,7 +2,7 @@
 id: RN-02
 title: 低 RTT 路径加 tc 时延，关闭 FEC，媒体成对对照
 kind: agent
-where: 低 RTT 路径（t1→g5 或 g5→t1；曾用 zjg→t1）
+where: 低 RTT 路径（t1→g5 或 g5→t1；曾用 zjg→t1，zjg 已于 2026-10-09 下线）
 automation: tools/realnet/srt/cmp_round.py 跑轮次；判定用 cmp_pair.py --limits 加本文规则
 duration: 约 1.5 小时（两条链并行，每条 7 轮）
 last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→g5，16 对，`LIMITS OK`；音频 −0.37 [−1.24, +0.49]、视频 −0.06、可解码 −0.36、关键帧 −0.18 个百分点，线上带宽 +0.51%；+100 ms 15% 一个场景按规则加种子重跑，见基准）

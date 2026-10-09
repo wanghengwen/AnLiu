@@ -25,7 +25,7 @@
 
 ## `test.c` 的内容（UT-01）
 
-按 `main` 中的运行顺序分组列出。`test_fec_capacity_recovery` 从本次运行的种子开始取随机数，不受前面测试的影响。`test_fec_buffers_release` 放在最后。
+按 `main` 中的运行顺序分组列出。`test_fec_capacity_recovery` 从本次运行的种子开始取随机数，不受前面测试的影响。新测试加在 `test_fec_buffers_release` 之后（目前是 `test_echo_clock_rate`），以免扰动它之前各测试的随机序列。
 
 | 组 | 测试 | 检查什么 |
 |---|---|---|
@@ -38,8 +38,15 @@
 | FEC | `test_fec_*`、`test_latency_rtt`、`test_report_late_clock`、`test_review_gf_tables` | 自动 FEC 的门、预算、丢失估计、容量门、伪修复；缓存释放（DESIGN 8.7）；GF 表 |
 | 拥塞控制 | `test_start_rate` `test_bbr_*` `test_tiny_rtt` `test_target_rate*` `test_delay_report` `test_rtt_stale_ack` `test_start_absent` | 起步、交付窗口、应用受限、限速器检测、目标码率 |
 | 断网与判死 | `test_outage` `test_rack_repeat_backoff` | 断网恢复；RACK 反复判丢的可靠重传要退避，不能在对端还在应答时判死 |
+| 报告与送达计量 | `test_report_rx_bytes` `test_report_rx_count` `test_bbr_policer_reports` `test_bbr_report_intervals` `test_report_epoch_wrap` `test_report_capacity_recovery` | REPORT 的 `rx_bytes`：只用对端时间更新的报告推进，乱序、重复、丢失与回绕；无丢包时接收计数等于 `sent_wire`；限速器检测用报告速率（覆盖不足时按 ACK）、一次重测；报告缺失、跨变速的迟到快照、短 REPORT 被跳过；浅 FIFO 的容量恢复（种子 9、10） |
 
 新增测试时，在对应的组里加上它的名字。
+
+### 报告送达计量与容量恢复回归的补充说明
+
+`test_bbr_report_intervals` / `test_report_epoch_wrap` 检查报告缺失、跨变速的迟到快照、恢复报告和发送端时间戳回绕；REPORT 固定 22 字节，更短的 REPORT 与其它过短的控制段一样跳过，同一数据报里其后的段照常处理。
+
+`test_report_capacity_recovery` 固定覆盖种子 10 / 10% 与种子 9 / 15% 的浅 FIFO 容量恢复，不放宽原有恢复断言。扩展扫描 `ANL_TEST_SEED=1..25 ANL_TEST_ONLY=fec_capacity_recovery` 时，种子 7 / 10% 仍有基线同样的最终 10 秒内 626 ms shortage 失败，必须单独记录，不能声称整个多种子扫描全通过。
 
 ## Sanitizer 构建（SAN-01）
 

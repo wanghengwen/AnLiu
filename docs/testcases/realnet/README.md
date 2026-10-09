@@ -30,7 +30,7 @@ R=~/workspace/AnLiu_github/tools/realnet
 
 | 类别 | RTT | 用途 | 例（主机表中的名字） |
 |---|---|---|---|
-| 低 RTT | ≈1 ms | 加 tc 时延做受控时延（RN-02） | t1→g5、g5→t1（曾用 zjg→t1） |
+| 低 RTT | ≈1 ms | 加 tc 时延做受控时延（RN-02） | t1→g5、g5→t1（曾用 zjg→t1，zjg 已于 2026-10-09 下线） |
 | 内网 | <1 ms | 约 90 Mbit，做瓶颈与闭环（RN-05） | F→G（G 为 macOS 客户端；F 只能被 G 访问） |
 | 中 RTT 广域网 | ≈99 ms | RN-03、RN-04 | rb→t1、t1→rb、g5→rb |
 | 长 RTT 广域网 | ≈167 ms | RN-03 | g5→hz |

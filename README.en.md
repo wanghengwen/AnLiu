@@ -96,7 +96,7 @@ anl_set_rate_callback(w, on_rate);
 
 Compared with using `bw_estimate` directly, it does three more things: when application-limited (the encoder sends less than the estimate) with no queuing, the target rises by at most 25% per second so the encoder probes gradually; normal increases are capped at 25% per second, and sustained delivery-limited periods may recover within the measured delivery bound; when RTT shows the bottleneck is queuing, it drops immediately to the actual delivery rate — after a sudden bandwidth drop, before the encoder has caught up, semi-reliable data can expire before being acknowledged and BBR gets no samples for seconds, but RTT still reveals the queue. Comparison results are in [performance.md](performance.md).
 
-**Receiver delay feedback** (DESIGN 6.9): every `max(srtt, 100 ms)` the receiver of a semi-reliable stream reports the measured jitter, queuing delay, frame delay (from the first fragment sent to the whole frame received, minus propagation delay), completed frames and skipped frames back to the sender:
+**Receiver delay feedback** (DESIGN 6.9): every `max(srtt, 100 ms)` the receiver of a stream (both modes, on by default) reports the measured jitter, queuing delay, frame delay (from the first fragment sent to the whole frame received, minus propagation delay), completed frames and skipped frames back to the sender:
 
 ```c
 anl_stream_stats ss;

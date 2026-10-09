@@ -106,7 +106,7 @@ anl_set_accept(w, on_accept);
 
 - `anl_get_stats`：`target_rate`（编码器码率）、`capacity_short`（链路容量低于媒体，自适应 FEC 暂停）、`srtt` / `min_rtt`。
 - `anl_stream_get_stats`：发送端 `fec_ratio`（自动模式开门时的名义比例，0 表示当前不发校验包）、`frames_dropped`（发送端放弃的帧）；接收端 `frames_skipped`、`fec_recovered`、`frames_discarded`（`rcv_drop_until_key` 丢弃的不可解码帧）。
-- `peer` / `rx` 时延报告（`report = 1`，半可靠流默认开启；自适应 FEC 用它估计丢包，不要关）：`frame_delay_max_ms` 接近 B 说明在预算边缘。
+- `peer` / `rx` 时延报告（`report = 1`，两种流默认都开启；自适应 FEC 用它估计丢包，限速器检测用其中的 `rx_bytes` 计算送达率，不要关）：`frame_delay_max_ms` 接近 B 说明在预算边缘。
 
 ## 5. 小结
 

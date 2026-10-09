@@ -81,10 +81,3 @@ for s in $(seq 1 24); do ANL_TEST_SEED=$s build/anl_test > /tmp/seed$s.log; grep
 - 只有候选失败，判为回归。
 
 注意：判断失败行要匹配 `"  FAIL "`（行首两个空格）。旧版本打印的是带完整路径的 `FAIL` 行，只搜 `FAIL test` 会漏掉。
-
-
-### 报告送达计量与容量恢复回归
-
-`test_bbr_report_intervals` / `test_report_epoch_wrap` 检查报告缺失、跨变速的迟到快照、恢复报告和发送端时间戳回绕；REPORT 固定 22 字节，旧长度作为格式错误拒绝。
-
-`test_report_capacity_recovery` 固定覆盖种子 10 / 10% 与种子 9 / 15% 的浅 FIFO 容量恢复，不放宽原有恢复断言。扩展扫描 `ANL_TEST_SEED=1..25 ANL_TEST_ONLY=fec_capacity_recovery` 时，种子 7 / 10% 仍有基线同样的最终 10 秒内 626 ms shortage 失败，必须单独记录，不能声称整个多种子扫描全通过。
