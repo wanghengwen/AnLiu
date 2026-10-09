@@ -2930,7 +2930,10 @@ static void test_bbr_policer_probes(void)
     w.lt.state = 3; w.lt.from = 1; w.lt.k = 1; w.lt.tail = 1;
     w.lt.rate = 6006981; w.lt.res = 4; w.lt.span = 16;
     policer_interval(&w, 678, 3021818, 770286, 1258346, 2466360, 62186);
-    CHECK(w.lt.state == 0, "underfed first confirmation does not establish a ceiling");
+    /* the test's rate stands until the next probe (an app-limited media
+       stream rarely feeds the tail; giving up left it 3-10x above the policer) */
+    CHECK(w.lt.state == 2 && w.lt.rate == 6006981 && w.lt.left == 16,
+          "underfed first confirmation keeps the tested rate as the ceiling");
 
     memset(&w, 0, sizeof(w));
     w.lt.state = 3; w.lt.from = 2; w.lt.k = 3;

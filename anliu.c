@@ -2544,10 +2544,10 @@ static uint32_t bbr_bw(const anl_t *w)
  * loss on a radio link looks the same), and the send-rate credit then keeps
  * the sender above the rate with much of what it sends lost. Told apart by
  * the response (BBRv1's long-term sampling plus a test): two intervals
- * (>= BBR_LT_ROUNDS rounds and 300 ms) in a row, network-limited, no queue,
- * over 10% lost, delivering the same rate within 1/4 - then an interval
- * paced at that rate. Halving the loss starts a probe for the ceiling; a
- * failed test holds off for 48 intervals.
+ * (>= BBR_LT_ROUNDS rounds and 300 ms) in a row, no queue, over 10% lost
+ * (over 25% when app-limited), delivering the same rate within 1/4 - then
+ * an interval paced at that rate. Halving the loss starts a probe for the
+ * ceiling; a failed test holds off for 48 intervals.
  *
  * The test alone passes on any path whose capacity is above the rate: a
  * policer is a ceiling, so the test is followed by intervals paced a
@@ -2695,10 +2695,15 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     } else if (w->lt.state == 1) {                      /* the capacity test interval */
         /* A capacity retest must actually offer >=7/8 of its requested rate,
            with no queue signal. Dividing the byte budget first avoids an
-           overflow for long intervals. Initial detection keeps its policy. */
-        if (loss * 2 < w->lt.ref_loss && !(w->lt.bad & 1) &&
-            (w->lt.from != 2 || (!(w->lt.bad & 2) &&
-             (uint64_t)(w->sent_wire - w->lt.sent0) * 8000 / 7 >= (uint64_t)w->lt.rate * dur))) {
+           overflow for long intervals. The initial test is app-limited for
+           a media stream whose encoder follows the estimate (down to the
+           test rate): it counts when at least half the test rate was sent -
+           random loss does not halve at any rate, and the probe that
+           follows measures the ceiling (TUNING.md 55) */
+        uint64_t sent = w->sent_wire - w->lt.sent0;
+        int fed = w->lt.from != 2 ? sent * 2000 >= (uint64_t)w->lt.rate * dur
+                                  : !(w->lt.bad & 2) && sent * 8000 / 7 >= (uint64_t)w->lt.rate * dur;
+        if (loss * 2 < w->lt.ref_loss && (!(w->lt.bad & 1) || fed) && (w->lt.from != 2 || fed)) {
             /* what is still lost at the policer's rate is random loss: send
                that much more, or random loss on top would pace below the
                rate. The smaller of the two measures: what was sent includes
@@ -2730,7 +2735,9 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         }
         else {
             w->lt.state = 0;
-            w->lt.hold = 48;
+            /* an app-limited interval short of half the rate is no verdict:
+               a short hold, not the 48 intervals of a random-loss verdict */
+            w->lt.hold = (w->lt.bad & 1) && !fed ? BBR_LT_SPAN : 48;
             /* the loss is random: the estimate from before the test stands
                for another filter window (the test's samples, paced at the
                rate, had taken the filter down to it - heavy20 video on time
@@ -2776,8 +2783,12 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
             w->lt.queue = 1;
             w->lt.prev_rate = 0;
         } else if ((w->lt.bad & 1) || tail_limited) {  /* insufficient offered load: no verdict */
-            if (w->lt.from == 1) { w->lt.state = 0; w->lt.hold = BBR_LT_SPAN; w->lt.span = 0; }
-            else { w->lt.state = 2; w->lt.left = w->lt.span; }
+            /* The rate the test passed at stands as the ceiling until the
+               next probe - the first confirmation too: giving it up left a
+               media stream (its encoder cut back after the step's loss, so
+               the tail was underfed) at 3-10x a 10 Mbit policer for minutes
+               with most of what it sent lost (TUNING.md 55) */
+            w->lt.state = 2; w->lt.left = w->lt.span;
             w->lt.tail = 0;
         } else if (w->lt.tail) {
             /* the tail: the same pace for an interval with the bucket empty
@@ -2869,10 +2880,17 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         }
     } else if (w->lt.hold > 0) {
         w->lt.hold--;
-    } else if (!w->lt.bad && counted > 100) {
+    } else if (!(w->lt.bad & 2) && counted > ((w->lt.bad & 1) ? 250u : 100u)) {
         /* over 10% lost, rates within 1/4: a test costs one interval at the
            delivery rate, and the test itself tells a policer from random
-           loss; stricter thresholds missed a jittery uplink (TUNING.md 19) */
+           loss; stricter thresholds missed a jittery uplink (TUNING.md 19).
+           App-limited intervals count at over a quarter lost: what was
+           delivered is then what the path took, whatever the sender had
+           left over (a media stream is app-limited in nearly every interval
+           while 3-10x a policer's rate is paced for its bursts), and no
+           random loss does that - a small flow's 5% reads over 10% in an
+           interval now and then, and the test's loss regresses to the mean
+           (TUNING.md 55) */
         if (w->lt.prev_rate != 0 && rate + w->lt.prev_rate / 4 >= w->lt.prev_rate && rate <= w->lt.prev_rate + w->lt.prev_rate / 4) {
             w->lt.state = 1;
             w->lt.from = 1;
