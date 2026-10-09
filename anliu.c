@@ -650,6 +650,8 @@ typedef struct anl_stream {
     anl_delay_report peer_rp;           /* the peer's latest report */
     uint32_t peer_rp_wire_ts;           /* newest report's peer clock; reject reordered / replayed reports */
     uint32_t peer_rp_ts;
+    uint32_t fl_prov, fl_prov_win;      /* before the peer's first report: losses counted from ACK order
+                                           (a rebuild, or reordering) and the estimate window they are in */
     fec_buf *fec_slot;                  /* sender: canonical encodings of the open block (FEC_K_MAX) */
     uint32_t fec_base, fec_first_ts, fec_n, fec_blk_ms;  /* fec_blk_ms: the open block collects this long */
     fec_buf *fec_out;                   /* sender: parities of the last block (FEC_M_MAX), FEC_GAP apart */
@@ -824,6 +826,7 @@ struct anl_s {
     uint64_t tx_payload;                /* first-transmission payload bytes (target_rate) */
     uint32_t fl_sent, fl_lost;          /* FEC streams: first transmissions, lost ones (repaired
                                            by the peer's FEC or not) in the current window */
+    uint32_t fl_win;                    /* windows closed so far */
     uint32_t fec_loss;                  /* raw loss of the connection before FEC, 1/65536 (DESIGN 8.5) */
     int fec_loss_valid;                 /* windows fec_loss has had, up to FEC_LOSS_WARM (0: none yet) */
     uint32_t rx_hole_ts;                /* the last datagram that showed a hole in a stream here (| 1; 0: none):
@@ -1390,6 +1393,22 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
     r->age_ms = 0;
     st->peer_rp_ts = w->current;
     st->peer_rp_wire_ts = ts;
+    /* The first report: the losses counted from ACK order before it were
+       rebuilds or reordering, which the sender cannot tell apart (a rebuilt
+       packet's ACK also follows a higher sn's). While their estimate window
+       is open, no more of them stay than the report's rebuilds - its count
+       leaves out those whose original came after all. One reordered packet
+       in the first second, taken as 2% while the estimate warms up, held a
+       reordering path without loss above the gate's threshold for 30 s
+       (test.c, test_fec_spurious_repair). The report itself is the
+       baseline: nothing is added from it */
+    if (st->fec && !had_report) {
+        if (st->fl_prov_win == w->fl_win) {
+            uint32_t drop = st->fl_prov - umin32(st->fl_prov, r->fec_recovered);
+            w->fl_lost -= umin32(drop, w->fl_lost);
+        }
+        st->fl_prov = 0;
+    }
     if (st->fec && had_report) {
         /* the repairs it reports are losses FEC hid from RACK (the rebuilt
            packet's ACK usually beats the mark; a mark that lost the race is
@@ -3545,6 +3564,13 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                            that does not report leaves the mark as the
                            only evidence of a repaired loss) */
                         if (st->fec && st->peer_rp.valid && w->fl_lost) w->fl_lost--;
+                        /* before the first report the mark stays, until the
+                           report says whether it was rebuilt (handle_report) */
+                        else if (st->fec && !st->peer_rp.valid) {
+                            if (st->fl_prov_win != w->fl_win) st->fl_prov = 0;
+                            st->fl_prov++;
+                            st->fl_prov_win = w->fl_win;
+                        }
                     }
                     /* acknowledged after a higher sn was (the last ACK's high
                        mark): lost and rebuilt from parity - or reordered. The
@@ -3552,8 +3578,13 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                        that does not report (the rebuilt packet's ACK beats
                        RACK's mark) */
                     else if (s->xmit == 1 && st->fec && !st->peer_rp.valid && st->rack_valid &&
-                             tdiff(s->sn, st->rack_hi) < 0)
+                             tdiff(s->sn, st->rack_hi) < 0) {
+                        /* until a first report says otherwise (handle_report) */
+                        if (st->fl_prov_win != w->fl_win) st->fl_prov = 0;
+                        st->fl_prov++;
+                        st->fl_prov_win = w->fl_win;
                         fec_loss_add(w, 0, 1, 0);
+                    }
                 }
                 /* an RTO retransmission's loss counts only now, when it is
                    known not to be a late ACK (RACK's is counted when it is
@@ -4427,6 +4458,7 @@ static void fec_loss_add(anl_t *w, uint32_t sent, uint32_t lost, int hard)
         else w->fec_loss = (uint32_t)((int32_t)w->fec_loss + (x - (int32_t)w->fec_loss) / 4);
         if (w->fec_loss_valid < FEC_LOSS_WARM) w->fec_loss_valid++;
         w->fl_sent = w->fl_lost = 0;
+        w->fl_win++;
     }
 }
 

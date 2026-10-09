@@ -314,3 +314,9 @@ past max_age: abandon instead of retransmitting (DESIGN 7.3). Not an FEC failure
 `anliu.c`: anl_flush_internal
 
 Not while capacity is short and the path is losing what is sent (rate_update): the queues are empty because frames were discarded for age, not because the application had nothing to send - the network is the limit. With the path delivering everything (a model that collapsed after an RTT jump, soak hirtt: frames expire behind a window of 33 segments at 390 ms) the app-limited samples are what lets the model climb back; held network-limited it fell further (bw 408 -> 117 kB/s, video 67%).
+
+## 52. the first report and losses counted from ACK order
+
+`anliu.c`: handle_report, handle_ack
+
+Before the peer's first report the sender counts an original acknowledged after a higher sn (and a RACK mark the original's ACK proves wrong) as a loss: rebuilt from parity, or reordered - it cannot tell. On a reordering path without loss (unit test, 60..110 ms jitter) one reordered packet at 1.27 s, 10 ms before the first report, made the first window (50 packets) read 2%; the warm-up takes a higher measurement as it is and the later windows smooth by a quarter, so the estimate was still 0.85% at 15 s (the gate closes below 0.25%). It took a STARTUP change's timing to put the packet there. Now these counts are provisional per stream: at the first report, while their window is still open, no more of them stay than the rebuilds it reports (net of rebuilds whose original came after all). The report stays a baseline - nothing is added from it. Media regression (ASan, 24 scenarios): output unchanged.
