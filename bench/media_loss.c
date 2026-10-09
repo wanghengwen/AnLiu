@@ -31,6 +31,7 @@
  * a parity block) and how many reached a receiver that already had the data
  * (dup_*); FECCNT: what fed the adaptive ratio. MEDIA_LOSS_RTX=1 traces each.
  */
+#include <stdio.h>
 #include "../anliu.h"
 static void loss_data(const anl_t *, const anl_stream_t *, const void *, uint32_t, int);
 static void loss_parity(const anl_t *, int, uint32_t);
@@ -178,7 +179,7 @@ int main(int argc, char **argv)
     flow f[2];
     linkcfg lc = {0};
     int bw = argc > 1 ? atoi(argv[1]) : 5000, rtt = argc > 2 ? atoi(argv[2]) : 100;
-    int loss = argc > 3 ? atoi(argv[3]) : 20, seed = argc > 4 ? atoi(argv[4]) : 1;
+    int loss = argc > 3 ? atoi(argv[3]) : 15, seed = argc > 4 ? atoi(argv[4]) : 1;
     int duration = argc > 5 ? atoi(argv[5]) : 120, stop = argc > 6 ? atoi(argv[6]) : 0;
     int interval = argc > 7 ? atoi(argv[7]) : 10;
     const char *event = argc > 8 ? argv[8] : "none";
@@ -188,7 +189,7 @@ int main(int argc, char **argv)
     int event_on, event_end = event_start + event_duration;
     uint64_t scale_sum = 0, gate_ms = 0, short_ms = 0;
     int i, k, errors = 0;
-    if (bw < 1 || rtt < 1 || rtt > 10000 || loss < 0 || loss > 20 || seed < 1 ||
+    if (bw < 1 || rtt < 1 || rtt > 10000 || loss < 0 || loss > 15 || seed < 1 ||
         duration < 3 || duration > 600 || stop < 0 || stop > duration ||
         (interval != 10 && interval != 20) ||
         (strcmp(event, "none") && strcmp(event, "pause") && strcmp(event, "delay") && strcmp(event, "bw")) ||

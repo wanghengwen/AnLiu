@@ -38,7 +38,7 @@ python3 tools/realnet/multi_round.py a b cand 901 2000 9900 --loss 5 --drive-che
 python3 tools/realnet/multi_sched_pair.py jobs.jsonl sched-log/
 ```
 
-`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，默认 20）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE）、`--tc-loss`（`--loss` 改由 tc 在发送端两个方向丢包，应用内不丢）、`--fec-off`（关闭 FEC，只靠重传）、`--queue-ms MS`（TBF 的队列，默认 100）、`--police`（令牌桶限速器：tc police 按 RATE_KBPS 限速，桶为 `--burst`，默认 64 KB，超出即丢、不排队；它后面是 `--line KBPS` 的线路，默认 40000，即本频段的 TBF 及其 `--queue-ms` 队列），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。
+`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，范围 0–15%，默认 15）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE）、`--tc-loss`（`--loss` 改由 tc 在发送端两个方向丢包，应用内不丢）、`--fec-off`（关闭 FEC，只靠重传）、`--queue-ms MS`（TBF 的队列，默认 100）、`--police`（令牌桶限速器：tc police 按 RATE_KBPS 限速，桶为 `--burst`，默认 64 KB，超出即丢、不排队；它后面是 `--line KBPS` 的线路，默认 40000，即本频段的 TBF 及其 `--queue-ms` 队列），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。
 
 测试用例（场景、轮次与通过规则）见 [docs/testcases/realnet](../../docs/testcases/realnet/README.md)。
 

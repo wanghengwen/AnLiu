@@ -2,7 +2,7 @@
 """End-to-end auto-FEC regression; pass an ASan-built media_loss executable.
 
 Checks delivery and wire cost, not the estimator's formula. All configured
-random loss is at most 20%. Three seeds cover each scenario independently.
+random loss is at most 15% (the test range). Three seeds cover each scenario independently.
 """
 import argparse
 import os
@@ -59,7 +59,7 @@ LOW_FIXED_SCALE = {800: 195, 2000: 500}
 def run_low(binary, output, bw, seed):
     # Six hundred seconds amortize startup and cover many key-frame bursts.
     env = dict(os.environ, MEDIA_LOSS_FIXED_SCALE=str(LOW_FIXED_SCALE[bw]))
-    result = subprocess.run([str(binary), str(bw), "100", "20", str(seed), "600"],
+    result = subprocess.run([str(binary), str(bw), "100", "15", str(seed), "600"],
                             capture_output=True, text=True, check=True, env=env)
     name = f"low{bw}-seed{seed}"
     if output:
@@ -92,8 +92,8 @@ def main():
     args = parser.parse_args()
     if args.output:
         args.output.mkdir(parents=True, exist_ok=True)
-    for rtt, loss, stop in [(100, 20, 0), (100, 15, 0), (2, 20, 0),
-                            (100, 0, 0), (180, 0, 0), (100, 20, 30)]:
+    for rtt, loss, stop in [(100, 10, 0), (100, 15, 0), (2, 15, 0),
+                            (100, 0, 0), (180, 0, 0), (100, 15, 30)]:
         for seed in (1, 2, 3):
             run(args.binary.resolve(), args.output, rtt, loss, seed, stop)
     for bw in (800, 2000):

@@ -35,7 +35,7 @@ def locked(fn):
     try:return fn()
     finally:fcntl.flock(lockf,fcntl.LOCK_UN)
 def setup():
-    if a.rate<1 or a.port<1024 or a.port>65535 or not 0<=a.loss<=20:raise RuntimeError('invalid rate/port/loss')
+    if a.rate<1 or a.port<1024 or a.port>65535 or not 0<=a.loss<=15:raise RuntimeError('invalid rate/port/loss')
     if state.exists():raise RuntimeError('state exists')
     r=load();root=roots()
     if not r['bands']:

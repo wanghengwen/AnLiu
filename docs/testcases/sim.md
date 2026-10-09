@@ -15,8 +15,10 @@ python3 bench/test_media_loss.py build-asan/bench/anl_media_loss --output /tmp/g
 
 覆盖 24 个场景，每个场景 3 个种子：
 
-- 5 Mbit：100 ms 时 20% / 15% 丢包；2 ms 时 20% 丢包；100 / 180 ms 时 0% 丢包；100 ms 时 20% 丢包并在 30 s 停止；
-- 800 / 2000 kbit 固定码率，600 s。
+- 5 Mbit：100 ms 时 10% / 15% 丢包；2 ms 时 15% 丢包；100 / 180 ms 时 0% 丢包；100 ms 时 15% 丢包并在 30 s 停止；
+- 800 / 2000 kbit 固定码率、15% 丢包，600 s。
+
+随机丢包最高 15%（2026-10-09 起，原为 20%）。
 
 **通过规则**：每个场景都打印 `PASS` 行，脚本退出码为 0。断言写在脚本里，主要包括：
 
@@ -79,3 +81,10 @@ for s in $(seq 1 24); do ANL_TEST_SEED=$s build/anl_test > /tmp/seed$s.log; grep
 - 只有候选失败，判为回归。
 
 注意：判断失败行要匹配 `"  FAIL "`（行首两个空格）。旧版本打印的是带完整路径的 `FAIL` 行，只搜 `FAIL test` 会漏掉。
+
+
+### 报告送达计量与容量恢复回归
+
+`test_bbr_report_intervals` / `test_report_epoch_wrap` 检查报告缺失、跨变速的迟到快照、恢复报告和发送端时间戳回绕；REPORT 固定 22 字节，旧长度作为格式错误拒绝。
+
+`test_report_capacity_recovery` 固定覆盖种子 10 / 10% 与种子 9 / 15% 的浅 FIFO 容量恢复，不放宽原有恢复断言。扩展扫描 `ANL_TEST_SEED=1..25 ANL_TEST_ONLY=fec_capacity_recovery` 时，种子 7 / 10% 仍有基线同样的最终 10 秒内 626 ms shortage 失败，必须单独记录，不能声称整个多种子扫描全通过。

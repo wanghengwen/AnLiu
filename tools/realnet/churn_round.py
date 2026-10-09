@@ -111,7 +111,7 @@ def run(argv):
         if name not in argv: return default
         i = argv.index(name); v = int(argv[i + 1]); del argv[i:i + 2]; return v
     loss = opt('--loss', 0); delay = opt('--delay', 0); conc = opt('--conc', 31); dur = opt('--dur', 600); rate = opt('--rate', 8000)
-    if not 0 <= loss <= 20 or not 0 <= delay <= 300 or not 1 <= conc <= 31: raise SystemExit('loss 0..20, delay 0..300, conc 1..31')
+    if not 0 <= loss <= 15 or not 0 <= delay <= 300 or not 1 <= conc <= 31: raise SystemExit('loss 0..15, delay 0..300, conc 1..31')
     snd, rcv, variant, seed, port = argv[0], argv[1], argv[2], int(argv[3]), int(argv[4])
     hs = H.load(); S, C = hs[snd], hs[rcv]
     if not S['shape']: raise SystemExit('server cannot shape')

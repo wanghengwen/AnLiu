@@ -43,7 +43,7 @@ BENCH_DEBUG=1 ./anl_bench ...        # 打印损坏消息的细节
 | s3 | 视频 30 fps，I 帧 25~35 KB，P 帧 2.5~3.5 KB，max_age 500 | anl / anl+fec / kcp / kcp+drop |
 | s4 | 音频 160 B / 20 ms，max_age 200 | 同上 |
 | s5 | 音频 + 视频 + 饱和批量流，5 Mbps 瓶颈 | 同上（kcp 每条流一个 conv） |
-| soak | 音频 + 视频 + 交互 + 250 KB/s 批量；每 60 s 切换网络阶段（良好 / 5% / 突发 / 20% / 2 Mbps / 5 s 断网 / 高 RTT）；时钟从回绕前 30 s 开始 | anl+fec / kcp+drop |
+| soak | 音频 + 视频 + 交互 + 250 KB/s 批量；每 60 s 切换网络阶段（良好 / 5% / 突发 / 15% / 2 Mbps / 5 s 断网 / 高 RTT）；时钟从回绕前 30 s 开始 | anl+fec / kcp+drop |
 | bwstep | 音频 + 视频 + 批量，瓶颈每 10 s 切换 8 → 2 → 5 → 1 → 8 Mbps；每阶段报告带宽估计 / 实际、利用率、音视频时延 | anl / anl+fec / kcp |
 | crypto | 真实时钟下每个数据报的 input 开销（合法包 / 伪造包） | anl / kcp |
 

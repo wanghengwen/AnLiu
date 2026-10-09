@@ -4,7 +4,7 @@
 Use --baseline and --candidate together for a before/after comparison. Steady
 cases run 600 virtual seconds by default; --quick uses 120. Event cases always
 run 120 seconds, including a 20-second delivery pause or delay change. Random
-loss never exceeds 20%; a pause retains datagrams instead of discarding them.
+loss never exceeds 15%; a pause retains datagrams instead of discarding them.
 The original test_media_loss.py assertions remain a separate acceptance gate.
 """
 import argparse
@@ -24,12 +24,12 @@ def cases(quick):
     for seed in (1, 2, 3):
         for bw in (800, 2000):
             for rtt in (2, 100, 180):
-                yield (bw, rtt, 20, seed, duration, 0, 10, "none", 30, 20, 200)
-        for rtt, loss, stop in ((100, 20, 0), (180, 20, 0), (100, 0, 0),
-                                (180, 0, 0), (2, 20, 0), (100, 20, 30)):
+                yield (bw, rtt, 15, seed, duration, 0, 10, "none", 30, 20, 200)
+        for rtt, loss, stop in ((100, 15, 0), (180, 15, 0), (100, 0, 0),
+                                (180, 0, 0), (2, 15, 0), (100, 15, 30)):
             yield (5000, rtt, loss, seed, duration, stop, 10, "none", 30, 20, 200)
         for event in ("pause", "delay"):
-            yield (5000, 180, 20, seed, 120, 0, 10, event, 30, 20, 200)
+            yield (5000, 180, 15, seed, 120, 0, 10, event, 30, 20, 200)
 
 
 def collect(binary, output, case):

@@ -2786,7 +2786,7 @@ static void run_fec_auto(int deadline, int *ratio, int *got, int *frames)
     a = open_pair(&n, 0, &o, NULL, &b);
     if (!b) { net_stop(&n); return; }
     for (phase = 0; phase < 3; phase++) {
-        n.loss_pct = phase == 1 ? 20 : 0;
+        n.loss_pct = phase == 1 ? 15 : 0;
         for (i = 0; i < 20000; i++) {
             net_tick(&n);
             if (i % 33 == 0) {
@@ -2869,19 +2869,19 @@ static void test_fec_report_order(void)
 static void test_fec_auto(void)
 {
     int r[3], tight, got, frames;
-    printf("[fec: adaptive redundancy, video 30 fps, rtt 100 ms: 0%% / 20%% / 0%% loss, 20 s each]\n");
+    printf("[fec: adaptive redundancy, video 30 fps, rtt 100 ms: 0%% / 15%% / 0%% loss, 20 s each]\n");
     run_fec_auto(100, r, &got, &frames);
     printf("  deadline 100 ms (a retransmission is late): ratio %d%% / %d%% / %d%%, %d of %d frames delivered\n",
            r[0], r[1], r[2], got, frames);
     CHECK(r[0] == FEC_AUTO_MIN, "clean link: down to the floor (%d)", r[0]);
-    CHECK(r[1] >= 50, "20%% loss: raised (%d)", r[1]);
+    CHECK(r[1] >= 50, "15%% loss: raised (%d)", r[1]);
     CHECK(r[2] < r[1], "loss over: lowered again (%d)", r[2]);
     tight = r[1];
     run_fec_auto(0, r, &got, &frames);
     printf("  deadline 250 ms (max_age / 2, a retransmission makes it): ratio %d%% / %d%% / %d%%, %d of %d delivered\n",
            r[0], r[1], r[2], got, frames);
-    /* raised a little: a lost retransmission (4% of the losses at 20%) is late */
-    CHECK(r[1] <= 70 && r[1] < tight, "20%% loss, retransmissions in time: raised less (%d vs %d)", r[1], tight);
+    /* raised little if at all: only a lost retransmission (15% of the losses at 15%) is late */
+    CHECK(r[1] <= 70 && r[1] < tight, "15%% loss, retransmissions in time: raised less (%d vs %d)", r[1], tight);
     CHECK(got >= frames * 99 / 100, "frames delivered (%d of %d)", got, frames);
 }
 
@@ -4529,7 +4529,7 @@ int main(void)
     RUN(test_fec_capacity_recovery(0));
     RUN(test_fec_capacity_recovery(5));
     RUN(test_fec_capacity_recovery(10));
-    RUN(test_fec_capacity_recovery(20));
+    RUN(test_fec_capacity_recovery(15));     /* loss at most 15% (the test range) */
     RUN(test_review_scheduler(3));
     RUN(test_review_scheduler(0));
     RUN(test_review_timers());

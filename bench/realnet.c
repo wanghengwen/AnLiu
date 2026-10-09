@@ -1005,7 +1005,7 @@ static void usage(void)
     fprintf(stderr, "usage: realnet server|client [--host H] [--port P] [--proto anl|anlfec|anlauto|kcp|kcpdrop|tcp]\n"
                     "       [--test media|bulk] [--dir up|down] [--dur S] [--bulk MB] [--loss P] [--seed N] [--init-cwnd N]\n"
                     "       [--pace-rate BYTES_PER_S] [--pace-burst BYTES] [--start-rate BYTES_PER_S (0 off)]\n"
-                    "       [--rx-loss 0..20] (receive-side random protocol loss after physical network)\n"
+                    "       [--rx-loss 0..15] (receive-side random protocol loss after physical network)\n"
                     "       [--rcv-deadline MS (-1 lifetime, 0 off)] [--fec-rtt-auto 0|1] [--fec-ratio 0..100 (0 adaptive)]\n"
                     "       [--fec-ratio-audio N] [--fec-ratio-video N] (per-flow override, 0 adaptive)\n"
                     "       [--rcv-deadline-audio MS] [--rcv-deadline-video MS] (per-flow receiver gap wait)\n"
@@ -1054,11 +1054,14 @@ int main(int argc, char **argv)
             g_start_rate = atoi(nx);
             if (g_start_rate < 0) usage();
         }
-        else if (!strcmp(a, "--loss")) g_loss = atof(nx);
+        else if (!strcmp(a, "--loss")) {
+            g_loss = atof(nx);
+            if (!isfinite(g_loss) || g_loss < 0 || g_loss > 15) usage();
+        }
         else if (!strcmp(a, "--rx-loss")) {
             char *end;
             g_rx_loss = strtod(nx, &end);
-            if (end == nx || *end || !isfinite(g_rx_loss) || g_rx_loss < 0 || g_rx_loss > 20) usage();
+            if (end == nx || *end || !isfinite(g_rx_loss) || g_rx_loss < 0 || g_rx_loss > 15) usage();
         }
         else if (!strcmp(a, "--rcv-deadline")) {
             g_rcv_deadline = atoi(nx);

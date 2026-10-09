@@ -2,7 +2,7 @@
 """One 600 s media round between two test hosts; several can run at once.
 
 Usage: multi_round.py SENDER RECEIVER VARIANT SEED RATE_KBPS PORT [FIXED_SCALE]
-         [--loss PCT]        receive-side random loss at both ends (realnet --rx-loss), default 20
+         [--loss PCT]        receive-side random loss at both ends (realnet --rx-loss), default 15
          [--tc-loss]         apply --loss with tc on the sender instead (multi_tc.py --loss: both
                              directions, the datagrams never reach the application); realnet --rx-loss 0
          [--fec-off]         FEC off (realnet --fec-rtt-auto 0): retransmission only
@@ -45,11 +45,11 @@ def flag(name):
     return True
 
 
-loss = opt('--loss', default=20)
+loss = opt('--loss', default=15)
 delay = opt('--delay'); burst = opt('--burst'); queue_ms = opt('--queue-ms'); video_max = opt('--video-max'); audio_max_age = opt('--audio-max-age')
 unlimited = flag('--unlimited'); audio_only = flag('--audio-only'); drive_check = flag('--drive-check')
 tc_loss = flag('--tc-loss'); fec_off = flag('--fec-off'); police = flag('--police'); line = opt('--line', default=40000)
-if not 0 <= loss <= 20: raise SystemExit('loss 0..20')
+if not 0 <= loss <= 15: raise SystemExit('loss 0..15')
 if not 0 <= delay <= 200: raise SystemExit('delay 0..200')
 if burst and not 1600 <= burst <= 4 << 20: raise SystemExit('burst 1600..4 MB')
 if queue_ms and not 1 <= queue_ms <= 1000: raise SystemExit('queue-ms 1..1000')

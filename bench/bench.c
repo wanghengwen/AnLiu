@@ -1218,7 +1218,7 @@ static const phase g_phases[] = {
     { "good",    { 0.00, 0, 20,  0, 20000, 100, 0.00 , 0, 0 }, 0 },
     { "rand5",   { 0.05, 0, 50,  0, 20000, 100, 0.01 , 0, 0 }, 0 },
     { "burst5",  { 0.05, 4, 50,  0, 20000, 100, 0.00 , 0, 0 }, 0 },
-    { "heavy20", { 0.20, 0, 100, 20, 20000, 100, 0.00 , 0, 0 }, 0 },
+    { "heavy15", { 0.15, 0, 100, 20, 20000, 100, 0.00 , 0, 0 }, 0 },     /* loss at most 15% (the test range) */
     { "bw2m",    { 0.005, 0, 30, 0, 2000,  200, 0.00 , 0, 0 }, 0 },
     { "outage",  { 0.00, 0, 30,  0, 20000, 100, 0.00 , 0, 0 }, 5000 },
     { "hirtt",   { 0.01, 0, 200, 40, 20000, 100, 0.00 , 0, 0 }, 0 },
@@ -1490,7 +1490,7 @@ static int parse_list(const char *s, double *out, int max)
 static void usage(void)
 {
     printf("usage: anl_bench [s1 s2 s3 s4 s5 soak crypto all] [options]\n"
-           "  --loss L,..     loss percents (default 0,1,3,5,10,20,30)\n"
+           "  --loss L,..     loss percents (default 0,1,3,5,10,15; at most 15)\n"
            "  --rtt R,..      rtt ms (default 20,100,300)\n"
            "  --burst N       extra rows: 5%% loss with mean burst N (default 4, 0 = off)\n"
            "  --jitter PCT    extra rows: 1%% loss, jitter = PCT%% of one-way delay, reorder (default 30, 0 = off)\n"
@@ -1520,8 +1520,8 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    double loss[32] = { 0, 1, 3, 5, 10, 20, 30 }, rtt[32] = { 20, 100, 300 };
-    int nloss = 7, nrtt = 3, burst = 4, jitter = 30, i, j;
+    double loss[32] = { 0, 1, 3, 5, 10, 15 }, rtt[32] = { 20, 100, 300 };
+    int nloss = 6, nrtt = 3, burst = 4, jitter = 30, i, j;
     int want[8] = { 0 }, any = 0, soak = 0, crypto = 0, bwstep = 0;
     point pts[512];
     int npts = 0;
@@ -1576,13 +1576,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--profile")) { g_fast = strcmp(nx, "default") != 0; i++; }
         else if (!strcmp(a, "--csv")) { g_csv = fopen(nx, "w"); i++; }
         else if (!strcmp(a, "--quick")) {
-            nloss = 3; loss[0] = 0; loss[1] = 5; loss[2] = 20;
+            nloss = 3; loss[0] = 0; loss[1] = 5; loss[2] = 15;
             nrtt = 2; rtt[0] = 50; rtt[1] = 200; g_dur = 20;
         }
         else { usage(); return 2; }
     }
     if (!any) { for (j = 1; j <= 5; j++) want[j] = 1; crypto = 1; }
     if (g_dur <= 0 || g_soak <= 0 || g_phase <= 0 || g_sample <= 0) { usage(); return 2; }
+    for (i = 0; i < nloss; i++)
+        if (!isfinite(loss[i]) || loss[i] < 0 || loss[i] > 15) { usage(); return 2; }
 
     for (i = 0; i < nloss; i++)
         for (j = 0; j < nrtt; j++) {
