@@ -2852,7 +2852,16 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            load. Otherwise a pacing/window stall could mimic the plateau. */
         int plateau = (uint64_t)rate <= (uint64_t)w->lt.prev_rate + w->lt.prev_rate / 32 &&
             (uint64_t)sent_rate * 8 >= (uint64_t)bbr_lt_probe_rate(w) * 7;
-        if (w->lt.bad & 2) {
+        /* Delivery collapsed under a quarter of the rate with a queue
+           signal: a stall (the path or the provider dropped out for a few
+           hundred ms), not a bottleneck's queue - a FIFO queues while it
+           delivers its capacity. No verdict, as for too little offered
+           load: on a 10 Mbit policer at 20 ms such stalls came every few
+           seconds until the policer was confirmed, and one in the first
+           probe step held the detector off for 48 intervals - confirmation
+           at 32..49 s instead of 7..23 (real network, TUNING.md 58) */
+        int stalled = (w->lt.bad & 2) && (uint64_t)rate * 4 < w->lt.rate;
+        if ((w->lt.bad & 2) && !stalled) {
             /* A single queued round can taint a whole short-RTT interval.
                When the 300 ms floor dominates its duration, repeat this
                bounded step before discarding an established ceiling. Initial
@@ -2865,7 +2874,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
             }
             w->lt.queue = 1;
             w->lt.prev_rate = 0;
-        } else if ((w->lt.bad & 1) || tail_limited) {  /* insufficient offered load: no verdict */
+        } else if ((w->lt.bad & 1) || tail_limited || stalled) {  /* insufficient offered load: no verdict */
             /* The rate the test passed at stands as the ceiling until the
                next probe - the first confirmation too: giving it up left a
                media stream (its encoder cut back after the step's loss, so

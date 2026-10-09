@@ -3208,6 +3208,21 @@ static void test_bbr_policer_probes(void)
     policer_interval(&w, 682, 6660226, 1668953, 1770809, 5296350, 1009732);
     CHECK(w.lt.state == 0 && w.lt.hold == 48, "long-RTT queued probe still yields immediately to congestion control");
 
+    /* a stall: the first probe step queued, but delivery collapsed under a
+       quarter of the rate (real network, 10 Mbit policer at 20 ms: 9..130 kB/s
+       for a few hundred ms) - no verdict, the tested rate stands */
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 3; w.lt.from = 1; w.lt.k = 1; w.lt.rate = 1200000; w.lt.span = 8;
+    w.min_rtt = 20; w.prev_round_min_rtt = 60;
+    policer_interval(&w, 300, 30000, 0, 0, 27000, 3000);
+    CHECK(w.lt.state == 2 && w.lt.rate == 1200000 && w.lt.left == 8, "queued stall in the first probe: tested rate kept (%d, %u)", w.lt.state, w.lt.rate);
+    /* a FIFO's queue: delivery at about the rate - congestion control's */
+    memset(&w, 0, sizeof(w));
+    w.lt.state = 3; w.lt.from = 1; w.lt.k = 1; w.lt.rate = 1200000; w.lt.span = 8;
+    w.min_rtt = 20; w.prev_round_min_rtt = 60;
+    policer_interval(&w, 300, 450000, 0, 0, 360000, 0);
+    CHECK(w.lt.state == 0 && w.lt.hold == 48, "queued probe delivering the rate still yields to congestion control (%d)", w.lt.state);
+
     /* J8, ab17b_zjg2lsj_v16d: an underfed k=2 tail still loses 152 per
        mille. The low-loss guard must not widen with the nominal probe. */
     memset(&w, 0, sizeof(w));
