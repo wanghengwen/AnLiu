@@ -60,7 +60,15 @@ typedef struct net {
     /* captured datagram for replay tests */
     char cap[2048]; int cap_len; int cap_from;
     uint32_t burst_window_bytes[2]; uint32_t burst_window_start[2]; uint32_t max_burst[2];
+    int clock_ppm[2];               /* this side's clock runs this much fast (0: the net's clock) */
+    uint32_t clock_t0;              /* net_start: where the clocks part */
 } net;
+
+/* an endpoint's clock: the net's, plus clock_ppm since the start (net_start) */
+static uint32_t ep_clock(const net *n, int i)
+{
+    return n->now + (uint32_t)((int64_t)(int32_t)(n->now - n->clock_t0) * n->clock_ppm[i] / 1000000);
+}
 
 static void net_enqueue(net *n, int to, const char *data, int len, uint32_t at)
 {
@@ -176,6 +184,7 @@ static void net_start(net *n, const anl_config *ca, const anl_config *cb)
     /* FIFO / link state relative to the clock (a test may start it past 2^31) */
     n->last_at[0] = n->last_at[1] = n->link_free_at[0] = n->link_free_at[1] = n->now;
     n->burst_window_start[0] = n->burst_window_start[1] = n->now;
+    n->clock_t0 = n->now;
     g_acc[0] = g_acc[1] = 0; g_acc_reject_mod = 0; g_acc_rcv_wnd = 0;
     n->ep[0] = anl_create(0x11223344, ca, &n->ep_idx[0]);
     n->ep[1] = anl_create(0x11223344, cb, &n->ep_idx[1]);
@@ -199,8 +208,8 @@ static void net_tick(net *n)
 {
     n->now++;
     net_deliver(n);
-    anl_update(n->ep[0], n->now);
-    anl_update(n->ep[1], n->now);
+    anl_update(n->ep[0], ep_clock(n, 0));
+    anl_update(n->ep[1], ep_clock(n, 1));
 }
 
 /*---------------------------------------------------------------------
@@ -2254,6 +2263,49 @@ static void test_rcv_hole_echo(void)
     run_hole(30, &late, &got, &er);
     printf("  rtt 60 ms: echo rtt %u ms, %d of 1000 frames delivered\n", er, got);
     CHECK(got >= 990, "short RTT: retransmissions fill the holes (%d)", got);
+}
+
+/* A peer's ts runs a little ahead of where our clock puts it: our current
+ * is the time of the last update, and the two clocks' rates differ. Clamped
+ * to that estimate (peer_ts may not pass ref, DESIGN 4.2), peer_ts fell
+ * behind the peer's clock for good, and CTRL_ECHO, which echoes it, gave the
+ * receive-only peer an RTT that grew with the drift: at a 100 ms path its
+ * rcv_hole_hopeless soon skipped every hole a retransmission still filled
+ * (real paths: 101 ms RTT read as 116..122 ms, audio at 15% loss lost what
+ * retransmissions had saved). Receiver clock 2000 ppm fast, 100 s */
+static void test_echo_clock_rate(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    static char buf[2000];
+    int i, sent = 0, got = 0;
+    printf("[semi: a peer clock running fast does not lengthen the echo RTT]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 50;
+    n.clock_ppm[1] = 2000;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.max_age_ms = 200;
+    o.fec = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    n.loss_pct = 5;
+    for (i = 0; i < 101000; i++) {
+        net_tick(&n);
+        if (i % 20 == 0 && sent < 5000) {
+            fill_pattern(buf, 160, (uint32_t)sent);
+            anl_stream_send_frame(a, 0, buf, 160, NULL);
+            sent++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) > 0) got++;
+    }
+    printf("  rtt 100 ms, receiver clock +2000 ppm, 100 s: echo rtt %u ms, %d of %d frames delivered\n",
+           n.ep[1]->echo_rtt, got, sent);
+    CHECK(n.ep[1]->echo_rtt >= 95 && n.ep[1]->echo_rtt <= 115, "echo rtt stays at the path's (%u)", n.ep[1]->echo_rtt);
+    CHECK(got * 100 >= sent * 99, "retransmissions still fill the holes (%d of %d)", got, sent);
+    CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
+    net_stop(&n);
 }
 
 static void test_rcv_skip_clears_fwd(void)
@@ -4481,6 +4533,7 @@ int main(void)
     RUN(test_review_backlog());
     RUN(test_review_gf_tables());
     RUN(test_fec_buffers_release());      /* last: new tests leave the others' random sequences alone */
+    RUN(test_echo_clock_rate());
     if (g_fail) { printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("\nall tests passed\n");
     return 0;

@@ -406,6 +406,8 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define ECHO_BODY       3       /* CTRL_ECHO body: the peer's ts (16 bits), held here this long (ms, 8 bits) */
 #define ECHO_MS         100     /* at most this often, and only while our ACKs give the peer no echo */
 #define ECHO_RTT_WIN    10000   /* echo_rtt: a windowed minimum, like min_rtt (BBR_MIN_RTT_WIN) */
+#define TS_AHEAD_MAX    1000    /* a peer ts may pass ref by this much (current lags between updates, clock
+                                   rates differ); a replay that extends into the future is 33..65 s ahead */
 #define ACK_F_WASK      0x80    /* window probe: please answer with an ACK */
 #define ACK_F_FRESH     0x40    /* data arrived since the last ACK: ts_echo is an RTT sample */
 #define SACK_REPEAT     3       /* every received segment is reported in at least 3 ACKs */
@@ -3797,13 +3799,17 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
         w->rx_stale++;
         return ANL_ESTALE;
     }
-    /* peer_ts never passes ref: a replayed datagram 33..65 s old extends to
-       a ts in the future, and taken as is it moved peer_ts that far ahead -
-       every genuine datagram after it was stale until the clock caught up
-       (up to 32 s; one replay stalled the connection). A genuine one is
-       never meaningfully ahead of ref */
+    /* peer_ts passes ref by at most TS_AHEAD_MAX: a replayed datagram
+       33..65 s old extends to a ts in the future, and taken as is it moved
+       peer_ts that far ahead - every genuine datagram after it was stale
+       until the clock caught up (up to 32 s; one replay stalled the
+       connection). A genuine one is ahead of ref by a few ms: current is
+       the time of the last update, and the clocks' rates differ. Clamped to
+       ref, peer_ts fell behind the peer's clock for good, and CTRL_ECHO,
+       which echoes it, gave a receive-only peer RTTs 15..20 ms long - enough
+       for rcv_hole_hopeless to skip every hole on a 100 ms path */
     if (!w->peer_ts_valid || tdiff(ts, w->peer_ts) > 0) {
-        w->peer_ts = w->peer_ts_valid && tdiff(ts, ref) > 0 ? ref : ts;
+        w->peer_ts = w->peer_ts_valid && tdiff(ts, ref) > TS_AHEAD_MAX ? ref : ts;
         w->peer_ts_at = w->current;
     }
     w->peer_ts_valid = 1;
