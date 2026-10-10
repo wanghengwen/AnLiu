@@ -82,8 +82,8 @@ static const int plan_weight[NPLAN] = { 25, 25, 15, 15, 10, 10 };
 typedef struct lst {
     anl_stream_t *s;
     int own, plan, semi, sid;
-    uint32_t uid;                   /* the opener's count of its opens (low 16 bits): sids are reused, this
-                                       tells the stream on a sid from an earlier one on the same sid */
+    uint32_t uid;                   /* the opener's count of its opens (low 16 bits): tells the stream on a
+                                       sid from an earlier one on it (sids were reused before 2026-10-08) */
     uint32_t t_open, t_next, t_end;
     uint32_t sent, total;           /* own: sent, the M or K of the plan */
     uint32_t got;                   /* accepted: messages / frames read */
