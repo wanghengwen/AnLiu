@@ -4464,6 +4464,79 @@ static void test_target_rate_queued_ack_burst(void)
           "queued ACK catch-up recovers within the sustained delivery ceiling (%u)", w.rate.target);
 }
 
+static void test_target_rate_reports(void)
+{
+    anl_t w;
+    memset(&w, 0, sizeof(w));
+    w.rate.share = 256;
+    w.rx_srtt = 100;
+    w.current = w.prx_at = 1000;
+    w.prx_valid = 1; w.prx_ms = 1000; w.prx_bytes = 100000;
+    CHECK(rate_report_pay(&w) == 0, "first report only establishes a snapshot");
+    w.current = w.prx_at = 1100; w.prx_ms += 100; w.prx_bytes += 10000;
+    w.sent_wire += 10000;
+    CHECK(rate_report_pay(&w) == 0, "short reports accumulate for a full control step");
+    w.current = w.prx_at = 1200; w.prx_ms += 100; w.prx_bytes += 10000;
+    w.sent_wire += 10000;
+    CHECK(rate_report_pay(&w) == 100000, "arrival rate uses the peer's elapsed time");
+    w.current = 1300;
+    CHECK(rate_report_pay(&w) == 100000, "a fresh sample spans the gap between reports");
+    w.current = 1401;
+    CHECK(rate_report_pay(&w) == 0, "a missing report cannot keep a stale rate alive");
+    w.current = w.prx_at = 1600; w.prx_ms += 1000; w.prx_bytes += 900000;
+    CHECK(rate_report_pay(&w) == 0, "resuming reports first discards the old interval");
+    w.current = w.prx_at = 1800; w.prx_ms += 1000; w.prx_bytes += 900000;
+    CHECK(rate_report_pay(&w) == 0, "compressed reports do not invent capacity");
+    w.current = w.prx_at = 4000;
+    CHECK(rate_report_pay(&w) == 0, "an idle interval establishes a new snapshot");
+    w.current = w.prx_at = 4200; w.prx_ms += 200; w.prx_bytes += 10000;
+    w.sent_wire += 10000;
+    CHECK(rate_report_pay(&w) == 50000, "ordinary reports recover after the idle interval");
+    w.current = w.prx_at = 4400; w.prx_ms += 200; w.prx_bytes += 10000;
+    w.sent_wire += 1000;
+    CHECK(rate_report_pay(&w) == 0, "backlog far above recent sending is rejected, not clamped to a false low rate");
+    w.current = w.prx_at = 4600; w.prx_ms += 200; w.prx_bytes += 10000;
+    w.sent_wire += 10000;
+    CHECK(rate_report_pay(&w) == 50000, "a rejected sample does not poison the next interval");
+
+    memset(&w, 0, sizeof(w));
+    w.rate.share = 256; w.rx_srtt = 100;
+    w.current = w.prx_at = UINT32_MAX - 99;
+    w.prx_valid = 1; w.prx_ms = 1000; w.prx_bytes = 100000;
+    w.sent_wire = UINT32_MAX - 9999;
+    CHECK(rate_report_pay(&w) == 0, "snapshot before local clock wrap");
+    w.current += 200; w.prx_at = w.current; w.prx_ms += 200; w.prx_bytes += 20000;
+    w.sent_wire += 20000;
+    CHECK(rate_report_pay(&w) == 100000, "arrival sampling survives local clock and sent-byte counter wrap");
+
+    /* A slower path still delivers 100 kB/s, even when old frames expire
+       before their ACKs arrive. */
+    memset(&w, 0, sizeof(w));
+    w.mss = 1200; w.rate.share = 256; w.btl_bw = 375000;
+    w.rx_srtt = 360; w.rate.rtt_min = w.rate.rtt_old = 100;
+    w.current = w.prx_at = w.rate.ts = w.rate.rtt_ts = 800;
+    w.prx_valid = 1; w.prx_ms = 1000; w.prx_bytes = 100000;
+    w.rate.target = 300000; w.rate.delivered_pay = 60000;
+    w.rate.steps = 5; w.rate.dlv_avg = w.rate.pay_avg = w.rate.pay_avg_prev = 300000;
+    (void)rate_report_pay(&w);
+    w.current = w.prx_at = 1000; w.prx_ms += 200; w.prx_bytes += 20000;
+    w.sent_wire = 60000; w.tx_payload = 60000; w.delivered = 60000;
+    rate_update(&w);
+    CHECK(w.rate.target == 270000, "arrival alone cannot replace feedback while the model is still stale (%u)", w.rate.target);
+    w.current = w.prx_at = 1200; w.prx_ms += 200; w.prx_bytes += 20000;
+    w.sent_wire += 20000; w.tx_payload += 20000;
+    w.btl_bw = 125000;
+    w.rate.capacity_short = w.rate.cs_loss = 1;
+    w.rate.dlv_avg = 1000;
+    rate_update(&w);
+    CHECK(w.rate.target == 90000, "expired ACKs do not hide a draining queue (%u)", w.rate.target);
+    w.current = w.prx_at = 1400; w.prx_ms += 200; w.prx_bytes += 20000;
+    w.sent_wire += 20000; w.tx_payload += 20000;
+    w.rx_srtt = 100; w.rate.dlv_avg = 20000;
+    rate_update(&w);
+    CHECK(w.rate.target == 48000, "without a queue the ACK ceiling and minimum window still apply (%u)", w.rate.target);
+}
+
 static void test_target_rate(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o; anl_stats st;
@@ -4508,6 +4581,24 @@ static void test_target_rate(void)
     CHECK(st.target_rate > 0, "target_rate in the stats (%u)", st.target_rate);
     CHECK(g_rate_calls > 2, "callbacks (%d)", g_rate_calls);
     net_stop(&n);
+}
+
+/* Full-suite RNG states that exposed the post-drop feedback collapse.
+   Preserve the caller's sequence so this regression does not change the
+   random network of unrelated tests. The same end-to-end bounds apply. */
+static void test_target_rate_drop_replay(void)
+{
+    static const uint64_t states[] = {
+        0x12b4ba65884038a4ULL, 0x10558d6c05b9d5c5ULL,
+        0xaf192a57cde035d5ULL, 0x2c85e17823fecb33ULL
+    };
+    uint64_t saved = g_seed;
+    unsigned i;
+    for (i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+        g_seed = states[i];
+        test_target_rate();
+    }
+    g_seed = saved;
 }
 
 /* delay reports (DESIGN 6.9): the receiver measures, the sender learns */
@@ -4925,7 +5016,9 @@ int main(void)
     RUN(test_tiny_rtt());
     RUN(test_target_rate_wrap());
     RUN(test_target_rate_queued_ack_burst());
+    RUN(test_target_rate_reports());
     RUN(test_target_rate());
+    RUN(test_target_rate_drop_replay());
     RUN(test_delay_report());
     RUN(test_outage());
     RUN(test_rtt_stale_ack());

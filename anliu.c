@@ -890,6 +890,9 @@ struct anl_s {
         uint32_t ts, share;       /* payload share of the wire bytes, 1/256 */
         uint32_t target, told;    /* target_rate; the value last given to rate_cb */
         uint32_t rtt_min, rtt_old, rtt_ts;  /* min srtt over 15..30 s (two windows) */
+        uint64_t report_bytes, report_ms; /* receiver-report snapshot: includes data retired before its ACK */
+        uint32_t report_ts, report_wire, report_rate, report_at; /* local time / sent_wire at snapshot; wire rate and its sample time */
+        int report_valid;             /* snapshot initialized; not a claim that report_rate is still fresh */
         uint32_t pay_avg_prev;              /* pay_avg a step ago: delivery trails sending by a round trip, about a step */
     } rate;
     anl_stream *dflt;                   /* default stream, sid 0 */
@@ -5512,11 +5515,48 @@ static void rate_par_budget(anl_t *w, int32_t dt, uint64_t dwire, uint64_t dpar)
     }
 }
 
+/* ACK accounting stops at frame expiry, even while the bottleneck keeps
+   delivering that frame. During a queue drain it can therefore report no
+   delivery at all. The peer's cumulative wire count survives that expiry.
+   Measure it over at least one rate step in the peer's clock, checking that
+   this interval agrees with local elapsed time (not a compressed report
+   burst). A report delivering over twice the recent sending is old backlog,
+   not evidence for the current source rate: discard it rather than clamping
+   it to an artificially low measurement when sending pauses. Keep a sample
+   for at most one report period; after an idle or a stale report, take a new
+   snapshot first. This only informs encoder rate:
+   ACK-based capacity_short still controls parity and recovery probes. */
+static uint32_t rate_report_pay(anl_t *w)
+{
+    uint64_t ms = w->prx_ms - w->rate.report_ms;
+    uint32_t elapsed = (uint32_t)tdiff(w->current, w->rate.report_ts);
+    if (!w->prx_valid || !bbr_report_fresh(w)) {
+        w->rate.report_valid = 0;
+        w->rate.report_rate = 0;
+        return 0;
+    }
+    if (!w->rate.report_valid || elapsed > 10 * RATE_STEP_MS) {
+        w->rate.report_valid = 1;
+        w->rate.report_rate = 0;
+    } else if (elapsed >= RATE_STEP_MS && ms >= RATE_STEP_MS && ms * 2 >= elapsed && ms <= elapsed + bbr_report_age(w)) {
+        uint64_t wire = (w->prx_bytes - w->rate.report_bytes) * 1000 / ms;
+        uint64_t sent = (uint32_t)(w->sent_wire - w->rate.report_wire);
+        w->rate.report_rate = wire <= sent * 2000 / elapsed ? sat32(wire) : 0;
+        w->rate.report_at = w->current;
+    } else return w->rate.report_rate && tdiff(w->current, w->rate.report_at) <= (int32_t)bbr_report_age(w)
+                 ? sat32((uint64_t)w->rate.report_rate * w->rate.share / 256) : 0;
+    w->rate.report_bytes = w->prx_bytes;
+    w->rate.report_ms = w->prx_ms;
+    w->rate.report_ts = w->current;
+    w->rate.report_wire = w->sent_wire;
+    return sat32((uint64_t)w->rate.report_rate * w->rate.share / 256);
+}
+
 static void rate_update(anl_t *w)
 {
     int32_t dt = tdiff(w->current, w->rate.ts);
     uint64_t dp, dwire, dd, dpar, base, pay_rate, floor;
-    uint32_t rmin, queue, qthresh;
+    uint32_t rmin, queue, qthresh, reported;
     int delivery_limited;
     if (w->rate.ts != 0 && dt < RATE_STEP_MS) return;
     dp = w->tx_payload - w->rate.payload0;
@@ -5562,6 +5602,14 @@ static void rate_update(anl_t *w)
        in bursts) */
     qthresh = umax32(rmin / 4, 25);
     if (queue > qthresh) w->rate.par_queue_ts = w->current | 1;
+    reported = rate_report_pay(w);
+    /* This repairs ACK undercount during a queue drain, not the policer or
+       app-limited ceiling. Require arrivals to sustain at least 80% of the
+       model: a stale burst estimate or a propagation-delay jump must still
+       use ACK feedback to reduce the source. BBR must first converge to the
+       slower link; a raw arrival report alone cannot certify that model. */
+    if (queue <= umax32(rmin / 2, 30) ||
+        (uint64_t)bbr_bw(w) * w->rate.share / 256 > (uint64_t)reported * 5 / 4) reported = 0;
     base = (uint64_t)bbr_bw(w) * w->rate.share / 256 * (100 - RATE_MARGIN) / 100;
     pay_rate = dp * 1000 / (uint32_t)dt;
     delivery_limited = w->rate.steps >= 5 && w->rate.dlv_avg != 0 &&
@@ -5580,6 +5628,10 @@ static void rate_update(anl_t *w)
            this step's rate */
         uint64_t now_pay = dd * 1000 / (uint32_t)dt * w->rate.share / 256, cut;
         if (!w->rate.cs_loss && now_pay < w->rate.dlv_avg) now_pay = w->rate.dlv_avg;
+        /* Prefer arrival over ACK goodput: it follows a slower bottleneck
+           promptly, and does not collapse when queued frames expire. A
+           rejected or missing report leaves the ACK fallback intact. */
+        if (reported) now_pay = reported;
         cut = now_pay * (100 - RATE_MARGIN) / 100;
         if (cut < floor) cut = (uint64_t)w->rate.target * (100 - RATE_DECREASE) / 100;
         if (cut < floor) cut = floor;
@@ -5622,7 +5674,9 @@ static void rate_update(anl_t *w)
        upward ramp to produce the load whose delivery the test measures.
        Capping it at old delivery otherwise defeats the requested probe. */
     if (delivery_limited && !w->rate.cs_test_ts) {
-        uint64_t cap = (uint64_t)w->rate.dlv_avg * (100 - RATE_MARGIN) / 100;
+        /* Recent arrivals are also evidence of delivery when those bytes
+           have already been retired from ACK accounting. */
+        uint64_t cap = (uint64_t)umax32(w->rate.dlv_avg, reported) * (100 - RATE_MARGIN) / 100;
         if (cap < floor) cap = floor;
         if (base > cap) base = cap;
     }
