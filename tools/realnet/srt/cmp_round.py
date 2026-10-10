@@ -38,6 +38,7 @@ from cmp_checks import recommended_latency, validate_lane
 B = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(B.parent))
 import hosts as H
+import rnlib as R
 HOSTS = H.load()
 argv = sys.argv[1:]
 dur = 600; anl_variant = 'main'; delay = 0
@@ -123,8 +124,8 @@ try:
     protos = [(n, known[n]) for n in want]
     meta['drive'] = 'check' if drive_check else 'poll1ms'
     meta['delay_ms'] = delay
-    subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(B.parent / 'multi_tc.py'),
-                    S['ssh'] + ':' + CMP(S) + '/multi_tc.py'], check=True, timeout=120)
+    # over the ssh master connection, retried (a public sshd drops some new logins)
+    R.upload(S, B.parent / 'multi_tc.py', CMP(S) + '/multi_tc.py')
     for k, (name, cfg) in enumerate(protos):
         port = pbase + k
         busy = ssh(S, f"ss -uan | grep -E '[:.]{port}[[:space:]]' || true").stdout.strip()
