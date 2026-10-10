@@ -12,9 +12,9 @@ p50 and video p95 extra delay (ms), wire kbps (percent of the baseline).
 A round is left out (SKIP) when a lane's end-to-end datagram loss (sender
 DATAGRAM_COST tx_packets against the receiver's rx_packets) is more than
 2 points above the tc loss: the path or the sender's egress dropped on its
-own (docs/testcases/realnet/README.md, egress capacity).
+own (docs/testcases/03-realnet.md, egress capacity).
 --limits checks the overall means against the regression limits of
-docs/testcases/realnet/RN-02 and prints LIMIT lines (FAIL when a mean is
+docs/testcases/RN-02-media-delay-pair.md and prints LIMIT lines (FAIL when a mean is
 worse than its limit and the interval excludes 0)."""
 import sys, json, glob, re, statistics, collections
 from pathlib import Path

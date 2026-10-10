@@ -1,6 +1,6 @@
-# 测试用例
+# 测试
 
-这个目录记录 AnLiu 的测试用例，分四类：
+本文件说明 AnLiu 的测试用例怎样组织、版本回归怎样做、结果怎样判定。用例本身放在 [testcases/](testcases/) 目录，分四类：
 
 - 单元测试；
 - 仿真（单机，虚拟时间）；
@@ -11,19 +11,20 @@
 
 相关文档：
 
-- 测试结果的历史：[PROGRESS.md](../PROGRESS.md)；
-- 性能数据：[PERFORMANCE.md](../PERFORMANCE.md)；
-- 对比数据：[COMPARISON.md](../COMPARISON.md)；
-- 实网工具：[tools/realnet/README.md](../../tools/realnet/README.md)。
+- 测试结果的历史：[PROGRESS.md](PROGRESS.md)；
+- 性能数据：[PERFORMANCE.md](PERFORMANCE.md)；
+- 对比数据：[COMPARISON.md](COMPARISON.md)；
+- 实网工具：[tools/realnet/README.md](../tools/realnet/README.md)。
 
 ## 目录
 
 | 文件 | 编号 | 内容 | 执行 |
 |---|---|---|---|
-| [unit.md](unit.md) | UT、AT、DG、FZ、SAN | `test.c`、攻击测试、诊断核算、模糊测试、Sanitizer 构建 | `ctest`；FZ 由代理执行 |
-| [sim.md](sim.md) | SM | 媒体仿真门槛、新旧版本成对仿真、多种子单元测试 | 脚本，按本文件判定 |
-| [realnet/](realnet/) | RN | 实网测试，每个用例一个文件；主机与参数见 [realnet/README.md](realnet/README.md) | 代理 |
-| [template.md](template.md) | | 新增代理用例的模板 | |
+| [testcases/01-unit.md](testcases/01-unit.md) | UT、AT、DG、FZ、SAN | `test.c`、攻击测试、诊断核算、模糊测试、Sanitizer 构建 | `ctest`；FZ 由代理执行 |
+| [testcases/02-sim.md](testcases/02-sim.md) | SM | 媒体仿真门槛、新旧版本成对仿真、多种子单元测试 | 脚本，按本文件判定 |
+| [testcases/03-realnet.md](testcases/03-realnet.md) | RN | 实网用例的环境与参数：主机与路径、出口容量、变体部署、有效轮次、批次脚本 | |
+| [testcases/RN-*.md](testcases/) | RN | 实网测试，每个用例一个文件 | 代理 |
+| [testcases/00-template.md](testcases/00-template.md) | | 新增代理用例的模板 | |
 
 ## 版本回归
 
@@ -34,7 +35,7 @@
 - UT / AT / DG / SAN 全部通过；
 - SM-01 通过；
 - SM-03 的失败只出现在已知不稳定的检查上；
-- 改动涉及拥塞控制或 FEC 时，加做 SM-02。
+- 改动涉及拥塞控制、FEC 或重传时，加做 SM-02。
 
 **第二步：实网部署与冒烟（RN-01）。**
 
@@ -55,12 +56,12 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && (cd 
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DANLIU_ENABLE_SANITIZERS=ON && cmake --build build-asan -j && (cd build-asan && ctest --output-on-failure)
 ```
 
-实网用例需要 `ANL_REALNET_HOSTS`（主机表）与 `ANL_REALNET_WORK`（本批次的工作目录）。详见 [realnet/README.md](realnet/README.md)。
+实网用例需要 `ANL_REALNET_HOSTS`（主机表）与 `ANL_REALNET_WORK`（本批次的工作目录）。详见 [testcases/03-realnet.md](testcases/03-realnet.md)。
 
 ## 判定
 
 - **脚本与 `ctest`**：退出码为 0，并且没有 `FAIL` 行，即为通过。
-- **代理用例**（`sim.md` 的成对部分、`realnet/`、FZ）：按文件中的"通过规则"逐条判定，全部满足才算通过。
+- **代理用例**（`02-sim.md` 中标为"代理"的用例、`RN-*.md`、FZ）：按文件中的"通过规则"逐条判定，全部满足才算通过。
 - **成对对照的差值**：一律写成"候选 − 基线"。
   - 只有均值超过限值，并且 95% 区间不含 0，才判为回归。
   - 均值超过限值、但区间含 0 的，记为"待确认"：在同一场景加种子重跑一次，再判定。
@@ -79,6 +80,7 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DANLIU_ENABLE_SANITIZERS=ON &
    - 每台主机上同时运行的轮次，限速合计不超过该主机的 `cap_kbps − 5000`（单位 kbit/s）。
    - 发送端与接收端都要计入。
 5. **丢包与时延统一由 tc 在发送端实现**（`multi_tc.py`），不在应用里丢包。
+   - `cmp_round.py` 与 `churn_round.py` 总是这样；`multi_round.py` 要加 `--tc-loss`（任务文件里 `"tc_loss": true`），否则它默认在应用的接收侧随机丢包。
    - 丢包率取 3 / 5 / 7 / 10%，重点是 3% 与 5%（用两个种子）；完整回归加 15%，不超过 15%。
 6. **无效轮次**（进程退出码非 0、运行时长不完整、tc 计数为 0、日志校验失败）**不计入结果。**
    - 同一场景重跑一次；仍无效的，写明原因。
@@ -94,6 +96,6 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DANLIU_ENABLE_SANITIZERS=ON &
 
 ## 维护
 
-- 新增代理用例：复制 [template.md](template.md) 到 `realnet/`，文件名为"编号-简短英文名.md"，编号不复用。
+- 新增代理用例：复制 [testcases/00-template.md](testcases/00-template.md)，在 `testcases/` 下新建"编号-简短英文名.md"（例如 `RN-07-xxx.md`），编号不复用。
 - 修改测试工具（`bench/`、`tools/realnet/`）时，同时修改引用它的用例的步骤。
 - 新的前缀要在本文"目录"一节中登记。

@@ -1,6 +1,6 @@
 /*
  * fuzz_peer.c - libFuzzer target for the receive path under the "peer holds
- * the PSK" model (SECURITY_AUDIT.md 4). A key holder can make any plaintext
+ * the PSK" model (docs/SECURITY_AUDIT.md 4). A key holder can make any plaintext
  * authenticate, so what it reaches is anl_input_plain: the datagram header
  * and every segment type. The fuzzer input is fed there directly - what
  * siv_open hands the parser after a successful check.

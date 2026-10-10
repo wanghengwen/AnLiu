@@ -12,7 +12,7 @@
 | `ANL_REALNET_WORK` | 本地工作目录：变体、`results/`、`events.jsonl`（默认当前目录） |
 | `ANL_REALNET_REMOTE_DIR` | 远端测试目录，在各主机 `base` 之下（默认 `anliu-realnet`） |
 
-主机表每项：`ssh`（user@host）、`ip`（对端发往的地址）、`base`（远端家目录下的目录）、`dev`（出口网卡，发送端整形用）、`shape`（能否 `sudo -n tc`，只有能整形的主机可做发送端），以及调度用的 `cap_kbps`、`slots`、`pool`（同一台机器上的主机共用一个 pool）。
+主机表每项：`ssh`（user@host）、`ip`（对端发往的地址）、`base`（远端家目录下的目录）、`dev`（出口网卡，发送端整形用）、`shape`（能否 `sudo -n tc`，只有能整形的主机可做发送端），以及调度用的 `cap_kbps`（默认 30000）、`slots`（每个 pool 同时运行的进程数上限，默认 3）、`pool`（同一台机器上的主机共用一个 pool，默认主机名）、`port_base`（`multi_sched_pair.py` 分配端口的起点，默认 9900）。
 
 ## 前提
 
@@ -38,9 +38,9 @@ python3 tools/realnet/multi_round.py a b cand 901 2000 9900 --loss 5 --drive-che
 python3 tools/realnet/multi_sched_pair.py jobs.jsonl sched-log/
 ```
 
-`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，范围 0–15%，默认 15）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE）、`--tc-loss`（`--loss` 改由 tc 在发送端两个方向丢包，应用内不丢）、`--fec-off`（关闭 FEC，只靠重传）、`--queue-ms MS`（TBF 的队列，默认 100）、`--police`（令牌桶限速器：tc police 按 RATE_KBPS 限速，桶为 `--burst`，默认 64 KB，超出即丢、不排队；它后面是 `--line KBPS` 的线路，默认 40000，即本频段的 TBF 及其 `--queue-ms` 队列），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。
+`multi_round.py` 的选项：`--loss`（两端接收侧随机丢包，范围 0–15%，默认 15）、`--unlimited`（不限速，只计字节）、`--delay MS`（发送端附加单向时延）、`--burst BYTES`（TBF 桶，默认 16 KB；约 3200 时接近普通 FIFO 队列）、`--audio-only`、`--audio-max-age MS`、`--video-max PERMILLE`（编码器上限）、固定码率（位置参数 FIXED_SCALE）、`--tc-loss`（`--loss` 改由 tc 在发送端两个方向丢包，应用内不丢）、`--fec-off`（关闭 FEC，只靠重传）、`--queue-ms MS`（TBF 的队列，默认 100）、`--police`（令牌桶限速器：tc police 按 RATE_KBPS 限速，桶为 `--burst`，默认 64 KB，超出即丢、不排队；它后面是 `--line KBPS` 的线路，默认 40000，即本频段的 TBF 及其 `--queue-ms` 队列），以及 `--drive-check`（两端按 `anl_check` 决定下一次 `anl_update`，与应用的用法一致；不加时每 1 ms 轮询一次）。范围检查：`--loss` 0..15、`--delay` 0..200、`--burst` 1600..4 MB、`--queue-ms` 1..1000、`--video-max` 1000..20000、`--line` 1000..1000000。
 
-测试用例（场景、轮次与通过规则）见 [docs/testcases/realnet](../../docs/testcases/realnet/README.md)。
+测试用例（场景、轮次与通过规则）见 [docs/TESTING.md](../../docs/TESTING.md)；实网用例的主机、带宽预算与有效轮次的规定见 [docs/testcases/03-realnet.md](../../docs/testcases/03-realnet.md)。
 
 结果在 `$ANL_REALNET_WORK/results/<tag>.{json,srv,cli,bw}`，两个变体成对轮次的差值用 `multi_pair.py BASE CAND`（tc、TBF 与限速器之外的丢包超过发送数 2% 的轮次判为 SKIP）；
 
@@ -57,7 +57,7 @@ python3 tools/realnet/churn_round.py run g5 rb close 1 9850 --loss 5 --delay 100
 python3 tools/realnet/churn_ana.py                                       # 汇总 results/churn_*.json
 ```
 
-服务端用 `multi_tc.py` 独占一个频段：TBF 默认 8000 kbit（只是上限），`--loss` 两个方向随机丢包，`--delay` 增加单向时延。每端输出关闭确认时间的分布（从本端关闭到收到对端 RST）、被拒绝的打开数、对端读到的数据，以及结束时的检查（`CHURN_FINAL ok=1`：两端只剩默认流、没有待确认的关闭）。
+服务端用 `multi_tc.py` 独占一个频段：TBF 默认 8000 kbit（只是上限），`--loss` 两个方向随机丢包，`--delay` 增加单向时延。每端输出关闭确认时间的分布（从本端关闭到收到对端 RST）、被拒绝的打开数、对端读到的数据，以及结束时的检查（`CHURN_FINAL` 行的 `ok=1`：两端只剩默认流、没有待确认的关闭）。
 
 每条消息带打开方的流编号（`uid`，本端打开次数的低 16 位）：接收方记下第一条消息的编号，之后编号不同的消息是另一个流的数据串入，记为 `gen_errors`（sid 在连接内不复用，DESIGN 6.1；2026-10-08 之前的版本复用 sid，这项检查针对上一代流）。`CHURN_OPEN max_sid` 是本端用到的最大 sid，`CHURN_NET replays` 是路径重复的数据报（`ANL_EREPLAY`，不算错误）。连接在收到握手包时才创建，启动慢的客户端不会让服务端先空闲超时。
 

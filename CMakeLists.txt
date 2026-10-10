@@ -169,7 +169,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(ANLIU_BUILD_FUZZERS)
-    # Receive path when the peer holds the PSK (SECURITY_AUDIT.md 4): the
+    # Receive path when the peer holds the PSK (docs/SECURITY_AUDIT.md 4): the
     # target feeds plaintext datagrams to the parser, so it includes anliu.c
     # like test.c does. anl_fuzz_seeds writes seeds from a real exchange.
     set(ANLIU_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)

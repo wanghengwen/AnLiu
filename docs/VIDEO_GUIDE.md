@@ -76,7 +76,7 @@ v.drop_until_key = 1;                   /* 发送端：一帧放弃后，丢到�
 
 ### 3.4 接收端：在 accept 回调里设本地选项
 
-流的模式、tag、`rcv_wnd` 由打开方决定，其他选项是**各端本地的**，接收端要在 accept 回调里设置；不设就用默认值（`fec` 为自动、`max_age_ms = 500`、`rcv_deadline_ms = -1` 即本地 `max_age_ms` 的 3/5）。FEC 需要两端都启用，默认即是。
+流的模式、`stream`、tag、`rcv_wnd` 由打开方决定，其他选项是**各端本地的**，接收端要在 accept 回调里设置；不设就用默认值（`fec` 为自动、`max_age_ms = 500`、`rcv_deadline_ms = -1` 即本地 `max_age_ms` 的 3/5）。FEC 需要两端都启用，默认即是。
 
 ```c
 static int on_accept(anl_t *w, anl_stream_t *s, anl_stream_opt *opt, void *user)
@@ -105,7 +105,7 @@ anl_set_accept(w, on_accept);
 ## 4. 运行中看什么
 
 - `anl_get_stats`：`target_rate`（编码器码率）、`capacity_short`（链路容量低于媒体，自适应 FEC 暂停）、`srtt` / `min_rtt`。
-- `anl_stream_get_stats`：发送端 `fec_ratio`（自动模式开门时的名义比例，0 表示当前不发校验包）、`frames_dropped`（发送端放弃的帧）；接收端 `frames_skipped`、`fec_recovered`、`frames_discarded`（`rcv_drop_until_key` 丢弃的不可解码帧）。
+- `anl_stream_get_stats`：发送端 `fec_ratio`（自动模式开门时的名义比例，0 表示 RTT 门关着，关键帧仍可能单独带校验包）、`frames_dropped`（发送端放弃的帧）；接收端 `frames_skipped`、`fec_recovered`、`frames_discarded`（`rcv_drop_until_key` 丢弃的不可解码帧）。
 - `peer` / `rx` 时延报告（`report = 1`，两种流默认都开启；自适应 FEC 用它估计丢包，限速器检测用其中的 `rx_bytes` 计算送达率，不要关）：`frame_delay_max_ms` 接近 B 说明在预算边缘。
 
 ## 5. 小结

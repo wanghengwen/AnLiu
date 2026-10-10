@@ -76,10 +76,10 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→g5，16 对，`LIMITS O
   | 线上带宽 | ≤ +3% |
 
 - 任何一个场景（时延 × 丢包）的音频均值低于基线 2 个百分点以上，或视频均值低于基线 5 个百分点以上，都要在该场景加两个种子（503、504）重跑，并以全部轮次的均值重新判定；
-- 两个版本都没有 `DEAD` 行（`grep -l "^DEAD" results/*.srv results/*.cli` 为空）；
-- 每一轮每个 lane 的端到端丢包（`DATAGRAM_COST` 的发送与接收之差）与 tc 设定相差不超过 2 个百分点，否则该轮无效（见 [README.md](README.md) 的"出口容量"一节）。
+- 两个版本都没有 `DEAD` 行（`grep -l "^DEAD" results/cmp_*.srv results/cmp_*.cli` 为空）；
+- 每一轮每个 lane 的端到端丢包（`DATAGRAM_COST` 的发送与接收之差）与 tc 设定相差不超过 2 个百分点，否则该轮无效（见 [03-realnet.md](03-realnet.md) 的"出口容量"一节）。
 
-`LIMIT ... WARN`（均值超出限值、但区间含 0）记为"待确认"，按 [../README.md](../README.md) 的判定规则处理。
+`LIMIT ... WARN`（均值超出限值、但区间含 0）记为"待确认"，按 [../TESTING.md](../TESTING.md) 的判定规则处理。
 
 ## 基准
 
@@ -107,5 +107,5 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→g5，16 对，`LIMITS O
 ## 失败时收集
 
 - `pair.txt`；
-- 差值最大的那一轮两个 lane 的 `.srv` 与 `.cli`：`DEAD`、`HEALTH`、`STATS` 行，以及末尾 50 行；
+- 差值最大的那一轮两个 lane 的 `.srv` 与 `.cli`：`DEAD`、`HEALTH`、`DATAGRAM_COST` 行和 `MDIAG_T` 采样，以及末尾 50 行；
 - 该轮的 tc 丢包（`cmp_ana.py` 的 `loss` 列）。

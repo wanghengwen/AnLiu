@@ -2,7 +2,7 @@
  * anliu.h - AnLiu（暗流）: an encrypted, multi-stream, semi-reliable ARQ
  * protocol over UDP, modelled after ikcp.
  *
- * See DESIGN.md for the wire format and protocol rules.
+ * See docs/DESIGN.md for the wire format and protocol rules.
  *
  * Threading: like ikcp, all calls on one anl_t must be serialised by the
  * caller. Different anl_t instances share only immutable GF tables. Each
@@ -28,12 +28,6 @@ extern "C" {
 /*---------------------------------------------------------------------
  * version / limits
  *---------------------------------------------------------------------*/
-#define ANL_VERSION         1       /* wire version, flg bit7-6 */
-
-#define ANL_MAX_SID         ((1 << 25) - 1) /* 4 bits in the segment's first byte, 25 with the
-                                               varint extension (DESIGN 5). Each side's sids go up
-                                               by 2 from its first one, none is used twice on a
-                                               connection (DESIGN 6.1) */
 #define ANL_MAX_STREAMS     64      /* streams on a connection at once, both sides' and the
                                        default stream included (DESIGN 6.1) */
 #define ANL_SID_DEFAULT     0       /* the default stream, created with the connection */
@@ -45,7 +39,6 @@ extern "C" {
 #define ANL_TAG_SIZE        12      /* SipHash-2-4-128 truncated, doubles as nonce */
 #define ANL_HDR_SIZE        11      /* conv(4) + flg(1) + ts(2) + pn(4) */
 #define ANL_OVERHEAD        (ANL_TAG_SIZE + ANL_HDR_SIZE)   /* 23 */
-#define ANL_FEC_OVERHEAD    12      /* mss reduction for FEC streams */
 
 /*---------------------------------------------------------------------
  * return codes
@@ -69,7 +62,7 @@ extern "C" {
 #define ANL_EBUSY         -16       /* retry later: ANL_MAX_STREAMS streams on the connection (closed
                                        ones the peer has not confirmed yet included) */
 #define ANL_EREPLAY       -17       /* datagram pn seen already or below the replay window (DESIGN 4.3), dropped */
-#define ANL_ENOSID        -18       /* the connection's sids are used up (2^24 opens per side, DESIGN 6.1): open a new connection */
+#define ANL_ENOSID        -18       /* the connection's sids are used up (about 2^24 opens per side, DESIGN 6.1): open a new connection */
 
 /*---------------------------------------------------------------------
  * roles / modes / flags
@@ -110,7 +103,7 @@ typedef struct anl_config {
     int mtu;                    /* 1400 */
     int pad_max;                /* 32: datagrams without data (ACK, control) get 1..pad_max
                                    random bytes; data datagrams none. 0 = no padding; <= ANL_MAX_PAD */
-    anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG */
+    anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG; called with the anl_create user */
     anl_malloc_fn malloc_fn;    /* NULL (with free_fn NULL) = malloc / free; set both or neither.
                                    Everything the connection and its streams hold, the anl_t
                                    itself included, comes from it and goes back by anl_release */
@@ -364,7 +357,7 @@ int      anl_get_stats(const anl_t *w, anl_stats *out);
  * at once, reliable byte stream (ikcp semantics), strict priority over every
  * other stream, cannot be closed by either side: a segment of the peer's
  * that would reset another stream (a frame number, FWD, other stream
- * parameters) is dropped there (DESIGN 6.1). Windows: cfg.default_snd_wnd / rcv_wnd.
+ * parameters) is dropped there (DESIGN 6.1). Windows: cfg.default_snd_wnd / default_rcv_wnd.
  *---------------------------------------------------------------------*/
 int      anl_send(anl_t *w, const char *buf, int len);
 int      anl_recv(anl_t *w, char *buf, int len);
@@ -382,16 +375,13 @@ anl_stream_t *anl_default_stream(anl_t *w);
  * can still be read, then calls return ANL_ECLOSED, and the application
  * still has to close it.
  *---------------------------------------------------------------------*/
-/* Opens a stream with an automatically allocated sid: the lowest free one of
- * this side's parity (client even from 2, server odd); a sid whose stream is
- * gone is used again after a hold: 2 s (ts_window_ms + 1 s if longer) from
- * when the stream went on both sides - for a close of ours, from the peer's
- * confirmation; one whose close the peer never confirmed is not used again
- * (DESIGN 6.1). There is
- * no handshake: the first segments carry the stream parameters and the peer
- * creates the stream on arrival.
- * Returns NULL on failure with the reason in *err (optional):
- * ANL_EINVAL / ANL_EDEAD / ANL_EBUSY (ANL_MAX_STREAMS open) / ANL_ENOMEM. */
+/* Opens a stream with an automatically allocated sid: the next one of this
+ * side's parity (client even from 2, server odd from 1); no sid is used twice
+ * on a connection (DESIGN 6.1). There is no handshake: the first segments
+ * carry the stream parameters and the peer creates the stream on arrival.
+ * Returns NULL on failure with the reason in *err (optional): ANL_EINVAL /
+ * ANL_EDEAD / ANL_EBUSY (ANL_MAX_STREAMS open) / ANL_ENOSID (the sids are
+ * used up) / ANL_ENOMEM. */
 anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
 
 /* Release the stream here and the handle: unsent, unacknowledged and unread

@@ -17,7 +17,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
 | Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
-See [DESIGN.md](docs/DESIGN.md) for the detailed design and [PERFORMANCE.md](docs/PERFORMANCE.md) for performance data; comparison tools are in `bench/`. (The first two are currently in Chinese.)
+See [DESIGN.md](docs/DESIGN.md) for the detailed design, [PERFORMANCE.md](docs/PERFORMANCE.md) for performance data and [TESTING.md](docs/TESTING.md) for the test cases and the release regression; comparison tools are in `bench/`. (These documents are currently in Chinese.)
 
 ## Build and install
 
@@ -83,7 +83,7 @@ anl_get_stats(w, &st);
    st.min_rtt / st.cc_state: propagation delay; STARTUP / DRAIN / PROBE_BW / PROBE_RTT */
 ```
 
-**Bitrate for the encoder** (DESIGN 6.10): `st.target_rate` already excludes headers, FEC parity, retransmissions and a 10% margin; it is the total **payload** bytes/s all streams may send. A callback fires when it changes by more than 5%:
+**Bitrate for the encoder** (DESIGN 6.10): `st.target_rate` already excludes headers, FEC parity, retransmissions and a 10% margin; it is the total **payload** bytes/s all streams may send. A callback fires when it changes by 5% or more:
 
 ```c
 static void on_rate(anl_t *w, uint32_t target_rate, void *user)
@@ -140,7 +140,7 @@ In real-time scenarios, retransmission is usually too late: a loss costs "loss d
 **Main parameter of fixed redundancy: the ratio** `fec_ratio` (parity packets per 100 data packets, default 25):
 
 - A block collects for at most 100 ms (or 64 packets) before it is sealed; the fixed ratio allocates parity by accumulating the remainder of `k × ratio`, at most 16 parity packets per block; a block can span multiple frames, and actual recovery also depends on pacing, scheduling and network delay;
-- Subsequent parity packets are spaced at least 5 ms apart; actual timing depends on flushes, pacing and scheduling. Small-block parity can ride with data from the same stream’s next block; other parity is sent separately (possibly with ECHO);
+- Subsequent parity packets are spaced at least 5 ms apart; actual timing depends on flushes, pacing and scheduling. Small-block parity can ride with data from the same stream’s next block; other parity is sent separately (possibly with ECHO), never in the datagram of its own block's data, so that one loss does not take both;
 - For packets covered by parity, the sender's RACK wait starts from the send time of the block's last parity packet, RTO can also be delayed, subject to frame deadlines and whether a retry can still arrive in time (DESIGN 8.2).
 
 **Adaptive redundancy** (`opt.fec_ratio = 0`, DESIGN 8.5): the nominal ratio is adjusted according to losses that were not recovered in time, and the actual parity count is decided together with the connection loss estimate, block size and redundancy budget. In adaptive mode the nominal ratio varies between 10% and 100%; the parity count is further limited by the per-block cap, the retransmission capability at low latency, and the capacity-shortage state. Ratio and latency comparisons are in [PERFORMANCE.md](docs/PERFORMANCE.md).
@@ -274,6 +274,8 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 4. Changes to congestion control, FEC or scheduling also get a real-network comparison (6.3);
 5. Test data, code version and limitations go into docs/PERFORMANCE.md; when implementation rules change, docs/DESIGN.md is updated as well.
 
+The test cases, steps and pass rules of the release regression are in [TESTING.md](docs/TESTING.md).
+
 ---
 
 ## 7. Next steps and suggestions
@@ -289,7 +291,10 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 
 ## 8. Quick example
 
+A fragment: sockets, the clock and error handling are left out; `my_psk`, `conv`, `now_ms`, `pkt` and the frame variables come from the application.
+
 ```c
+#include <string.h>
 #include "anliu.h"
 
 static int udp_out(char *buf, int len, anl_t *w, void *user) {
@@ -326,7 +331,7 @@ anl_stream_close(video);                      /* the handle is invalid after clo
 anl_release(w);
 ```
 
-See `anliu.h` for the full API and [DESIGN.md](docs/DESIGN.md) for protocol details.
+See `anliu.h` for the full API and [DESIGN.md](docs/DESIGN.md) for protocol details. [VIDEO_GUIDE.md](docs/VIDEO_GUIDE.md) says when an audio/video application needs FEC and how to set the parameters.
 
 ## License
 

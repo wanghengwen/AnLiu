@@ -15,7 +15,7 @@ AnLiu 是一个基于 UDP 的传输协议，实现方式参考 [ikcp](https://gi
 | 现代丢包恢复 | 区间确认（SACK）+ 基于时间的丢包判定（RACK）+ 乱序自适应 |
 | 精简头部 | 数据报头 23 字节（含 12 字节认证和 4 字节包号），默认 MTU 下基础 DATA 段头 6~7 字节，分片扩展、帧号、流 ID 扩展和 OPEN 参数另计；kcp 每段 24 字节且不加密 |
 
-详细设计见 [DESIGN.md](docs/DESIGN.md)，性能测试数据见 [PERFORMANCE.md](docs/PERFORMANCE.md)，对照测试工具位于 `bench/`。
+详细设计见 [DESIGN.md](docs/DESIGN.md)，性能测试数据见 [PERFORMANCE.md](docs/PERFORMANCE.md)，测试用例与版本回归流程见 [TESTING.md](docs/TESTING.md)，对照测试工具位于 `bench/`。
 
 ## 编译与安装
 
@@ -94,7 +94,7 @@ anl_set_rate_callback(w, on_rate);
 
 它比直接用 `bw_estimate` 多做了三件事：应用受限（编码器发得比估计值少）且没有排队时，目标值最多每秒上调 25%，让编码器逐步试探；常规上升最多每秒 25%，持续交付受限时可在已测交付上界内恢复；RTT 显示瓶颈在排队时，立刻降到实际交付速率——带宽骤降后编码器还没跟上时，半可靠流的数据会在确认前过期，BBR 数秒内拿不到样本，而 RTT 仍然看得到队列。相关对照结果见 [PERFORMANCE.md](docs/PERFORMANCE.md)。
 
-**接收端时延反馈**（DESIGN 6.9）：接收端（两种流默认都开启）每 `max(srtt, 100 ms)` 把测得的抖动、排队时延、帧时延（最早分片发出到整帧收齐，扣除传播时延）、完成帧数和跳过帧数报告给发送端：
+**接收端时延反馈**（DESIGN 6.9）：接收端（两种流默认都开启）每 `max(srtt, 100 ms)` 把测得的抖动、排队时延、帧时延（最早分片发出到整帧收齐，扣除传播时延）、完成帧数和跳过操作数报告给发送端：
 
 ```c
 anl_stream_stats ss;
@@ -272,6 +272,8 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 4. 涉及拥塞控制、FEC、调度的修改，再做真实网络对照（6.3）；
 5. 测试数据、代码版本与限制写入 docs/PERFORMANCE.md；实现规则有变化时同步更新 docs/DESIGN.md。
 
+版本回归用到的用例、步骤与通过规则见 [TESTING.md](docs/TESTING.md)。
+
 ---
 
 ## 7. 下一步与建议
@@ -287,7 +289,10 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 
 ## 8. 快速示例
 
+下面是片段，省略了 socket、时钟和错误处理；`my_psk`、`conv`、`now_ms`、`pkt` 和帧变量由应用提供。
+
 ```c
+#include <string.h>
 #include "anliu.h"
 
 static int udp_out(char *buf, int len, anl_t *w, void *user) {
