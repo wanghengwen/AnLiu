@@ -1,0 +1,101 @@
+diff --git a/DESIGN.md b/DESIGN.md
+index 186a259..4df78fb 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -405,7 +405,7 @@ rttval = 首样本 RTT / 2，后续按 1/4 平滑偏差
+ rto    = srtt + max(2 × interval, 4 × rttval, srtt / 4)
+ ```
+ 
+-两个更新间隔的下限覆盖对端 ACK 等待 flush 的延迟（最多一个间隔）和丢失 ACK 的补发（再晚一个间隔，5.3）：只留一个间隔时，低 RTT 下 RTO 与这两者赛跑，20 ms RTT 无丢包时音频每秒一次伪超时，5..15% 丢包时约三分之一的超时重传到达时对端已有该分片。RTO 限制在 30..60000 ms；分片超时后按 ×1.5 退避。分片的超时时刻另加它排在本端瓶颈积压之后的时间：所有发出的线上字节按 max(带宽估计, burst_bw) 排空，得到发送时刻仍在前面的积压，换算为时间后最多一个 srtt；容量不足时不加。关键帧及其校验包以高于瓶颈的速率发出，会推迟后续分片，按平滑 RTT 得出的 RTO 会对对端已收到的分片超时重传。每个输入数据报最多取一个 RTT 样本，来自 FRESH ACK 中最新的 ts_echo；负值与超过 60 s 的样本忽略。 收包间断超过当前 RTO 后进入回显恢复阶段：没有新确认发送缓冲中的分片、且回显年龄超过当前 RTO 的 ACK 不更新 RTT，避免积压的旧 ACK 重新放大计时器。收到年龄在当前 RTO 内的有效时延样本后退出恢复阶段。持续到达的普通 ACK 及窗口内的媒体回显仍可反映排队；真正新确认的数据仍可学习超过当前 RTO 的时延。
++两个更新间隔的下限覆盖对端 ACK 等待 flush 的延迟（最多一个间隔）和丢失 ACK 的补发（再晚一个间隔，5.3）：只留一个间隔时，低 RTT 下 RTO 与这两者赛跑，20 ms RTT 无丢包时音频每秒一次伪超时，5..15% 丢包时约三分之一的超时重传到达时对端已有该分片。RTO 限制在 30..60000 ms；分片超时后按 ×1.5 退避。分片的超时时刻另加它排在本端瓶颈积压之后的时间：所有发出的线上字节按 max(带宽估计, burst_bw) 排空，得到发送时刻仍在前面的积压，换算为时间后最多一个 srtt；容量不足时不加。关键帧及其校验包以高于瓶颈的速率发出，会推迟后续分片，按平滑 RTT 得出的 RTO 会对对端已收到的分片超时重传。积压估计看不到的队列（令牌桶的突发把它按以排空的速率抬高）另由 ACK 的进度兜底：分片超时时，若最近一次确认新数据的 ACK 确认的是比它早发出的数据、距今不到 RTO 的裕量（rto − srtt），且没有比它晚发出的数据被确认过，它是在路径仍按序交付的数据后面排队，不是丢失，超时时刻改为那次 ACK 加裕量；一旦有比它晚发的数据被确认，它就是洞，照常超时（或由 RACK 处理），所以帧尾丢失的等待不变。每个输入数据报最多取一个 RTT 样本，来自 FRESH ACK 中最新的 ts_echo；负值与超过 60 s 的样本忽略。 收包间断超过当前 RTO 后进入回显恢复阶段：没有新确认发送缓冲中的分片、且回显年龄超过当前 RTO 的 ACK 不更新 RTT，避免积压的旧 ACK 重新放大计时器。收到年龄在当前 RTO 内的有效时延样本后退出恢复阶段。持续到达的普通 ACK 及窗口内的媒体回显仍可反映排队；真正新确认的数据仍可学习超过当前 RTO 的时延。
+ 
+ 新数据受连接 cwnd、每流 `min(snd_wnd, rmt_wnd)` 与 pacing 共同约束。cwnd 限制新分片进入 snd_buf，重传不受 cwnd 预算限制，仍受 pacing 限速。FEC 校验段不进入待确认 inflight，但占本次 flush 的新数据预算。cwnd 上限 `ANL_MAX_WND`（32768），普通初始值 16，`start_rate` 可扩大初始窗口。
+ 
+diff --git a/TUNING.md b/TUNING.md
+index 0bc6dea..db9d051 100644
+--- a/TUNING.md
++++ b/TUNING.md
+@@ -375,3 +375,9 @@ A queue signal during the first confirmation's probe yields to ordinary congesti
+ `anliu.c`: bbr_policer (watching)
+ 
+ Real network, t1>rb (30 Mbit provider limit, ~100 ms, 1% loss), scx: 53..72% lost at 1.6..2.0 s, both intervals app-limited at 46..50 kB/s while the encoder was still ramping, still in STARTUP. They started a test at 48 kB/s, which the encoder could not exceed, so it passed; every probe after it underfed and the tested rate stood (TUNING.md 55): 88% of the round policed at 48 kB/s, timely video 0.3 Mbit against ~17. The losses were STARTUP's own; early heavy loss on t1>rb showed in 5 of ~60 rounds. A STARTUP interval still counts as evidence, but neither the second interval of the pair nor the test can be in STARTUP. In simulation a 1 MB bucket at 100 ms gives a pair across STARTUP's exit (16.1 s in it, 16.5 s after) and keeps its timing: barring the first interval as well delayed confirmation by 8..10 s (video -2..-4 points in two seeds). In all 19 real policer rounds (g5>t1) the first test came after STARTUP. Simulation (policers 10/12/30 Mbit, 64 KB / 1 MB, 20/100 ms, 0/1%, 5 seeds; FIFO 20..200 ms at 0..15%; FEC on at 2 Mbit): unchanged to the byte.
++
++## 60. rto_queued_hold: an RTO behind data the path is still delivering
++
++`anliu.c`: rto_queued_hold
++
++A 2 Mbit TBF with a 16 KB bucket at 1 ms RTT (media_loss, FEC off, 940 kbit video): the bucket lets a burst out at line rate, the delivery-rate samples read 125 Mbit and burst_bw 6.7, so vq_ms drained the backlog at once and read 0 while a key frame queued 60..110 ms in the TBF; every key frame's tail went on its 30 ms RTO, 1100 video RTOs in 120 s, all of segments the peer had, +8% wire. The same at 170 ms (10 Mbit, 5 Mbit video): the estimate was right at 10.4 Mbit but burst_bw 17.6 (ACK dispersion of a burst the bucket front-loaded, kept at its maximum), key frames paced at 22 Mbit into a 60..100 ms queue, 143 KB in flight, vq_ms 2 ms, 2900 RTOs a run of which 2700 the peer had. The hold reads the ACK progress instead of the model: 2 Mbit / 1 ms / bucket 1100 -> 0 RTOs, wire 17.47 -> 16.05 MB (the no-bucket figure), video p99 97 -> 70 ms. The matrix (2/5/10 Mbit, 1..300 ms, 0..3% loss, with and without the bucket, 6 seeds): wire -2.2 MB a run on average (-18 at 10 Mbit / 1 ms / bucket), key frames +0.1 at 1..100 ms, -1.0 at 170 ms (10 Mbit, 2..3% loss, bucket: -6.7 / -8.1), video and audio on time within 0.6 points everywhere. The 170 ms cost is the baseline's RTOs firing before the ACK evidence for a frame's lost middle segments (111 of 120 key frames need a retransmission at 2%): a blind retransmission a round trip after the send beats RACK, which waits for the queue, by 30..40 ms - at the price of the copies. Exempting a frame's last two fragments from the hold (a tail probe) buys nothing: the useful RTOs sit in the middle of the frame (of 208 useful RTOs 27 were the last two fragments). Pacing bursts at the measured path instead of burst_bw halves the 170 ms bucket cost but costs 2..4 points without a bucket (the ACK evidence arrives later when a burst goes out slower) - not taken. RFC 6298's restart of the timer on every ACK of new data (tried earlier) delays the first unacknowledged segment too: the same key frame cost without the hold's exemption of holes.
+diff --git a/anliu.c b/anliu.c
+index cee1f1e..d2a530a 100644
+--- a/anliu.c
++++ b/anliu.c
+@@ -695,6 +695,9 @@ struct anl_s {
+     uint32_t pace_burst;
+ 
+     int32_t rx_rttval, rx_srtt, rx_rto;
++    uint32_t ackprog_ts;                /* the last ACK that acknowledged data (| 1): the path still delivers (rto_queued_hold) */
++    uint32_t acked_sent_max;            /* the latest send time among the segments acknowledged so far */
++    int acked_sent_valid;
+     int rtt_resume;                  /* resumed after an RTO without input: drain old ACK echoes */
+     int reo_mult;                       /* RACK reordering window = reo_mult * min_rtt / 16 */
+     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
+@@ -3785,6 +3788,9 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
+                 /* the original was acknowledged: the send state recorded for
+                    the retransmission would give a false rate sample and end
+                    the round early */
++                if (!w->acked_sent_valid || tdiff(s->ts_sent, w->acked_sent_max) > 0) w->acked_sent_max = s->ts_sent;
++                w->acked_sent_valid = 1;
++                w->ackprog_ts = w->current | 1;
+                 bbr_on_acked(w, s, orig ? NULL : rs);
+                 snd_unlink(st, s);
+                 seg_free(s);
+@@ -5129,6 +5135,25 @@ static void vq_add(anl_t *w, uint32_t wire)
+     w->vq_ts = w->current;
+ }
+ 
++/* A segment's RTO has run out while the path is still delivering what was
++ * sent before it: the last ACK acknowledged data sent before the segment,
++ * less than the RTO's margin ago, and nothing sent after it has been
++ * acknowledged. It waits in a queue the backlog estimate (vq_ms) did not
++ * see - a token bucket's burst inflates the rate it drains at - not lost:
++ * its RTO moves to that ACK plus the margin. An ACK of anything sent after
++ * it makes it a hole - the RTO (or RACK) fires as before, so a lost frame
++ * tail waits no longer than it did. Returns the new deadline, 0 to fire
++ * (DESIGN 6.3, TUNING.md 60). */
++static uint32_t rto_queued_hold(const anl_t *w, const anl_seg *seg)
++{
++    uint32_t margin = w->rx_rto > w->rx_srtt ? (uint32_t)(w->rx_rto - w->rx_srtt) : 0;
++    if (w->ackprog_ts == 0 || margin == 0 || seg->lost) return 0;
++    if (w->acked_sent_valid && tdiff(w->acked_sent_max, seg->ts_sent) > 0) return 0;   /* a hole: newer data arrived */
++    if (tdiff(w->ackprog_ts, seg->ts_sent) <= 0) return 0;                            /* nothing heard since it went out */
++    if (tdiff(w->current, w->ackprog_ts) >= (int32_t)margin) return 0;                 /* the ACKs stopped: fire */
++    return w->ackprog_ts + margin;
++}
++
+ /* The time a segment just sent waits behind that backlog: its RTO waits as
+  * much longer: a key frame's burst, paced above the bottleneck, delays its
+  * last segments and the frames after it, and their RTOs retransmitted what
+@@ -5642,6 +5667,11 @@ static void anl_flush_internal(anl_t *w)
+                     if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
+                     continue;
+                 }
++                if (why == 2 && (hold = rto_queued_hold(w, seg)) != 0) {
++                    seg->resendts = hold;
++                    if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
++                    continue;
++                }
+                 if (why == 2) {
+                     lost = 1;
+                     seg->rto = umin32(seg->rto + seg->rto / 2, RTO_MAX);  /* back off x1.5 */
+diff --git a/progress.md b/progress.md
+index 1250d39..c62e683 100644
+--- a/progress.md
++++ b/progress.md
+@@ -12,6 +12,7 @@
+ 
+ ## 2026-10-10
+ 
++- RTO 在路径仍按序交付的数据后面排队时不触发（DESIGN 6.3，TUNING.md 60；仿真 `bench/media_loss.c`，FEC 关）。分片超时时，若最近一次确认新数据的 ACK 确认的是比它早发出的数据、距今不到 rto − srtt，且没有比它晚发出的数据被确认过，超时改为那次 ACK 加这个裕量；有比它晚发的数据被确认即照常触发。2 Mbit TBF、16 KB 桶、1 ms：视频 RTO 1100 → 0（全部是对端已收到的），线上 17.47 → 16.05 MB（与无桶持平），视频时延 p99 97 → 70 ms；同场景 170 ms、10 Mbit 跑 5 Mbit 视频：RTO 2900 → 9（桶让 burst_bw 读 17.6 Mbit、关键帧按 22 Mbit 发出，在途 143 KB，vq_ms 只有 2 ms）。全矩阵（2/5/10 Mbit × 1..300 ms × 0..3% × 有无桶，6 种子）：线上平均 −2.2 MB，关键帧 1..100 ms +0.1，170 ms −1.0（10 Mbit 2..3% 加桶 −6.7 / −8.1），视频与音频准时率各格子 ±0.6 以内。170 ms 的代价来自基线在 ACK 证据之前盲发的 RTO 恰好早 30..40 ms 修好帧中段的丢失（2% 时 111/120 个关键帧需要重传），帧尾豁免和按路径发突发都补不回（TUNING.md 60）；要换回需要有意的尾部探测，待定。已验证：ASan/UBSan CTest 6/6；`test.c` 默认种子一项失败，`test_latency_rtt` 的"重传送达 ≥ 230 帧"得 226，与改动前种子 8 的失败值相同：改动使第一个测试 `test_sid_churn` 的重传序列不同，其后所有测试的随机序列平移，这项检查单独运行时 30 个显式种子两版逐字节相同（基线 6 个种子失败）；种子 1..8 改动前 7、8 失败，改动后 1、8 失败，都是 `test_fec_capacity_recovery` 的容量恢复时间检查，它单独运行 30 个种子基线失败 3 个（7、26、29）、改动后 2 个（1、8）。两项都在已记录的不稳定清单内，未改测试。
+ - 与 SRT 的实网复测（`8d6988e`，AnLiu 关闭 FEC，SRT 1.5.4；COMPARISON.md 2.8）：两条广域网路径（RTT 约 99 / 170 ms）与同机房节点对加 tc 单向时延 +0..+200 ms，2 Mbit TBF，丢包 0..15%（1..3% 两个种子），实时互动与 SRT 推荐延迟两种预算，共 100 轮。已验证：丢包 ≤ 3% 时，实时互动预算下可解码视频与关键帧不低于 SRT（一轮路径劣化除外），RTT 越长差距越大；推荐延迟下 AnLiu 视频 99.8..100%，SRT 有 41 轮交付整体后移。
+ - 观察到、待处理：局域网（RTT 约 1 ms）经 2 Mbit TBF 时约 8% 的重传是过早的 RTO（桶让带宽估计读到约 28 Mbit，关键帧在 TBF 里排队 60..110 ms，RTO 下限 30 ms），线上带宽多 3..6%，交付不受影响；仿真可复现。试过"RTO 也从最近一次确认新数据的 ACK 算起"：虚假重传几乎消失、带宽省 1..8%，但长 RTT 加大关键帧时关键帧明显下降（仿真 8 种带宽 × 5 种 RTT × 0..3% 丢包，6 个种子：170 ms、10 Mbit 跑 5 Mbit 视频低 5.7..9.2 个百分点；1 Mbit 带突发桶时码率工作点改变，关键帧低 7..16），加上"无乱序时 RACK 窗口归零"也补不回来，未采用。原因未查清（首次重传时机两版相同），暂不处理。
+ - 推荐延迟预设在 RTT 约 105 ms、15% 丢包时，音频缺口等待（max_age 170 ms 的 3/5）短于一次重传，音频重传全部白发；准时率不受影响（预算 130 ms 本来容不下）。
