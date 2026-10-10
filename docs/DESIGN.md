@@ -751,7 +751,7 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 
 | 分组 | API |
 |---|---|
-| 初始化 | anl_config_default、anl_stream_opt_default、anl_create、anl_release、anl_allocator |
+| 初始化 | anl_config_default、anl_stream_opt_default、anl_create、anl_release |
 | 输出与回调 | anl_setoutput、anl_set_accept、anl_set_rate_callback、anl_set_report_callback |
 | 收包与时钟 | anl_input、anl_update、anl_check、anl_flush |
 | 分发 | anl_peek_conv |
@@ -762,7 +762,7 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 | 流查询 | anl_stream_peeksize、anl_stream_waitsnd、anl_stream_id、anl_stream_tag、anl_stream_conn |
 | 用户数据与统计 | anl_stream_set_user、anl_stream_get_user、anl_state、anl_get_stats、anl_stream_get_stats |
 
-同一连接的所有调用由应用串行化。GF 表为只读常量，不需要首次初始化同步；全局分配器钩子须在创建连接之前设置，已有对象存活或并发调用时不得更换。不同连接的运行状态独立。output 回调不得调用 anl_*；accept 回调只允许 anl_stream_set_user 和只读元数据查询（id、tag、conn、get_user）；rate/report 回调只允许只读统计查询。回调同步执行，应避免阻塞。
+同一连接的所有调用由应用串行化。GF 表为只读常量，不需要首次初始化同步。内存分配器随 anl_config 传入（`malloc_fn` / `free_fn`，调用时带 `alloc_user`），每个连接各用各的，只在该连接的调用中使用；连接本身、流、分片和 FEC 缓冲都从它分配，anl_release 全部归还。两个都为 NULL 时用 malloc / free，只设一个时 anl_create 失败。不同连接的运行状态独立。output 回调不得调用 anl_*；accept 回调只允许 anl_stream_set_user 和只读元数据查询（id、tag、conn、get_user）；rate/report 回调只允许只读统计查询。回调同步执行，应避免阻塞。
 
 | 连接配置 | 默认值 |
 |---|---|
@@ -772,6 +772,7 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 | keepalive_ms / idle_timeout_ms | 0 / 服务端 30000 ms，客户端 0 |
 | pace_rate / pace_burst / start_rate | 0 / 0（实际桶为 4×mtu）/ 0 |
 | default_snd_wnd / default_rcv_wnd | 4096 / 4096 |
+| malloc_fn / free_fn / alloc_user | NULL（malloc / free）|
 
 | 流配置 | 可靠流默认 | 半可靠流默认 |
 |---|---|---|

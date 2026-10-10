@@ -478,14 +478,9 @@ static void ep_create(void)
         g_init_cwnd = cfg.init_cwnd;
         if (g_pace_rate) cfg.pace_rate = g_pace_rate;
         if (g_pace_burst) cfg.pace_burst = g_pace_burst;
-#ifdef ANL_CONFIG_START_RATE
         if (g_start_rate) cfg.start_rate = g_start_rate;
         printf("PACECFG init_cwnd=%d pace_rate=%d pace_burst=%d start_rate=%d (0 = library default)\n",
                cfg.init_cwnd, cfg.pace_rate, cfg.pace_burst, cfg.start_rate);
-#else
-        if (g_start_rate) { fprintf(stderr, "--start-rate: this protocol build has no anl_config.start_rate\n"); exit(2); }
-        printf("PACECFG init_cwnd=%d pace_rate=%d pace_burst=%d (0 = library default)\n", cfg.init_cwnd, cfg.pace_rate, cfg.pace_burst);
-#endif
         g_anl = anl_create(0x5a5a0001, &cfg, NULL);
         anl_setoutput(g_anl, anl_out);
         anl_set_accept(g_anl, accept_cb);

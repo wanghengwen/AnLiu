@@ -85,7 +85,7 @@ static void run_exact_cost(void)
     anl_config_default(&c, ANL_ROLE_CLIENT); c.pad_max = 0;
     w = anl_create(1, &c, NULL); anl_setoutput(w, review_sink);
     w->dflt->peer_opened = 1;
-    s = seg_new(100); memset(s->data, 42, 100);
+    s = seg_new(w, 100); memset(s->data, 42, 100);
     for (kind = 0; kind < 5; kind++) {
         memset(&g_fec_diag, 0, sizeof(g_fec_diag));
         g_fec_diag.enabled = 1; g_fec_diag.owner = w;
@@ -101,7 +101,7 @@ static void run_exact_cost(void)
         if (kind == 3) CHECK(g_fec_diag.sent[0].parity == 204 && g_fec_diag.parity_output[0] == 204 + ANL_OVERHEAD && g_fec_diag.parity_datagrams[0] == 1, "pure parity: 4 + body");
         if (kind == 4) CHECK(g_fec_diag.control == 6 && g_fec_diag.output == 6 + ANL_OVERHEAD, "a control segment: 3 + body");
     }
-    seg_free(s); anl_release(w);
+    seg_free(w, s); anl_release(w);
     memset(&g_fec_diag, 0, sizeof(g_fec_diag));
 }
 

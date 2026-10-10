@@ -455,6 +455,101 @@ static void test_default_stream(void)
     net_stop(&n);
 }
 
+/* the allocator in anl_config: user pointer, size header, a failure after
+ * fail_after allocations (-1: never) */
+typedef struct { size_t live; long allocs, frees, null_frees, fail_after; } alloc_acct;
+typedef union { size_t n; long double align; } alloc_hdr;
+
+static void *acct_malloc(void *user, size_t n)
+{
+    alloc_acct *a = (alloc_acct *)user;
+    alloc_hdr *h;
+    if (a->fail_after >= 0 && a->allocs >= a->fail_after) return NULL;
+    h = (alloc_hdr *)malloc(sizeof(alloc_hdr) + n);
+    if (h == NULL) return NULL;
+    h->n = n;
+    a->live += n;
+    a->allocs++;
+    return h + 1;
+}
+
+static void acct_free(void *user, void *p)
+{
+    alloc_acct *a = (alloc_acct *)user;
+    alloc_hdr *h;
+    if (p == NULL) { a->null_frees++; return; }
+    h = (alloc_hdr *)p - 1;
+    a->live -= h->n;
+    a->frees++;
+    free(h);
+}
+
+static void test_allocator(void)
+{
+    net n; anl_config ca, cb, c; anl_stream_opt o;
+    alloc_acct acct[2];
+    static char buf[30000];
+    anl_stream_t *a, *b;
+    int i, k, frames = 0, got = 0, created = 0, failed_clean = 1;
+    printf("[allocator: per connection from anl_config, with its user pointer, all back at release]\n");
+    memset(acct, 0, sizeof(acct));
+    acct[0].fail_after = acct[1].fail_after = -1;
+    net_init(&n, &ca, &cb);
+    n.loss_pct = 5;
+    ca.malloc_fn = cb.malloc_fn = acct_malloc;
+    ca.free_fn = cb.free_fn = acct_free;
+    ca.alloc_user = &acct[0];
+    cb.alloc_user = &acct[1];
+    net_start(&n, &ca, &cb);
+    CHECK(acct[0].allocs > 0 && acct[1].allocs > 0, "each connection allocates through its own allocator (%ld, %ld)", acct[0].allocs, acct[1].allocs);
+    /* a semi stream with FEC (its buffers, the receive runs, the peer's accepted stream) */
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 1; o.fec_ratio = 25; o.max_age_ms = 300;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    CHECK(a != NULL && b != NULL, "stream opened");
+    for (i = 0; i < 4000 && a && b; i++) {
+        anl_frame_info info;
+        net_tick(&n);
+        if (i % 33 == 0 && frames < 60) {
+            int len = frames % 30 == 0 ? 20000 : 2000;
+            fill_pattern(buf, len, (uint32_t)frames);
+            anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            frames++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &info) >= 0) got++;
+    }
+    CHECK(got > 50, "frames delivered (%d of %d)", got, frames);
+    CHECK(acct[0].live > 0 && acct[1].live > 0, "memory held while running");
+    printf("  %d frames, %ld / %ld allocations, %zu / %zu bytes held before release\n",
+           got, acct[0].allocs, acct[1].allocs, acct[0].live, acct[1].live);
+    net_stop(&n);
+    for (k = 0; k < 2; k++)
+        CHECK(acct[k].live == 0 && acct[k].allocs == acct[k].frees && acct[k].null_frees == 0,
+              "side %d: everything back at release (live %zu, %ld allocs, %ld frees, %ld NULL frees)",
+              k, acct[k].live, acct[k].allocs, acct[k].frees, acct[k].null_frees);
+
+    /* set both or neither */
+    anl_config_default(&c, ANL_ROLE_CLIENT);
+    c.malloc_fn = acct_malloc;
+    CHECK(anl_create(1, &c, NULL) == NULL, "malloc_fn without free_fn refused");
+    c.malloc_fn = NULL; c.free_fn = acct_free;
+    CHECK(anl_create(1, &c, NULL) == NULL, "free_fn without malloc_fn refused");
+
+    /* an allocation that fails inside anl_create: NULL, and nothing kept */
+    c.malloc_fn = acct_malloc; c.free_fn = acct_free; c.alloc_user = &acct[0];
+    for (k = 0; k < 64 && !created; k++) {
+        anl_t *w;
+        memset(&acct[0], 0, sizeof(acct[0]));
+        acct[0].fail_after = k;
+        w = anl_create(1, &c, NULL);
+        if (w) { created = 1; anl_release(w); }
+        if (acct[0].live != 0 || acct[0].allocs != acct[0].frees) failed_clean = 0;
+    }
+    CHECK(created && k > 1, "anl_create succeeds once enough allocations succeed (after %d)", k - 1);
+    CHECK(failed_clean, "a failed anl_create gives back what it took");
+    printf("  anl_create takes %d allocations; each earlier failure left nothing behind\n", k - 1);
+}
+
 static void test_reliable(int loss, int stream_mode)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
@@ -2174,7 +2269,7 @@ static void test_receiver_skip_ack_fragments(void)
     st->peer_opened = 1; st->rcv_nxt = 100;
     st->rcv_skip_valid = 1; st->rcv_skip_una = 50;
     for (i = 0; i < 200; i++) {
-        anl_seg *s = seg_new(0);
+        anl_seg *s = seg_new(w, 0);
         CHECK(s != NULL, "allocate received segment");
         if (!s) break;
         s->sn = 101u + (uint32_t)i * 2;
@@ -4750,6 +4845,7 @@ int main(void)
     RUN(test_demux());
     RUN(test_output_rewrite());
     RUN(test_default_stream());
+    RUN(test_allocator());
     RUN(test_reliable(0, 0));
     RUN(test_reliable(10, 0));
     RUN(test_reliable(10, 1));

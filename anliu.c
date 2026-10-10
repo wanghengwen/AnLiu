@@ -3,7 +3,7 @@
  *
  * Implementation of DESIGN.md. Structure of this file:
  *
- *   1. utilities: allocator, byte order, varint, intrusive list
+ *   1. utilities: byte order, varint, intrusive list
  *   2. crypto: ChaCha20 (RFC 8439), SipHash-2-4-128, SIV seal/open, KDF, PRNG
  *   3. data structures: segment, stream, connection
  *   4. datagram builder (packing segments, padding, sealing, pacing tokens)
@@ -25,26 +25,6 @@
 /*=====================================================================
  * 1. utilities
  *====================================================================*/
-static void *(*anl_malloc_hook)(size_t) = NULL;
-static void (*anl_free_hook)(void *) = NULL;
-
-static void *anl_malloc(size_t n)
-{
-    return anl_malloc_hook ? anl_malloc_hook(n) : malloc(n);
-}
-
-static void anl_free(void *p)
-{
-    if (p == NULL) return;
-    if (anl_free_hook) anl_free_hook(p); else free(p);
-}
-
-void anl_allocator(void *(*new_malloc)(size_t), void (*new_free)(void *))
-{
-    anl_malloc_hook = new_malloc;
-    anl_free_hook = new_free;
-}
-
 static int32_t tdiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 static uint32_t umin32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 static uint32_t umax32(uint32_t a, uint32_t b) { return a > b ? a : b; }
@@ -688,6 +668,9 @@ struct anl_s {
     uint32_t mtu, mss;
     int pad_max;
     anl_rng_fn rng;
+    anl_malloc_fn malloc_fn;            /* the allocator (anl_config); NULL: malloc / free */
+    anl_free_fn free_fn;
+    void *alloc_user;
     int interval;
     uint32_t init_cwnd, dead_link, ts_window, keepalive_ms, idle_timeout_ms;
     int pace_rate_cfg;
@@ -912,6 +895,19 @@ struct anl_s {
     uint8_t rx_pn_seen[PN_WIN / 8];
 };
 
+/* the connection's allocator (anl_config.malloc_fn / free_fn), malloc / free
+ * without one; free_fn never sees NULL */
+static void *anl_malloc(const anl_t *w, size_t n)
+{
+    return w->malloc_fn ? w->malloc_fn(w->alloc_user, n) : malloc(n);
+}
+
+static void anl_free(const anl_t *w, void *p)
+{
+    if (p == NULL) return;
+    if (w->free_fn) w->free_fn(w->alloc_user, p); else free(p);
+}
+
 /* the smoothed RTT, RTO_DEF before the first sample */
 static uint32_t srtt_or_def(const anl_t *w) { return w->rx_srtt > 0 ? (uint32_t)w->rx_srtt : RTO_DEF; }
 
@@ -925,16 +921,16 @@ static int wnd_open(const anl_stream *st)
     return tdiff(st->snd_nxt, st->snd_una + umin32(st->snd_wnd, st->rmt_wnd)) < 0;
 }
 
-static anl_seg *seg_new(uint32_t len)
+static anl_seg *seg_new(const anl_t *w, uint32_t len)
 {
-    anl_seg *s = (anl_seg *)anl_malloc(sizeof(anl_seg) + len);
+    anl_seg *s = (anl_seg *)anl_malloc(w, sizeof(anl_seg) + len);
     if (s == NULL) return NULL;
     memset(s, 0, sizeof(anl_seg));
     s->len = len;
     return s;
 }
 
-static void seg_free(anl_seg *s) { anl_free(s); }
+static void seg_free(const anl_t *w, anl_seg *s) { anl_free(w, s); }
 
 static anl_seg *qfirst_seg(anl_node *head)
 {
@@ -946,12 +942,12 @@ static anl_seg *qlast_seg(anl_node *head)
     return QEMPTY(head) ? NULL : QENTRY(head->prev, anl_seg, node);
 }
 
-static void free_seg_list(anl_node *head)
+static void free_seg_list(const anl_t *w, anl_node *head)
 {
     while (!QEMPTY(head)) {
         anl_seg *s = QENTRY(head->next, anl_seg, node);
         qdel(&s->node);
-        seg_free(s);
+        seg_free(w, s);
     }
 }
 
@@ -1710,21 +1706,21 @@ static void snd_unlink(anl_stream *st, anl_seg *s)
     backlog_sub(st, s->len);
 }
 
-static void fbuf_free(fec_buf *b)
+static void fbuf_free(const anl_t *w, fec_buf *b)
 {
-    anl_free(b->p);
+    anl_free(w, b->p);
     b->p = NULL;
     b->cap = b->len = 0;
 }
 
 /* capacity for n bytes; the content is not kept */
-static int fbuf_reserve(fec_buf *b, uint32_t n)
+static int fbuf_reserve(const anl_t *w, fec_buf *b, uint32_t n)
 {
     uint8_t *np;
     if (n <= b->cap) return 0;
-    np = (uint8_t *)anl_malloc(n);
+    np = (uint8_t *)anl_malloc(w, n);
     if (np == NULL) return -1;
-    anl_free(b->p);
+    anl_free(w, b->p);
     b->p = np;
     b->cap = n;
     return 0;
@@ -1737,9 +1733,9 @@ static void fec_release_tx(anl_stream *st)
 {
     uint32_t i;
     if (!st->fec_tx_held || st->fec_slot == NULL || st->fec_n > 0) return;
-    for (i = 0; i < FEC_K_MAX; i++) fbuf_free(&st->fec_slot[i]);
+    for (i = 0; i < FEC_K_MAX; i++) fbuf_free(st->w, &st->fec_slot[i]);
     if (st->fec_out_i < st->fec_out_m) return;      /* parities still to go: next time */
-    for (i = 0; i < FEC_M_MAX; i++) fbuf_free(&st->fec_out[i]);
+    for (i = 0; i < FEC_M_MAX; i++) fbuf_free(st->w, &st->fec_out[i]);
     st->fec_out_m = st->fec_out_i = 0;
     st->fec_tx_held = 0;
 }
@@ -1748,8 +1744,8 @@ static void fec_release_rx(anl_stream *st)
 {
     uint32_t i;
     if (!st->fec_rx_held || st->cache == NULL || st->pcache == NULL) return;
-    for (i = 0; i < st->cache_n; i++) { fbuf_free(&st->cache[i].b); st->cache[i].valid = 0; }
-    for (i = 0; i < st->pcache_n; i++) { fbuf_free(&st->pcache[i].b); st->pcache[i].valid = 0; }
+    for (i = 0; i < st->cache_n; i++) { fbuf_free(st->w, &st->cache[i].b); st->cache[i].valid = 0; }
+    for (i = 0; i < st->pcache_n; i++) { fbuf_free(st->w, &st->pcache[i].b); st->pcache[i].valid = 0; }
     st->fec_rx_held = 0;
 }
 
@@ -1759,23 +1755,23 @@ static void fec_free(anl_stream *st)
     st->fec_n = 0;                  /* an open block would be closed later on freed buffers */
     st->fec_out_i = st->fec_out_m = 0;
     if (st->fec_slot) {
-        for (i = 0; i < FEC_K_MAX; i++) fbuf_free(&st->fec_slot[i]);
-        anl_free(st->fec_slot);
+        for (i = 0; i < FEC_K_MAX; i++) fbuf_free(st->w, &st->fec_slot[i]);
+        anl_free(st->w, st->fec_slot);
         st->fec_slot = NULL;
     }
     if (st->fec_out) {
-        for (i = 0; i < FEC_M_MAX; i++) fbuf_free(&st->fec_out[i]);
-        anl_free(st->fec_out);
+        for (i = 0; i < FEC_M_MAX; i++) fbuf_free(st->w, &st->fec_out[i]);
+        anl_free(st->w, st->fec_out);
         st->fec_out = NULL;
     }
     if (st->cache) {
-        for (i = 0; i < st->cache_n; i++) fbuf_free(&st->cache[i].b);
-        anl_free(st->cache);
+        for (i = 0; i < st->cache_n; i++) fbuf_free(st->w, &st->cache[i].b);
+        anl_free(st->w, st->cache);
         st->cache = NULL;
     }
     if (st->pcache) {
-        for (i = 0; i < st->pcache_n; i++) fbuf_free(&st->pcache[i].b);
-        anl_free(st->pcache);
+        for (i = 0; i < st->pcache_n; i++) fbuf_free(st->w, &st->pcache[i].b);
+        anl_free(st->w, st->pcache);
         st->pcache = NULL;
     }
 }
@@ -1806,7 +1802,7 @@ static int rcv_link(anl_stream *st, anl_seg *seg, rcv_run *r)
             r->end = next->end;
             r->last = next->last;
             qdel(&next->node);
-            anl_free(next);
+            anl_free(st->w, next);
         }
     } else if (next && next->start == sn + 1) {
         qadd_after(&seg->node, next->first->node.prev);
@@ -1814,7 +1810,7 @@ static int rcv_link(anl_stream *st, anl_seg *seg, rcv_run *r)
         next->start = sn;
         next->rep = 0;
     } else {
-        rcv_run *nr = (rcv_run *)anl_malloc(sizeof(rcv_run));
+        rcv_run *nr = (rcv_run *)anl_malloc(st->w, sizeof(rcv_run));
         if (nr == NULL) return 0;
         nr->start = sn;
         nr->end = sn + 1;
@@ -1834,7 +1830,7 @@ static anl_seg *rcv_pop_first(anl_stream *st)
     anl_seg *s = r->first;
     if (s == r->last) {
         qdel(&r->node);
-        anl_free(r);
+        anl_free(st->w, r);
     } else {
         r->first = QENTRY(s->node.next, anl_seg, node);
         r->start++;
@@ -1849,7 +1845,7 @@ static void free_runs(anl_stream *st)
     while (!QEMPTY(&st->rcv_runs)) {
         rcv_run *r = RUN_OF(st->rcv_runs.next);
         qdel(&r->node);
-        anl_free(r);
+        anl_free(st->w, r);
     }
 }
 
@@ -1859,7 +1855,7 @@ static void free_rcv_list(anl_t *w, anl_node *head, uint32_t *count)
         anl_seg *s = QENTRY(head->next, anl_seg, node);
         qdel(&s->node);
         rcv_bytes_sub(w, s->len);
-        seg_free(s);
+        seg_free(w, s);
     }
     *count = 0;
 }
@@ -1887,8 +1883,8 @@ static void stream_free_ex(anl_t *w, anl_stream *st, int keep_read)
     free_rcv_list(w, &st->rcv_buf, &st->nrcv_buf);
     if (keep_read && st->mode == ANL_SEMI) drop_tail_incomplete(w, st);
     if (!keep_read) free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);
-    free_seg_list(&st->snd_queue);
-    free_seg_list(&st->snd_buf);
+    free_seg_list(w, &st->snd_queue);
+    free_seg_list(w, &st->snd_buf);
     QINIT(&st->snd_time);
     st->nsnd_que = st->nsnd_buf = st->nlost = 0;
     st->backlog_bytes = 0;
@@ -2022,7 +2018,7 @@ static void drop_tail_incomplete(anl_t *w, anl_stream *st)
         qdel(&s->node);
         st->nrcv_que--;
         rcv_bytes_sub(w, s->len);
-        seg_free(s);
+        seg_free(w, s);
         if (first) break;
     }
 }
@@ -2033,7 +2029,7 @@ static void skip_to(anl_t *w, anl_stream *st, uint32_t new_una)
     while (!QEMPTY(&st->rcv_runs) && tdiff(RUN_OF(st->rcv_runs.next)->start, new_una) < 0) {
         anl_seg *s = rcv_pop_first(st);
         rcv_bytes_sub(w, s->len);
-        seg_free(s);
+        seg_free(w, s);
     }
     drop_tail_incomplete(w, st);
     st->rcv_nxt = new_una;
@@ -2178,7 +2174,7 @@ static void fec_cache_add(anl_stream *st, uint32_t sn, uint32_t frg, uint8_t fla
     fec_centry *e;
     if (st->cache == NULL || len > st->mss) return;
     e = &st->cache[sn % st->cache_n];
-    if (fbuf_reserve(&e->b, len + CANON_HDR_MAX) < 0) { e->valid = 0; return; }
+    if (fbuf_reserve(st->w, &e->b, len + CANON_HDR_MAX) < 0) { e->valid = 0; return; }
     e->valid = 1;
     e->sn = sn;
     e->b.len = canon_build(e->b.p, frg, flags, frame16, data, len);
@@ -2340,7 +2336,7 @@ static void handle_parity(anl_t *w, anl_stream *st, const char *body, uint32_t b
         if (tdiff(q->ts, st->pcache[slot].ts) < 0) slot = i;
     }
     e = &st->pcache[slot];
-    if (fbuf_reserve(&e->b, lmax) < 0) return;
+    if (fbuf_reserve(w, &e->b, lmax) < 0) return;
     st->fec_rx_held = 1;
     e->valid = 1;
     e->base = base;
@@ -2399,7 +2395,7 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
         return;
     }
 
-    seg = seg_new(len);
+    seg = seg_new(w, len);
     if (seg == NULL) return;
     seg->sn = sn;
     seg->frg = frg;
@@ -2413,7 +2409,7 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
         st->frame_seen = 1;
     }
     memcpy(seg->data, data, len);
-    if (!rcv_link(st, seg, r)) { seg_free(seg); return; }
+    if (!rcv_link(st, seg, r)) { seg_free(w, seg); return; }
     rcv_bytes_add(w, len);
 
     if (st->fec) {
@@ -2436,7 +2432,7 @@ static int parse_una(anl_stream *st, uint32_t una)
         anl_seg *s = qfirst_seg(&st->snd_buf);
         if (tdiff(una, s->sn) <= 0) break;
         snd_unlink(st, s);
-        seg_free(s);
+        seg_free(st->w, s);
         n++;
     }
     return n;
@@ -3780,7 +3776,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                    the round early */
                 bbr_on_acked(w, s, orig ? NULL : rs);
                 snd_unlink(st, s);
-                seg_free(s);
+                seg_free(w, s);
                 acked++;
             }
             pos = next;
@@ -3881,7 +3877,7 @@ static anl_stream *accept_stream(anl_t *w, int sid, const open_info *oi)
 refuse:
     stream_free(w, st);
     qdel(&st->lnode);
-    anl_free(st);
+    anl_free(w, st);
     return NULL;
 }
 
@@ -4535,7 +4531,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
     m = umin32(m, FEC_M_MAX);
     for (j = 0; j < m; j++) {
         fec_buf *o = &st->fec_out[j];
-        if (fbuf_reserve(o, lmax) < 0) { m = j; break; }
+        if (fbuf_reserve(w, o, lmax) < 0) { m = j; break; }
         memset(o->p, 0, lmax);
         o->len = lmax;
         for (i = 0; i < k; i++) gf_addmul(o->p, st->fec_slot[i].p, st->fec_slot[i].len, fec_coef(j, i));
@@ -4744,7 +4740,7 @@ static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
         st->fec_blk_ms = fec_block_ms(w, st);
     }
     b = &st->fec_slot[st->fec_n];
-    if (fbuf_reserve(b, seg->len + CANON_HDR_MAX) < 0) { fec_close_block(w, st); return; }
+    if (fbuf_reserve(w, b, seg->len + CANON_HDR_MAX) < 0) { fec_close_block(w, st); return; }
     st->fec_tx_held = 1;
     b->len = canon_build(b->p, seg->frg, seg->flags, (uint16_t)seg->frame_no, seg->data, seg->len);
     st->fec_n++;
@@ -4796,7 +4792,7 @@ static int purge_frame(anl_stream *st, uint32_t frame_no, uint32_t *end)
         in_buf = sent = 1;
         if (tdiff(s->sn + 1, *end) > 0) *end = s->sn + 1;
         snd_unlink(st, s);
-        seg_free(s);
+        seg_free(st->w, s);
     }
     for (pos = st->snd_queue.next; pos != &st->snd_queue; pos = next) {
         anl_seg *s = QENTRY(pos, anl_seg, node);
@@ -4812,7 +4808,7 @@ static int purge_frame(anl_stream *st, uint32_t frame_no, uint32_t *end)
         qdel(&s->node);
         st->nsnd_que--;
         backlog_sub(st, s->len);
-        seg_free(s);
+        seg_free(st->w, s);
     }
     return (in_buf ? PURGED_ANY : 0) | (sent ? PURGED_SENT : 0);
 }
@@ -5819,10 +5815,14 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
     if (cfg->ts_window_ms > 30000) return NULL;     /* a 16-bit ts: well inside half its range */
     if (cfg->default_snd_wnd < 0 || cfg->default_snd_wnd > ANL_MAX_WND) return NULL;
     if (cfg->default_rcv_wnd < 0 || cfg->default_rcv_wnd > ANL_MAX_WND) return NULL;
+    if ((cfg->malloc_fn == NULL) != (cfg->free_fn == NULL)) return NULL;
 
-    w = (anl_t *)anl_malloc(sizeof(anl_t));
+    w = (anl_t *)(cfg->malloc_fn ? cfg->malloc_fn(cfg->alloc_user, sizeof(anl_t)) : malloc(sizeof(anl_t)));
     if (w == NULL) return NULL;
     memset(w, 0, sizeof(*w));
+    w->malloc_fn = cfg->malloc_fn;
+    w->free_fn = cfg->free_fn;
+    w->alloc_user = cfg->alloc_user;
     w->conv = conv;
     w->role = cfg->role;
     w->user = user;
@@ -5863,11 +5863,11 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
     w->pace_tokens = (int64_t)w->pace_burst;
     w->par_rate = 0xffffffffu;
 
-    w->buf = (char *)anl_malloc(w->mtu);
-    w->rxbuf = (char *)anl_malloc(w->mtu);
-    w->scratch = (char *)anl_malloc(w->mtu * 2);
+    w->buf = (char *)anl_malloc(w, w->mtu);
+    w->rxbuf = (char *)anl_malloc(w, w->mtu);
+    w->scratch = (char *)anl_malloc(w, w->mtu * 2);
     if (w->buf == NULL || w->rxbuf == NULL || w->scratch == NULL) {
-        anl_free(w->buf); anl_free(w->rxbuf); anl_free(w->scratch); anl_free(w);
+        anl_free(w, w->buf); anl_free(w, w->rxbuf); anl_free(w, w->scratch); anl_free(w, w);
         return NULL;
     }
     prng_init(w);
@@ -5897,12 +5897,12 @@ void anl_release(anl_t *w)
         stream_free(w, st);
         free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);    /* left readable by the peer's CLOSE */
         qdel(&st->lnode);
-        anl_free(st);
+        anl_free(w, st);
     }
-    anl_free(w->buf);
-    anl_free(w->rxbuf);
-    anl_free(w->scratch);
-    anl_free(w);
+    anl_free(w, w->buf);
+    anl_free(w, w->rxbuf);
+    anl_free(w, w->scratch);
+    anl_free(w, w);                 /* the allocator is read before the call */
 }
 
 void anl_setoutput(anl_t *w, anl_output_fn output)
@@ -6040,12 +6040,12 @@ int anl_get_stats(const anl_t *w, anl_stats *out)
 static int fec_alloc(anl_stream *st)
 {
     /* the buffers themselves grow on first use (fbuf_reserve) */
-    st->fec_slot = (fec_buf *)anl_malloc(sizeof(fec_buf) * FEC_K_MAX);
-    st->fec_out = (fec_buf *)anl_malloc(sizeof(fec_buf) * FEC_M_MAX);
+    st->fec_slot = (fec_buf *)anl_malloc(st->w, sizeof(fec_buf) * FEC_K_MAX);
+    st->fec_out = (fec_buf *)anl_malloc(st->w, sizeof(fec_buf) * FEC_M_MAX);
     st->cache_n = 2u * FEC_K_MAX;                   /* two blocks of received data */
-    st->cache = (fec_centry *)anl_malloc(sizeof(fec_centry) * st->cache_n);
+    st->cache = (fec_centry *)anl_malloc(st->w, sizeof(fec_centry) * st->cache_n);
     st->pcache_n = 2u * FEC_M_MAX;                  /* two blocks of parities */
-    st->pcache = (fec_pentry *)anl_malloc(sizeof(fec_pentry) * st->pcache_n);
+    st->pcache = (fec_pentry *)anl_malloc(st->w, sizeof(fec_pentry) * st->pcache_n);
     if (st->fec_slot) memset(st->fec_slot, 0, sizeof(fec_buf) * FEC_K_MAX);
     if (st->fec_out) memset(st->fec_out, 0, sizeof(fec_buf) * FEC_M_MAX);
     if (st->cache) memset(st->cache, 0, sizeof(fec_centry) * st->cache_n);
@@ -6111,7 +6111,7 @@ static int stream_apply_local(anl_t *w, anl_stream *st, const anl_stream_opt *op
 
 static anl_stream *stream_create(anl_t *w, int sid, const anl_stream_opt *opt)
 {
-    anl_stream *st = (anl_stream *)anl_malloc(sizeof(anl_stream));
+    anl_stream *st = (anl_stream *)anl_malloc(w, sizeof(anl_stream));
     if (st == NULL) return NULL;
     memset(st, 0, sizeof(*st));
     st->w = w;
@@ -6129,7 +6129,7 @@ static anl_stream *stream_create(anl_t *w, int sid, const anl_stream_opt *opt)
     QINIT(&st->rcv_runs);
     if (stream_apply_local(w, st, opt) != 0 || sput(w, st) != 0) {
         fec_free(st);
-        anl_free(st);
+        anl_free(w, st);
         return NULL;
     }
     return st;
@@ -6176,7 +6176,7 @@ int anl_stream_close(anl_stream_t *st)
     if (notify) sid_closing(w, sid);
     free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);        /* left readable by the peer's CLOSE */
     qdel(&st->lnode);
-    anl_free(st);
+    anl_free(w, st);
     if (notify) flush_control(w);           /* tell the peer at once */
     return ANL_OK;
 }
@@ -6217,7 +6217,7 @@ static int frame_peeksize(anl_t *w, anl_stream *st)
         qdel(&head->node);
         st->nrcv_que--;
         rcv_bytes_sub(w, head->len);
-        seg_free(head);
+        seg_free(w, head);
     }
     n = head->frg + 1;
     if (st->nrcv_que < n) return -1;
@@ -6228,7 +6228,7 @@ static int frame_peeksize(anl_t *w, anl_stream *st)
             anl_seg *h;
             do {
                 h = qfirst_seg(&st->rcv_queue);
-                qdel(&h->node); st->nrcv_que--; rcv_bytes_sub(w, h->len); seg_free(h);
+                qdel(&h->node); st->nrcv_que--; rcv_bytes_sub(w, h->len); seg_free(w, h);
                 h = qfirst_seg(&st->rcv_queue);
             } while (h && !(h->flags & F_HAS_FRAME));
             st->frames_skipped++;
@@ -6354,7 +6354,7 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
         if (old && old->len < mss) {
             uint32_t cap = mss - old->len;
             uint32_t ext = (uint32_t)len < cap ? (uint32_t)len : cap;
-            anl_seg *seg = seg_new(old->len + ext);
+            anl_seg *seg = seg_new(w, old->len + ext);
             if (seg == NULL) return ANL_ENOMEM;
             memcpy(seg->data, old->data, old->len);
             memcpy(seg->data + old->len, buf, ext);
@@ -6362,7 +6362,7 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
             seg->ts_enq = w->current;
             qadd_after(&seg->node, &old->node);
             qdel(&old->node);
-            seg_free(old);
+            seg_free(w, old);
             st->backlog_bytes += ext;
             buf += ext;
             len -= (int)ext;
@@ -6376,7 +6376,7 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
 
     for (i = 0; i < count; i++) {
         uint32_t size = (uint32_t)len > mss ? mss : (uint32_t)len;
-        anl_seg *seg = seg_new(size);
+        anl_seg *seg = seg_new(w, size);
         if (seg == NULL) return ANL_ENOMEM;
         memcpy(seg->data, buf, size);
         seg->frg = st->stream ? 0 : (count - i - 1);
@@ -6410,7 +6410,7 @@ int anl_stream_recv(anl_stream_t *st, char *buf, int len)
         qdel(&seg->node);
         st->nrcv_que--;
         rcv_bytes_sub(w, seg->len);
-        seg_free(seg);
+        seg_free(w, seg);
         if (frg == 0) break;
     }
     after_recv(w, st, recover);
@@ -6449,7 +6449,7 @@ int anl_stream_send_frame(anl_stream_t *st, int flags, const char *buf, int len,
 
     for (i = 0; i < count; i++) {
         uint32_t size = (uint32_t)len > mss ? mss : (uint32_t)len;
-        anl_seg *seg = seg_new(size);
+        anl_seg *seg = seg_new(w, size);
         if (seg == NULL) return ANL_ENOMEM;
         memcpy(seg->data, buf, size);
         seg->frg = count - i - 1;
@@ -6493,7 +6493,7 @@ int anl_stream_recv_frame(anl_stream_t *st, char *buf, int len, anl_frame_info *
         qdel(&seg->node);
         st->nrcv_que--;
         rcv_bytes_sub(w, seg->len);
-        seg_free(seg);
+        seg_free(w, seg);
         if (frg == 0) break;
     }
     if (info) {

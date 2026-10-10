@@ -52,7 +52,7 @@ static double rnd_unit(uint64_t *s) { return rnd_next(s) / 4294967296.0; }
 static int rnd_range(uint64_t *s, int lo, int hi) { return hi <= lo ? lo : lo + (int)(rnd_next(s) % (uint32_t)(hi - lo + 1)); }
 
 /*=====================================================================
- * memory accounting (both libraries accept an allocator hook)
+ * memory accounting (AnLiu: the allocator in anl_config; ikcp: a global hook)
  *===================================================================*/
 typedef union { size_t n; long double pad; } mhdr;
 static int64_t g_mem_live[2], g_mem_peak[2];
@@ -74,8 +74,8 @@ static void mt_free(int k, void *p)
     g_mem_live[k] -= (int64_t)h->n;
     free(h);
 }
-static void *anl_m(size_t n) { return mt_alloc(0, n); }
-static void anl_f(void *p) { mt_free(0, p); }
+static void *anl_m(void *user, size_t n) { (void)user; return mt_alloc(0, n); }
+static void anl_f(void *user, void *p) { (void)user; mt_free(0, p); }
 static void *kcp_m(size_t n) { return mt_alloc(1, n); }
 static void kcp_f(void *p) { mt_free(1, p); }
 
@@ -400,6 +400,8 @@ static void ep_create(sim *s, int side, int proto)
         memset(cfg.psk, 0x5a, sizeof(cfg.psk));
         cfg.mtu = MTU;
         cfg.rng = ep_rng;
+        cfg.malloc_fn = anl_m;
+        cfg.free_fn = anl_f;
         e->prng = g_seed * 0x2545F4914F6CDD1DULL + (uint64_t)side * 0x9E3779B97F4A7C15ULL + 1;
         if (g_fast) cfg.interval = 10;
         if (g_init_cwnd) cfg.init_cwnd = g_init_cwnd;
@@ -1526,7 +1528,6 @@ int main(int argc, char **argv)
     point pts[512];
     int npts = 0;
 
-    anl_allocator(anl_m, anl_f);
     ikcp_allocator(kcp_m, kcp_f);
     setvbuf(stdout, NULL, _IOLBF, 0);
 

@@ -5,9 +5,9 @@
  * See DESIGN.md for the wire format and protocol rules.
  *
  * Threading: like ikcp, all calls on one anl_t must be serialised by the
- * caller. Different anl_t instances share only immutable GF tables and the
- * allocator hooks. Set anl_allocator before creating any connections; do not
- * change hooks while allocated objects remain alive or calls run concurrently.
+ * caller. Different anl_t instances share only immutable GF tables. Each
+ * connection allocates through the allocator in its anl_config (malloc_fn /
+ * free_fn with alloc_user), from within the calls on that connection only.
  *
  * Re-entrancy: anl_flush, anl_update, anl_input (immediate ACKs),
  * anl_stream_open (the OPEN announcement), anl_stream_close (the CLOSE) and
@@ -99,8 +99,10 @@ extern "C" {
  * configuration
  *---------------------------------------------------------------------*/
 typedef void (*anl_rng_fn)(void *user, uint8_t *buf, size_t n);
-
-#define ANL_CONFIG_START_RATE 1  /* anl_config has start_rate (feature test) */
+/* a connection's allocator: user is anl_config.alloc_user; free_fn is never
+   called with NULL */
+typedef void *(*anl_malloc_fn)(void *user, size_t size);
+typedef void (*anl_free_fn)(void *user, void *ptr);
 
 typedef struct anl_config {
     uint8_t psk[ANL_PSK_SIZE];  /* pre-shared key */
@@ -109,6 +111,11 @@ typedef struct anl_config {
     int pad_max;                /* 32: datagrams without data (ACK, control) get 1..pad_max
                                    random bytes; data datagrams none. 0 = no padding; <= ANL_MAX_PAD */
     anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG */
+    anl_malloc_fn malloc_fn;    /* NULL (with free_fn NULL) = malloc / free; set both or neither.
+                                   Everything the connection and its streams hold, the anl_t
+                                   itself included, comes from it and goes back by anl_release */
+    anl_free_fn free_fn;
+    void *alloc_user;           /* passed to malloc_fn / free_fn */
     int interval;               /* 20 ms (ikcp default is 100) */
     int init_cwnd;              /* 16 segments: initial cwnd and app-limited burst floor;
                                   also seeds pacing before the first bandwidth sample */
@@ -351,8 +358,6 @@ void     anl_flush(anl_t *w);
 /* 0 = alive, -1 = dead (dead_link or idle timeout) */
 int      anl_state(const anl_t *w);
 int      anl_get_stats(const anl_t *w, anl_stats *out);
-
-void     anl_allocator(void *(*new_malloc)(size_t), void (*new_free)(void *));
 
 /*---------------------------------------------------------------------
  * default stream (sid 0): created with the connection on both sides, usable

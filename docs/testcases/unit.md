@@ -31,6 +31,7 @@
 |---|---|---|
 | 基础与线上格式 | `test_kat` `test_demux` `test_output_rewrite` `test_wire_v1_wrap` `test_seg_size` | 已知答案、按 conv 分流、输出回调原地改写明文头、ts / sn 回绕、段长度上限 |
 | 可靠流与半可靠流 | `test_default_stream` `test_reliable` `test_semi` `test_window_reopen_loss` `test_handle_lifetime` | 有丢包和无丢包时的完整性与顺序、窗口重开、句柄生命周期 |
+| 内存分配器 | `test_allocator` | anl_config 里的分配器按连接使用并带 alloc_user；anl_release 后全部归还；只设一个函数时拒绝创建；anl_create 中途分配失败不留残余 |
 | 安全与健壮性 | `test_reflect` `test_replay` `test_violation` `test_default_violation` `test_fuzz` | 反射、重放窗口（pn）、违规段导致流重置；默认流只丢弃违规段，不会被结束；随机段 |
 | 流的生命周期 | `test_close_notify` `test_close_confirm` `test_semi_close` `test_stream_lifecycle` `test_sid_lifecycle` `test_sid_hold` `test_sid_churn` `test_accept_limits` `test_max_streams` | CLOSE 一直重发到收到 RST；两端计数一致；sid 不复用、保留期；接受上限；64 个流 |
 | 调度与 pacing | `test_pacing` `test_priority` `test_review_scheduler` `test_review_timers` `test_review_backlog` | 加权轮询的额度、按优先级调度、时钟回绕时的定时器、积压计数 |
