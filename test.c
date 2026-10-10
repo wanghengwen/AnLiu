@@ -2512,13 +2512,37 @@ static int g_gate_open_pct;             /* ... % of 100 ms samples after 3 s wit
 static int g_gate_latency_rtt;          /* ... the sender's latency_rtt */
 static int g_gate_deadline_cfg;         /* ... and fec_deadline_ms */
 static uint32_t g_gate_deadline;        /* ... its fec_deadline at the end */
+/* Optional finite-flight diagnostics. The original fixed-window assertions
+ * still use `got` and g_gate_open_pct, before any draining takes place. */
+typedef struct gate_observation {
+    int first_hard_ms, first_protected_ms, opening_budget_ms;
+    int protected_samples, evidence_samples;
+    int total, tail, last_tail_ms, max_delivery_ms;
+    uint32_t skipped, repaired;
+} gate_observation;
+static gate_observation *g_gate_observe;
+
+static void gate_observe_frame(gate_observation *d, const char *buf, int len,
+                               const anl_frame_info *fi, int elapsed, int period)
+{
+    int age = elapsed - (int)fi->frame_no * period;
+    CHECK(check_pattern(buf, len, fi->frame_no), "gate replay: frame content (%u)", fi->frame_no);
+    CHECK(fi->frame_no == (uint32_t)d->total + d->skipped + fi->lost_before,
+          "gate replay: ordered frame accounting (%u)", fi->frame_no);
+    d->skipped += fi->lost_before;
+    d->total++;
+    if (age > d->max_delivery_ms) d->max_delivery_ms = age;
+}
+
 static int run_fec_gate(int fec, int max_age, int size, int period, int delay, int loss, int ms, uint32_t *repaired, int *got)
 {
     net n; anl_config ca, cb; anl_stream_opt o, op; anl_stream_stats ss;
     anl_stream_t *a, *b;
     anl_frame_info fi;
     static char buf[40000];
-    int i, sent = 0, open, samples = 0, on = 0;
+    int i, r, sent = 0, open, samples = 0, on = 0;
+    gate_observation *d = g_gate_observe;
+    if (d) { memset(d, 0, sizeof(*d)); d->first_hard_ms = d->first_protected_ms = -1; }
     *repaired = 0; *got = 0;
     net_init(&n, &ca, &cb);
     n.min_delay = n.max_delay = delay;
@@ -2534,6 +2558,7 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
     a = open_pair(&n, 0, &o, &op, &b);
     if (!b) { net_stop(&n); return -1; }
     n.loss_pct = loss;
+    if (d) d->opening_budget_ms = FEC_BLOCK_MS + period + 2 * ca.interval;
     for (i = 0; i < ms; i++) {
         net_tick(&n);
         if (i % period == 0) {
@@ -2542,7 +2567,18 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
             sent++;
         }
         if (i >= 3000 && i % 100 == 0) { anl_stream_get_stats(a, &ss); samples++; on += ss.fec_ratio != 0; }
-        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) (*got)++;
+        if (d && n.ep[0]->fec_loss_ts) {
+            if (d->first_hard_ms < 0) d->first_hard_ms = i;
+            if (((anl_stream *)a)->fec_gate && d->first_protected_ms < 0) d->first_protected_ms = i;
+            if (d->first_protected_ms >= 0 && i % 100 == 0) {
+                d->evidence_samples++;
+                d->protected_samples += ((anl_stream *)a)->fec_gate != 0;
+            }
+        }
+        while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) >= 0) {
+            (*got)++;
+            if (d) gate_observe_frame(d, buf, r, &fi, i, period);
+        }
     }
     g_gate_open_pct = samples ? on * 100 / samples : 0;
     g_gate_deadline = ((anl_stream *)a)->fec_deadline;
@@ -2550,6 +2586,27 @@ static int run_fec_gate(int fec, int max_age, int size, int period, int delay, i
     open = ss.fec_ratio != 0;
     anl_stream_get_stats(b, &ss);
     *repaired = ss.fec_recovered;
+    if (d) {
+        uint64_t saved_rng = g_seed;
+        /* Stop generating, keep loss and both endpoints running through the
+         * final frame's sender lifetime and a round trip. Restore the RNG
+         * so a diagnostic tail cannot change the next scenario's packets. */
+        for (i = 0; i < max_age + 2 * delay; i++) {
+            net_tick(&n);
+            while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) >= 0) {
+                gate_observe_frame(d, buf, r, &fi, ms + i, period);
+                d->tail++;
+                d->last_tail_ms = i + 1;
+            }
+        }
+        g_seed = saved_rng;
+        anl_stream_get_stats(b, &ss);
+        d->repaired = ss.fec_recovered;
+        printf("  finite flight: cutoff %d, total %d/%d, tail %d through +%d ms, skipped %u, max delivery %d ms; "
+               "hard_loss_ms=%d, protected_ms=%d, protected samples %d/%d, repairs %u\n",
+               *got, d->total, sent, d->tail, d->last_tail_ms, d->skipped, d->max_delivery_ms,
+               d->first_hard_ms, d->first_protected_ms, d->protected_samples, d->evidence_samples, d->repaired);
+    }
     CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0, "connection stays alive");
     net_stop(&n);
     return open;
@@ -4994,6 +5051,47 @@ static void test_review_gf_tables(void)
     for (a = 1; a < 256; a++) CHECK(gf_mul((uint8_t)a, gf_inv((uint8_t)a)) == 1, "GF inverse %u", a);
 }
 
+/* Replay the exact random states at entry to the failing run_fec_gate
+ * scenarios (after the earlier scenarios in each historical test). These checks
+ * complement, and do not replace, the fixed-window assertions above. */
+static void test_fec_gate_finite_flight(void)
+{
+    static const uint64_t video_rng[] = { UINT64_C(0x709b4771c57e81c8), UINT64_C(0x0269a3c42ff29859) };
+    uint64_t saved_rng = g_seed;
+    gate_observation d;
+    uint32_t repaired;
+    int got, open, j;
+    printf("[FEC gate: evidence onset and finite-flight delivery replay]\n");
+    g_seed = UINT64_C(0xac81a8851fccbd0a);
+    g_gate_noreport = 1;
+    g_gate_observe = &d;
+    open = run_fec_gate(ANL_FEC_RTT_AUTO, 200, 160, 20, 140, 5, 20000, &repaired, &got);
+    CHECK(d.first_hard_ms > 3000, "historical audio: no hard loss yet at sample-window start (%d)", d.first_hard_ms);
+    CHECK(d.first_protected_ms >= d.first_hard_ms && d.first_protected_ms - d.first_hard_ms <= d.opening_budget_ms,
+          "audio protection promptly follows hard evidence (%d -> %d)", d.first_hard_ms, d.first_protected_ms);
+    CHECK(open && d.evidence_samples > 100 && d.protected_samples == d.evidence_samples,
+          "audio protection stays on after opening (%d/%d)", d.protected_samples, d.evidence_samples);
+    CHECK(d.total >= 985 && d.total + (int)d.skipped == 1000,
+          "finite audio flight delivered and accounted (%d + %u)", d.total, d.skipped);
+    g_gate_observe = NULL;
+    g_gate_noreport = 0;
+    for (j = 0; j < 2; j++) {
+        g_seed = video_rng[j];
+        g_gate_deadline_cfg = 300;
+        g_gate_latency_rtt = 4;
+        g_gate_observe = &d;
+        open = run_fec_gate(ANL_FEC_RTT_AUTO, 1200, 3000, 33, 125, 5, 8000, &repaired, &got);
+        CHECK(!open && repaired == 0 && d.repaired == 0, "video replay: retransmissions only (%d, %u -> %u)", open, repaired, d.repaired);
+        CHECK(d.total == 243 && d.skipped == 0, "finite video flight loses no frame (%d, %u)", d.total, d.skipped);
+        CHECK(g_gate_deadline >= 996 && g_gate_deadline <= 1040 && d.max_delivery_ms <= (int)g_gate_deadline,
+              "every video frame arrives within its own deadline (%d <= %u)", d.max_delivery_ms, g_gate_deadline);
+        g_gate_observe = NULL;
+        g_gate_latency_rtt = 0;
+        g_gate_deadline_cfg = 0;
+    }
+    g_seed = saved_rng;
+}
+
 /* ANL_TEST_ONLY: substrings of test names separated by '|', any of them selects the test */
 static int test_selected(const char *name, const char *only)
 {
@@ -5135,6 +5233,7 @@ int main(void)
     RUN(test_capacity_clear_window());
     RUN(test_capacity_recovery_replay());
     RUN(test_close_confirm_lost_replies());
+    RUN(test_fec_gate_finite_flight());
     if (g_fail) { printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("\nall tests passed\n");
     return 0;
