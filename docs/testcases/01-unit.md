@@ -7,9 +7,9 @@
 
 `test.c` 的结果由种子决定：环境变量 `ANL_TEST_SEED` 不设时使用默认种子。下面三个环境变量用来缩小范围：
 
-- `ANL_TEST_ONLY=子串`：只运行名字含该子串的测试；
+- `ANL_TEST_ONLY=子串`：只运行调用文本含该子串的测试；可用 `|` 分隔多个子串，参数也参与匹配（例如 `ANL_TEST_ONLY='fec_capacity_recovery(10)'`）；
 - `ANL_TEST_TRACE=1`：在每个测试前打印当时的随机数状态；
-- `ANL_TEST_RND=状态`：从打印出的状态开始回放。
+- `ANL_TEST_RND=状态`：从打印出的状态开始回放（`test_fec_capacity_recovery` 例外：它从本次运行的种子重新取随机数，回放它用 `ANL_TEST_SEED=<种子> ANL_TEST_ONLY=fec_capacity_recovery`）。
 
 ## CTest
 
@@ -18,14 +18,14 @@
 | UT-01 | `anliu.unit` | `test.c` | 协议单元测试，见下表 | 默认种子没有 `FAIL` |
 | AT-01 | `anliu.attack` | `test_attack.c` | 不持有 PSK 的路径上攻击者：重放、反射、伪造、篡改、可塑性、注入、认证前模糊、不放大 | 没有被接受的伪造数据报 |
 | DG-01 | `anliu.fec_accounting` | `bench/test_fec_diag.c` | FECCOST 核算：丢失、重传、FEC 路径 | 字节核算平衡 |
-| DG-02 | `anliu.tx_accounting` | `bench/test_tx_diag.c` | pacing 令牌与输出字节的核算 | 断言通过 |
-| DG-03 | `anliu.media_workload` | `bench/test_media_workload.c` | 相同种子产生相同的媒体负载，与协议、端点角色、定时器批次无关 | 帧序列相同 |
-| DG-04 | `anliu.comparison_validation` | `tools/realnet/srt/test_cmp_checks.py` | 实网对比轮次的有效性检查（离线） | 通过 |
+| DG-02 | `anliu.tx_accounting` | `bench/test_tx_diag.c` | pacing 令牌与输出字节的核算（只在 Linux 上注册） | 断言通过 |
+| DG-03 | `anliu.media_workload` | `bench/test_media_workload.c` | 相同种子产生相同的媒体负载，与协议、端点角色、定时器批次无关（只在 Linux 上注册） | 帧序列相同 |
+| DG-04 | `anliu.comparison_validation` | `tools/realnet/srt/test_cmp_checks.py` | 实网对比轮次的有效性检查（离线；找到 Python3 时注册） | 通过 |
 | FZ-00 | `anliu.fuzz_peer_smoke` | `tools/fuzz/fuzz_peer.c` | libFuzzer 运行 2 万次，固定种子（只在 Clang 且 `-DANLIU_BUILD_FUZZERS=ON` 时有） | 没有崩溃，没有违反不变量 |
 
 ## `test.c` 的内容（UT-01）
 
-按 `main` 中的运行顺序分组列出。`test_fec_capacity_recovery` 从本次运行的种子开始取随机数，不受前面测试的影响。新测试加在 `test_fec_buffers_release` 之后（目前是 `test_echo_clock_rate`），以免扰动它之前各测试的随机序列。
+按主题分组列出（不是运行顺序：`test_sid_churn(10, 4000)` 最先运行，`test_fuzz` 在 `test_start_absent` 之后）。`test_fec_capacity_recovery` 从本次运行的种子开始取随机数，不受前面测试的影响。新测试加在 `test_fec_buffers_release` 之后（目前是 `test_echo_clock_rate`），以免扰动它之前各测试的随机序列。
 
 | 组 | 测试 | 检查什么 |
 |---|---|---|
@@ -65,7 +65,7 @@ cmake --build build-asan -j && (cd build-asan && ctest --output-on-failure)
 
 在 Release 构建的输出中查找 `warning`，与基线比较。通过规则：`anliu.c`、`test.c`、`test_attack.c` 没有新增警告。
 
-`bench/` 的比较工具（`bench.c`、`capacity_step.c`）在 GCC 13 下已有 `-Wmaybe-uninitialized` 与 `-Wformat-truncation` 警告，不计入。
+`bench/` 的比较工具在 GCC 13 下已有警告，不计入：`bench.c` 1033..1036 行的 `-Wmaybe-uninitialized`（经 `capacity_step.c`、`media_loss.c` 包含各出现一次）和 `capacity_step.c` 31 行的 `-Wmissing-field-initializers`。
 
 ## 模糊测试（FZ-01，代理）
 

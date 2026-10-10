@@ -32,7 +32,7 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→rb 与 rb→t1，16 轮
 ## 前置
 
 - RN-01 已通过（`cbase` / `ccand` 已部署）；
-- 带宽：每轮实际约 2.4 Mbit 每方向，`--rate 4000` 是上限。每个发送端两个轮次按 8 Mbit 计入预算（见 [README.md](README.md) 的"出口容量"一节）；两条路径都用到的主机，按两个方向分别计算。
+- 带宽：每轮实际约 2.4 Mbit 每方向，`--rate 4000` 是上限。每个发送端两个轮次按 8 Mbit 计入预算（见 [03-realnet.md](03-realnet.md) 的"出口容量"一节）；两条路径都用到的主机，按两个方向分别计算。
 
 ## 步骤
 
@@ -52,18 +52,20 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→rb 与 rb→t1，16 轮
    done; echo ALLDONE
    ```
 
+   按 [../TESTING.md](../TESTING.md) 的规则 3，重复的轮次要交换两版的启动顺序：上面的脚本每轮都先启动 `cbase`，下次运行时按丢包率的奇偶交换 `cbase` / `ccand` 两行的顺序。
+
 2. 等到 `ALLDONE`，然后运行 `cd $R && python3 churn_ana.py`。
 
 ## 通过规则
 
 - 有效轮次 ≥ 14 / 16；候选的每一个无效轮次都要有可归因的原因（例如 tc 计数为 0、主机故障），并且与它同时运行的基线轮次不是有效的。
 - 候选的每个有效轮次，两端都满足：
-  - `HEALTH errors=0 ok=1 state=0`；
-  - `CHURN_FINAL ok=1`：只剩默认流，没有待确认的关闭；
+  - `HEALTH` 行 `state=0 errors=0 ok=1`；
+  - `CHURN_FINAL` 行 `ok=1`：只剩默认流，没有待确认的关闭；
   - `CHURN_READ` 中的 `order_errors=0`、`pattern_errors=0`、`gen_errors=0`、`graceful_short=0`；
   - 被拒绝的打开为 0；
   - `CHURN_NET` 中的 `input_errors=0`；
-  - 没有 `DEAD` 行。
+  - 没有 `DEAD` 行（`churn_ana.py` 不汇总它，在 `.srv` / `.cli` 日志里 grep）。
 - 关闭确认时间的 p99：候选不超过同一路径、同一时间基线的 1.5 倍加 100 ms。
 - 每轮的打开数：候选不低于同时运行的基线的 90%。
 

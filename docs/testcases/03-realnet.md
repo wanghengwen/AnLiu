@@ -1,9 +1,9 @@
 # 实网用例的环境与参数
 
-这些用例在真实的广域网和机房主机上执行。执行前先读：
+实网用例（本目录的 `RN-*.md`）在真实的广域网和机房主机上执行。执行前先读：
 
-- [../README.md](../README.md) 中的代理执行规则；
-- [tools/realnet/README.md](../../../tools/realnet/README.md)。
+- [../TESTING.md](../TESTING.md) 中的代理执行规则；
+- [tools/realnet/README.md](../../tools/realnet/README.md)。
 
 **仓库里不包含任何主机地址或账号。** 主机表放在仓库之外，由 `ANL_REALNET_HOSTS` 指定，用例中只用表中的主机名。
 
@@ -19,11 +19,12 @@ R=~/workspace/AnLiu_github/tools/realnet
 
 ## 主机与路径
 
-主机表每一项有以下字段：
+主机表每一项有以下字段（`ssh`、`ip`、`base`、`dev` 见 [tools/realnet/README.md](../../tools/realnet/README.md)）：
 
-- `cap_kbps`：可用带宽；
-- `slots`：同时运行的进程数上限；
-- `pool`：同一台机器上的主机共用一个 pool；
+- `cap_kbps`：可用带宽，默认 30000；
+- `slots`：同一个 pool 同时运行的进程数上限（取 pool 内的最大值），默认 3；
+- `pool`：同一台机器上的主机共用一个 pool，默认为主机名；
+- `port_base`：调度器（`multi_sched_pair.py`）给该发送端分配端口的起点，默认 9900；
 - `shape`：能否 `sudo -n tc`。只有能整形的主机可以做发送端。
 
 用例按路径的类别写，执行时从表中选择当时可达、而且出口容量够用的主机：
@@ -47,7 +48,7 @@ R=~/workspace/AnLiu_github/tools/realnet
 ssh <发送端> ping -c 10 -q <接收端的 ip>
 ```
 
-有的主机不回 ICMP，这时以 `cmp_round.py` 记录的 `rtt_min_ms` 为准。
+`cmp_round.py` 记录的 `rtt_min_ms` 也是 ping 得到的（接收端到发送端、再反过来各试一次，都不通时轮次中止）；完全不回 ICMP 的路径看 `.cli` 日志里 realnet 自己测的 `PATH ping rtt_min=`。
 
 ### 出口容量（每个批次之前）
 
@@ -76,7 +77,7 @@ python3 $R/capacity_probe.py <发送端> <接收端> <端口> 2,4,8,12,16 8
 - 限速器的桶用 `python3 $R/burst_probe.py <发送端> <接收端> <端口> 64,128,256,512,1024 3` 测，每个大小重复几次（结果波动大）；
 - 测量要逐级升速：超出限速很多时，云平台可能会暂时丢掉全部数据报。
 
-每一轮中，还要用两端的数据报计数核对实际丢包：发送端 `.srv` 的 `DATAGRAM_COST tx_packets` 与接收端 `.cli` 的 `rx_packets` 之差，应当接近 tc 设定的丢包率（相差不超过 2 个百分点）。差得多的轮次，说明路径或出口另有丢包，该轮无效。
+每一轮中，还要用两端的数据报计数核对实际丢包：发送端 `.srv` 的 `DATAGRAM_COST tx_packets` 与接收端 `.cli` 的 `rx_packets` 之差，应当接近 tc 设定的丢包率（相差不超过 2 个百分点）。差得多的轮次，说明路径或出口另有丢包：`cmp_pair.py` 自动跳过高出 tc 设定 2 个百分点以上的轮次（低于设定的不跳过），`multi_pair.py` 跳过"tc 与 TBF 之外的丢包超过发送数 2%"的轮次。
 
 ## 版本（变体）
 
@@ -100,7 +101,7 @@ python3 $R/churn_round.py deploy ccand HEAD --tools-from-rev <主机...>
 |---|---|
 | `cmp_round.py` | 末行 `... True`：两端正常退出，运行时长完整，末尾 HEALTH 正常，发送端音视频序号完整，有接收记录和 tc 字节计数 |
 | `multi_round.py` | `MULTI_DONE True`；用 tc 丢包时，tc 计数不为 0 |
-| `churn_round.py` | `CHURN_DONE <tag> True`：两端 `HEALTH errors=0 ok=1 state=0`，tc 频段计数不为 0 |
+| `churn_round.py` | `CHURN_DONE <tag> True ...`（后面还有错误字段，不能按 `True$` 匹配）：两端 `HEALTH state=0 errors=0 ok=1`，`--loss > 0` 时 tc 频段计数不为 0 |
 
 无效轮次重跑一次（`cmp_round.py` 的批次脚本按两次尝试写）。
 

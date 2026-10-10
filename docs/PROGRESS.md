@@ -12,32 +12,38 @@
 
 ## 2026-10-10
 
+- 发布前整理（文档结构、文档与代码核对、`anliu.c` 清理；行为不变）：
+  - 文档：`docs/testcases/README.md` 改为 [TESTING.md](TESTING.md)，`realnet/` 目录取消，用例文件上移并按 `00-template`、`01-unit`、`02-sim`、`03-realnet`、`RN-NN-*` 命名；所有相互引用、`tools/realnet` 脚本注释和两个 README 中的链接随之更新；TUNING.md 删除后留下的条目号引用去掉。
+  - 文档与代码核对（三份独立审计，逐条对照 `anliu.h` / `anliu.c` / 测试脚本），改正的主要有：`anl_stream_open` 注释里过时的"sid 复用"说法与漏掉的 `ANL_ENOSID`；DESIGN 中 SACK 重复计数按区间而不是按分片、RACK 也在 FRESH ACK 时判定、RCV_SKIP 7 字节、ECHO 6 字节、大块 RTO 保留的失败上限是千分之三（`FEC_HOLD_FAIL`）、校验包预算的扣除范围、pacing 下限用 srtt、`send_frame` 的 `ETOOBIG` 不占帧号、客户端 7 个 / 服务端 8 个单字节 sid、内置 PRNG 的 key / nonce 构成、同 conv 重连先是 `ANL_EREPLAY`；SECURITY_AUDIT 的攻击编号对齐 `test_attack.c`；测试用例文档中日志标记的真实写法（`HEALTH state= errors= ok=`、`CHURN_DONE` 后的字段、`TRACE` 行而非不存在的 `STATS`）、SM-01 的 8 场景 × 3 种子、2000 kbit 的门限、`ANL_TEST_ONLY` 的 `|` 与参数匹配、`test_fec_capacity_recovery` 的回放方式、`multi_round.py` 默认在应用内丢包须加 `--tc-loss`、RN-03 每链 7 轮、RN-05 成对交换顺序、RN-06 四条链 28 对、主机表字段与默认值；README 快速示例补 `<string.h>` 并注明是片段。
+  - `anliu.c`（6508 → 6655 行，多出的是注释与空行）：文件结构注释按实际内容重写；漂到别的函数上方的注释归位（`handle_ack`、`fec_gate_update`、`fec_auto_count`、`fec_parities_for`、`bbr_path_rtt`、`bbr_window_bw`）；`DESIGN x.y` 引用改正 5 处；`bbr_policer` 拆成 `lt_startup_trim`、`lt_interval_rate` / `lt_interval_loss` 和五个状态各一个函数（`lt_watch`、`lt_test_verdict`、`lt_residual_recheck`、`lt_policed_interval`、`lt_probe_step`），`rate_update` 拆出 `rate_capacity_short`、`rate_par_budget`，`anl_flush_internal` 拆出 `flush_retransmit`、`burst_begin`，`handle_ack` 拆出 `reo_grow`、`fwd_on_ack`，`anl_input_plain` 拆出 `handle_echo`；`handle_report` 与 `vq_*` 移到所属的节；新 helper 合并重复代码：`stream_destroy`（3 处）、`rcv_queue_drop`（5 处）、`rcv_take_message`、`ctrl_seg_size`、`bbr_queue_margin`、`bbr_wnd_segs`、`bbr_enter_probe_rtt`、`bbr_trim_filter`、`fec_small_frame`、`fbufs_free`、`stream_has_data`、`probe_tell_schedule`、`ts16_back`、`flush_control_segs(marked_only)`；手写的饱和 / 取小取大换成 `sat32` / `umin32`（其中 `(uint32_t)umin32((uint32_t)x, 0xffffffff)` 一处原本不起作用）；`stream_for_open` 无用的 `urgent` 出参、两处多余的大括号块、两个多余的前向声明、`rate.cs_net` 字段（只在一处当临时量用）去掉；`anl_input_plain` 的 `scratch` 取用移到 NULL 检查之后；`48`、`0xffffffff`、`230` 与配置默认值命名为 `BBR_LT_HOLD`、`PAR_RATE_NONE`、`RATE_SHARE_INIT`、`CFG_*`；只有实现用到的 `ANL_VERSION`、`ANL_MAX_SID`、`ANL_FEC_OVERHEAD` 从 `anliu.h` 移入 `anliu.c`。
+  - 已验证：Release 与 ASan 的 CTest 6/6，Clang 构建加 libFuzzer 冒烟 7/7；整理前后的输出逐字节比较：`anl_test` 默认种子加种子 1..12、`anl_attack`、`anl_media_loss` 77 个场景（含限速器与 800 kbit）、`anl_bench --quick` s1~s5 / bwstep / `--abr` / TBF 共 94 份输出完全相同，唯一差异是 `test_allocator` 打印的字节数少 8（`anl_s` 少了 `cs_net` 字段）；媒体门槛 SM-01 24/24（ASan）。没有实网对照：没有改变任何行为。
+
 - 与 SRT 的实网复测（`8d6988e`，AnLiu 关闭 FEC，SRT 1.5.4；COMPARISON.md 2.8）：两条广域网路径（RTT 约 99 / 170 ms）与同机房节点对加 tc 单向时延 +0..+200 ms，2 Mbit TBF，丢包 0..15%（1..3% 两个种子），实时互动与 SRT 推荐延迟两种预算，共 100 轮。已验证：丢包 ≤ 3% 时，实时互动预算下可解码视频与关键帧不低于 SRT（一轮路径劣化除外），RTT 越长差距越大；推荐延迟下 AnLiu 视频 99.8..100%，SRT 有 41 轮交付整体后移。
 - 观察到、待处理：局域网（RTT 约 1 ms）经 2 Mbit TBF 时约 8% 的重传是过早的 RTO（桶让带宽估计读到约 28 Mbit，关键帧在 TBF 里排队 60..110 ms，RTO 下限 30 ms），线上带宽多 3..6%，交付不受影响；仿真可复现。试过"RTO 也从最近一次确认新数据的 ACK 算起"：虚假重传几乎消失、带宽省 1..8%，但长 RTT 加大关键帧时关键帧明显下降（仿真 8 种带宽 × 5 种 RTT × 0..3% 丢包，6 个种子：170 ms、10 Mbit 跑 5 Mbit 视频低 5.7..9.2 个百分点；1 Mbit 带突发桶时码率工作点改变，关键帧低 7..16），加上"无乱序时 RACK 窗口归零"也补不回来，未采用。原因未查清（首次重传时机两版相同），暂不处理。
 - 推荐延迟预设在 RTT 约 105 ms、15% 丢包时，音频缺口等待（max_age 170 ms 的 3/5）短于一次重传，音频重传全部白发；准时率不受影响（预算 130 ms 本来容不下）。
 
 ## 2026-10-09
 
-- STARTUP 与损失补偿（`d7f4a8b`，TUNING 53、54，`bbr_on_ack`）：
+- STARTUP 与损失补偿（`d7f4a8b`，`bbr_on_ack`）：
   - 编码器跟随 target_rate 时发送端一直应用受限，STARTUP 的带宽平台只数非应用受限的轮次，STARTUP 不结束，关键帧按 2.9 倍路径速率发进队列（闭环 2 Mbit、200 ms：视频 70%、关键帧 24%）。现在一个带排队信号的应用受限样本也结束 STARTUP（须已见过非应用受限样本）。
   - 损失补偿原按"发送速率 / 交付速率"，关键帧突发被瓶颈摊开后两者差 2.9 倍而没有丢失，估计被抬到链路的 1.1..1.4 倍。改按样本发送区间内的发送字节 / 交付字节，上限仍为 1.5 倍。
   - 验证：仿真 FIFO / TBF / 限速器无回退；实网 F→G（模拟限速器与 TBF，与上一版同一路径成对）14 对：音频 +0.11 ± 0.23、视频 −0.18 ± 1.21、关键帧 −0.39 ± 1.82 个百分点，准时视频码率 −0.00 ± 1.13%。
-- 云平台限速器下的媒体流（`d57d4ee`，TUNING 55，`bbr_policer`）：
+- 云平台限速器下的媒体流（`d57d4ee`，`bbr_policer`）：
   - 现象：t1、rb、g5 的线速为 1 Gbit，云平台令牌桶约 30 / 30 / 10 Mbit（`burst_probe.py`：128 KB 突发总能通过，256 KB..1 MB 多数能通过）。g5→t1、编码器要 19 Mbit 时，关键帧穿过约 1 MB 的桶，带宽估计被抬到限速的 3..10 倍。检测器 7 s 就看到 35..90% 的丢失，但检测、降速测试、上探三个阶段都要求非应用受限，媒体流几乎每个区间都应用受限，确认只能碰运气（一轮在 146 s，+100 ms 的 4 轮整轮未确认，端到端丢 25..28%）。
   - 修改：应用受限区间丢失超过 25% 时计入检测；应用受限的测试区间只要发出测试速率的一半即可判定（不足一半只短暂等待）；上探或尾段供给不足时，首次确认也保留测试通过的速率。
   - 仿真（1 Gbit 线速，10/12/30 Mbit 限速器，64 KB / 1 MB 桶，20/100 ms，0/1%，3 个种子）：被卡住时视频 +8..+35、关键帧 +5..+62 个百分点，限速器丢包减少 70..99%；30 Mbit 不卡住、30 Mbit FIFO 0..3% 与 10..15% 随机丢包逐字节不变。单元测试 Release / ASan 全过，媒体门槛 24/24。
   - 实网（修改前后成对，关闭 FEC，两个种子，每个发送端上两版交替，24 对全部有效）：g5→t1 +100 ms 视频 72 → 97..98.7%、端到端丢包 25..28% → 1.2..2.7%；+20 ms 视频持平（99%），确认时间 8..31 s（原 7..53 s）；t1→rb、rb→g5（不卡住）无变化。总体视频 +4.9 ± 4.3、关键帧 +2.7 ± 3.0、音频 +0.02 个百分点。
   - 未解决：确认的速率可能偏低。g5→t1 +100 ms 只用到 5.2..6.4 Mbit（限速 10 Mbit）。测试速率取自检测区间的交付，RTT 100 ms、重度丢包时比链路实际送达低 20..25%（仿真）；之后的上探又因编码器跟不上而判为供给不足。试过两种修法都更差（重复供给不足的上探步：20 ms 视频 99 → 87..94%；取前一步的交付：含桶的积累，速率到限速的 1.1..1.5 倍），未采用。下一步先查检测区间的交付为何偏低。
-- 首份报告之前按 ACK 顺序计的丢失（`17b2eb2`，TUNING 52）：只乱序不丢包的路径上（`test_fec_spurious_repair`），首份报告前 10 ms 有一个乱序包被当作 FEC 重建计入，首个窗口读成 2%，预热期取高值，15 s 时估计仍为 0.85%（应低于 0.25%）。STARTUP 修改只是改变了时序。现在这类计数在首份报告到达、窗口未结算时，最多保留报告的重建数；报告仍只作基线。单元测试 Release / ASan 全过，媒体门槛 24/24 输出不变。
+- 首份报告之前按 ACK 顺序计的丢失（`17b2eb2`）：只乱序不丢包的路径上（`test_fec_spurious_repair`），首份报告前 10 ms 有一个乱序包被当作 FEC 重建计入，首个窗口读成 2%，预热期取高值，15 s 时估计仍为 0.85%（应低于 0.25%）。STARTUP 修改只是改变了时序。现在这类计数在首份报告到达、窗口未结算时，最多保留报告的重建数；报告仍只作基线。单元测试 Release / ASan 全过，媒体门槛 24/24 输出不变。
 - 测试工具（`96b941a`）：`multi_pair.py` 读入 `--unlimited`（云平台限速器）的轮次；`burst_probe.py` 测令牌桶；`multi_tc.py` / `multi_round.py --police` 用 tc police 模拟限速器（TBF 不是限速器：它排队）；`media_loss` 新增 `MEDIA_LOSS_POLICER(_KB)`、`MEDIA_LOSS_QDELAY`、`MEDIA_LOSS_LT`，被拒绝的过大帧不再使后续帧计为错误。
 - 随机丢包上限 15%（`a75f02d`）：单元测试、媒体门槛、`test_media_protection.py`、`anl_bench` 默认值与 soak 阶段（heavy20 → heavy15）、各实网脚本的参数检查都不超过 15%。100% 的"丢包"是断网或定点丢弃，不是丢包率，保留。
-- 限速器检测的送达率改用对端报告（`31cceb1`，TUNING 56、57，DESIGN 6.8、6.9）：
+- 限速器检测的送达率改用对端报告（`31cceb1`，DESIGN 6.8、6.9）：
   - 原因（交接后的逐包审计）：帧过期时 `purge_frame` 删掉了已发出的段，之后到达的部分无法由 ACK 结算，`delivered` 少算约 22%，测试速率因此锁在限速的三分之二左右。
   - 修改：接收端按与 `sent_wire` 相同的口径累计到达的数据与校验字节（`rx_net`）；REPORT 改为定长 22 字节，带 `rx_bytes`（u32）与发送端时间戳回显（u16）；检测器的速率在同一节拍阶段内用报告的字节差 / 对端时间差，覆盖不足时按 ACK；可靠流默认也发报告；测试按速率发满而送达低于 7/8 时按实际送达重测一次；应用受限的测试发送不足时多等一个区间；`capacity_short` 期间不开始新的检测。编码器目标仍按 ACK 统计（试过让被清除帧的到达计入 BBR 与编码器目标：随机丢包 100 ms 视频 68 → 32%）。
   - 实网（第 6 批，与 `d57d4ee` 成对，24 对）：g5→t1 +100 ms 4 对全部更好（视频 +1.7..+9.5 个百分点，端到端丢包更低，确认在 1138..1260 kB/s）；+20 ms 0% 时确认变慢（见下一条）；总体视频 +0.82 ± 1.16、关键帧 +0.03 ± 1.33。
-- 首次上探中的断流不作结论（`133ca10`，TUNING 58）：g5→t1 +20 ms 在确认限速之前的大幅超发阶段周期性出现几百毫秒的断流（送达 9..130 kB/s、RTT 上升），落在首次上探时原规则交回普通拥塞控制并等待 48 个区间，确认推迟到 32..49 s。现在上探区间带排队信号而送达不到速率的 1/4 时不作结论，保留测试速率。实网第 7 批（与 `31cceb1` 成对，24 对）：g5→t1 8 对平均视频 −0.03、关键帧 +0.25 个百分点，规则生效 1 次；仿真只有 10 Mbit / 1 MB / 20 ms 两格变化（视频 +1.9 / +3.2）。
+- 首次上探中的断流不作结论（`133ca10`）：g5→t1 +20 ms 在确认限速之前的大幅超发阶段周期性出现几百毫秒的断流（送达 9..130 kB/s、RTT 上升），落在首次上探时原规则交回普通拥塞控制并等待 48 个区间，确认推迟到 32..49 s。现在上探区间带排队信号而送达不到速率的 1/4 时不作结论，保留测试速率。实网第 7 批（与 `31cceb1` 成对，24 对）：g5→t1 8 对平均视频 −0.03、关键帧 +0.25 个百分点，规则生效 1 次；仿真只有 10 Mbit / 1 MB / 20 ms 两格变化（视频 +1.9 / +3.2）。
 - 评审意见（`c74483e`）：`extend16`、`bbr_report_fresh`、`bbr_lt_pace`、`fl_prov_add` 等简化（102 个仿真场景逐字节相同）；短于 22 字节的 REPORT 与其它短控制段一样跳过，不再丢弃整个数据报；报告速率不超过同一区间发送量的 2 倍。
-- 测试在 STARTUP 结束后才开始（`8d6988e`，TUNING 59）：t1→rb（30 Mbit、约 100 ms、1%）起步阶段 1.6..2.0 s 丢失 53..72%，编码器还在起步（46..50 kB/s），按 48 kB/s 测试通过后上探一直喂不满，整轮 88% 的时间限速在 48 kB/s，准时视频 0.3 Mbit。现在 STARTUP 中的区间只作为依据，测试须在 STARTUP 结束后开始；仿真 162 个场景逐字节相同。
+- 测试在 STARTUP 结束后才开始（`8d6988e`）：t1→rb（30 Mbit、约 100 ms、1%）起步阶段 1.6..2.0 s 丢失 53..72%，编码器还在起步（46..50 kB/s），按 48 kB/s 测试通过后上探一直喂不满，整轮 88% 的时间限速在 48 kB/s，准时视频 0.3 Mbit。现在 STARTUP 中的区间只作为依据，测试须在 STARTUP 结束后开始；仿真 162 个场景逐字节相同。
 - 实网主机：zjg 已下线（主机表删除）；lsj 与 t1、g5 在同一机房；hz 只能作为主动连出的接收端。
 - 未解决：t1 出口短暂拥塞时，不受限速的路径（t1→rb）会被确认为限速，之后上探喂不满（编码器已到上限），限速状态解除不了，两版都有（第 6、7 批各 2 轮）。属于上探发送量不足的问题，待处理。
 
@@ -61,7 +67,7 @@
   - +20 ms 无丢包时实网关键帧约 92%（仿真 98..100%）：+20 ms 时码率更高，关键帧 56..64 KB，单是排出瓶颈就接近预算。实网与仿真的差距未查。
   - 可选的改进（未做）：码率接口给编码器一个"关键帧上限"，即（预算 − 1.5·RTT − 检测时间）× 瓶颈带宽；在 2 Mbit、RTT 100 ms、预算 300 ms 时约 30 KB。或者在关闭 FEC 时仍只为关键帧加校验包。
 
-- 版本回归（`3353b9d` 对上一个实网验证版 `44a963c`，关闭 FEC，同一路径同时运行；测试用例见新增的 [docs/testcases](testcases/README.md)）：
+- 版本回归（`3353b9d` 对上一个实网验证版 `44a963c`，关闭 FEC，同一路径同时运行；测试用例见新增的 [TESTING.md](TESTING.md) 与 [testcases/](testcases/)）：
   - 单机：
     - UT / AT / DG / SAN：Release 与 ASan 各 6/6；
     - 媒体门槛：24/24；
@@ -91,7 +97,7 @@
   - 重复代码合并：`fec_ok_prob`（二项分布尾概率此前三份）、`fec_repair_ms` 加单次重传参数（`fec_one_retry` 是它的前半）、`srtt_or_def`、`ack_jitter_ms`、`wnd_open`、`open_backoff`（OPEN 与 CLOSE 同一退避）、`fec_pcache_expire`（校验包缓存此前在两处过期）。行为不变：单元测试输出逐字节相同。
   - 跟踪钩子：16 处 `#ifdef ANL_*_TRACE` 改为一个 `ANL_TRACE(kind, ...)`，`bench/anl_trace.h` 列出种类并转到工具自己的 `ANL_TRACE_<kind>` 宏（`data_seg` / `fec_block` / `dup` 把工具原来从库的作用域里取的变量改为显式参数）；流链表按（默认流、优先级、打开顺序）有序，flush 的三个按优先级逐遍的循环各改为一遍，`prio_pass` 删除。行为不变，输出逐字节相同。
   - 线上格式：去掉末段省略长度字段（SEG_L，段首字节 bit 5 保留、须为 0）和 ACK 回显差分（ACK_F_DELTA）；每数据报多 1..2 字节，两端须同时升级；封包不再回写数据报，bench 的字节核算不再需要修正项。随机数序列因此平移，默认种子下两项已记录的不稳定检查失败：`test_fec_capacity_recovery` 改为从本次运行的种子开始（不再随前面的测试平移，单独运行时各种子通过）；`test_fec_buffers_release` 的关键帧原本只在 33 ms 帧槽与 2000 ms 对齐时发出（每 66 s 一次，一次未修复的丢失让 drop_until_key 停发一分钟、接收端空闲超时），改为每 2 s 一次。
-  - 注释：51 处记录实验经过（真实网络、仿真、数字）的注释块搬到 TUNING.md，按代码顺序编号；代码里留结论和条目号。
+  - 注释：51 处记录实验经过（真实网络、仿真、数字）的注释块搬到 TUNING.md，按代码顺序编号；代码里留结论和条目号（TUNING.md 已于 2026-10-10 在 `4abd9ee` 删除，代码里只留结论，原文见 git 历史）。
   - 已验证：`anliu.c` 6608 → 6292 行（注释约 1500 → 1330 行，TUNING.md 316 行）；默认种子与种子 1..8 全部通过（改动前种子 5、6 各失败一项 `test_fec_capacity_recovery`）；ASan/UBSan 加泄漏检查 CTest 6/6；libFuzzer（Clang）20000 次冒烟无崩溃；`bench/` 全部工具编译无警告。本次没有实网对照：线上格式变化只影响段长度字段，拥塞控制与 FEC 的规则未动。
 - 持 PSK 对端的健壮性评估（SECURITY_AUDIT.md 4.1）：缓冲区注入 / 内存安全未发现问题；默认流缺陷已修复；接收内存有界但偏大，写入 DESIGN 6.1 与 `anliu.h` 的 accept 回调说明。
   - 默认流（sid 0）可被一个违规段永久结束：可靠流上带帧号的 DATA、FWD、模式或字节流标志不符的 OPEN 在 sid 0 上会释放默认流且无法重建，`anl_send` / `anl_recv` 永久返回 `ANL_ECLOSED`，连接仍显示存活。三条路径各写 PoC 复现，回归测试 `test_default_violation` 在修复前 20 项检查失败。修复：`stream_reset` 对默认流只丢弃违规段（DESIGN 6.1）。

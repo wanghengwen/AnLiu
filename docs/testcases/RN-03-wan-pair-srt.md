@@ -4,7 +4,7 @@ title: 广域网路径，关闭 FEC，媒体成对对照，SRT 作参考
 kind: agent
 where: 中 RTT（rb→t1 或 g5→rb，约 99 ms）与长 RTT（g5→hz，约 167 ms）
 automation: cmp_round.py 跑轮次；判定用 cmp_pair.py --limits 加本文规则
-duration: 约 1.5 小时（两条链并行，每条 6 轮）
+duration: 约 1.5 小时（两条链并行，每条 7 轮）
 last_run: 2026-10-08 通过（3353b9d 对 44a963c，rb→t1 约 99 ms 与 g5→hz 约 170 ms，14 对；音频 +0.24、视频 −0.07、可解码 +0.01、关键帧 −0.37 个百分点，线上带宽 +0.26%；有丢包的场景中候选的可解码视频与关键帧都高于 srt-b）
 ---
 
@@ -19,8 +19,8 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，rb→t1 约 99 ms 与 g5→h
 ## 前置
 
 - RN-01 已通过；
-- 两条路径的 g5 端都有 `srtnet`，即 `python3 $R/srt/deploy_srt.py ./srtnet` 已执行过；
-- 发送端 g5 的带宽：每条链 3 个 lane × 2000 kbit，两条链共 12 Mbit。
+- 两条路径的两端主机上都有 `srtnet`，即 `python3 $R/srt/deploy_srt.py ./srtnet` 已执行过；
+- 发送端带宽：每条链 3 个 lane × 2000 kbit = 6 Mbit，计入各自发送端的预算（rb 链是 rb，hz 链是 g5；g5 的出口只有约 10 Mbit，见 [03-realnet.md](03-realnet.md)）。
 
 ## 步骤
 
@@ -33,7 +33,7 @@ last_run: 2026-10-08 通过（3353b9d 对 44a963c，rb→t1 约 99 ms 与 g5→h
 
 ## 通过规则
 
-- 有效轮次 ≥ 10 / 12；
+- 有效轮次 ≥ 12 / 14；
 - `cmp_pair.py` 末行为 `LIMITS OK`，限值与 RN-02 相同；
 - 有丢包的场景里，候选的可解码视频与关键帧都不低于同一轮的 `srt-b`。允许一轮例外：SRT 后移的轮次中，SRT 的准时率会整体降到约 50% 以下，这种轮次不作为证据；
 - 两个版本都没有 `DEAD` 行。
@@ -70,4 +70,4 @@ COMPARISON.md 2.7（`c0bf537`，2026-10-07），实时互动预算，AnLiu / SRT
 
 - `cmp_pair.py` 的输出；
 - 差值最大的那一轮三个 lane 的 `cmp_ana.py` 行；
-- 该轮每个 lane 的 `rtt_min_ms`：五元组不同可能走不同的路由。
+- 该轮的 `rtt_min_ms`（每轮一个）和各 lane 自己测的 RTT（AnLiu `.cli` 的 `PATH ping rtt_min=`，SRT 的 `SRTSTAT rtt_ms`）：五元组不同可能走不同的路由。

@@ -31,12 +31,12 @@ RN-02、RN-03 用的是固定码率，拥塞控制给出的目标码率不影响
 1. 写任务文件 `rn05.jsonl`。每行一个任务；相邻、只有 `variant` 不同的两行组成一对，同时启动：
 
    ```sh
-   for d in 20 100; do for l in 0 3; do for s in 1 2; do for v in base cand; do
+   for d in 20 100; do for l in 0 3; do for s in 1 2; do for v in $([ $s = 1 ] && echo "base cand" || echo "cand base"); do
      echo "{\"snd\":\"F\",\"rcv\":\"G\",\"variant\":\"$v\",\"seed\":$s,\"rate\":2000,\"loss\":$l,\"tc_loss\":true,\"fec_off\":true,\"delay\":$d,\"burst\":3200,\"video_max\":8000,\"drive\":\"check\"}"
    done; done; done; done > rn05.jsonl
    ```
 
-   `video_max 8000` 把编码器上限设为约 7.5 Mbit/s（默认 1000‰ 约 940 kbit/s，2 Mbit 的瓶颈根本打不满，闭环不受考验；2026-10-08 第一次运行时就是这样）。`delay 20` 加上路径本身（内网 <1 ms，低 RTT 路径约 1 ms），得到约 20 ms 的路径。`seed` 为 2 的对，由调度器分配的端口与种子 1 的不同。
+   `video_max 8000` 把编码器上限设为约 7.5 Mbit/s（默认 1000‰ 约 940 kbit/s，2 Mbit 的瓶颈根本打不满，闭环不受考验；2026-10-08 第一次运行时就是这样）。`delay 20` 加上路径本身（内网 <1 ms，低 RTT 路径约 1 ms），得到约 20 ms 的路径。调度器给每个任务分配当前未被占用的最低端口，成对中列在前面的变体先启动（早 3 s）并拿到较低的端口；种子 2 的对把 `cand` 写在前面，以交换两版的顺序（[../TESTING.md](../TESTING.md) 规则 3）。
 
 2. 运行 `python3 $R/multi_sched_pair.py rn05.jsonl sched-rn05/`，等它结束（`sched.log` 中出现 `all done`）。
 3. 汇总：`cd $R && python3 multi_pair.py base+nf cand+nf`（lane 写作"变体+开关"：`+nf` 关闭 FEC）。按（路径、限速、时延、丢包、种子）配对，给出"候选 − 基线"，并给出每个场景和全部对的均值与 95% 区间：
@@ -53,7 +53,7 @@ RN-02、RN-03 用的是固定码率，拥塞控制给出的目标码率不影响
   - 视频 ≥ −1.0 个百分点；
   - 关键帧 ≥ −2.0 个百分点；
   - 准时视频码率 ≥ −5%。
-- 单对的准时视频码率差超过 ±15% 的，重跑该对；仍超过的，报告"待确认"并附上两版的 `STATS` 行（每 10 s 一行，含 `cc_state`、`bw_estimate`、`target_rate`）。
+- 单对的准时视频码率差超过 ±15% 的，重跑该对；仍超过的，报告"待确认"并附上两版 `.srv` 中的 `TRACE` 行（`multi_round.py` 设 `REALNET_TRACE=1000`，每 1 s 一行，含 `st=`、`bw=`、`target=`）。
 
 ## 基准
 
@@ -77,4 +77,4 @@ RN-02、RN-03 用的是固定码率，拥塞控制给出的目标码率不影响
 ## 失败时收集
 
 - `sched-rn05/sched.log`；
-- 差值最大的那一对两版的 `.srv` 中的 `STATS`、`LTEV`、`DEAD` 行。
+- 差值最大的那一对两版的 `.srv` 中的 `TRACE`、`LTEV`、`DEAD` 行。

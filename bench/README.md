@@ -15,9 +15,11 @@ make
 ./anl_bench s1 --bw 0 --wnd 4096     # 不限带宽，批量流窗口 4096
 ./anl_bench --quick --fec-ratio 15   # FEC 冗余率（默认 25）
 ./anl_bench bwstep                   # 瓶颈 8/2/5/1/8 Mbps 阶梯：带宽估计、利用率、时延（--step 秒，--step-loss %）
-BENCH_CC=100 ./anl_bench soak        # 每 100 ms 把 AnLiu 的拥塞控制状态打印到 stderr（s1~s5、soak、bwstep）
+BENCH_CC=100 ./anl_bench soak        # 把 AnLiu 的拥塞控制状态打印到 stderr：soak、bwstep 每 BENCH_CC ms 一行，s1~s5 固定每 500 ms 一行
 BENCH_DEBUG=1 ./anl_bench ...        # 打印损坏消息的细节
 ```
+
+其他选项（`./anl_bench` 不带参数打印完整用法）：`all`（s1~s5、soak、crypto 全跑）；`--bulk MB`（s1 的数据量）；`--init-cwnd N`；`--fec-auto`（FEC 流用 `ANL_FEC_RTT_AUTO`，覆盖 `--fec-ratio`）；`--rcv-deadline MS`（半可靠流的缺口等待，-1 为本地期限，0 关闭）；`--qdelay MS`（瓶颈缓冲深度，默认 100，很小时近似限速器）；`--policer KBPS` / `--pbucket KB`（瓶颈前的令牌桶限速器及其桶深，只丢不排队）；`--tbf KB`（瓶颈为该突发量的令牌桶整形器，0 为普通 FIFO）；`--step-rtt MS`（bwstep 的路径 RTT）；`--abr` / `--nobulk`（bwstep 不带批量流，视频码率跟随 `target_rate` / 固定）；`--phase S` / `--sample S`（soak 的阶段长度与采样周期）。环境变量：`SIM_VIDEO_LATENCY`（视频预算 L ms，max_age 取 L + 200）、`SIM_VIDEO_FEC_DEADLINE`（drop_until_key 视频流的 `fec_deadline_ms`）、`SIM_VIDEO_LATENCY_RTT`（它的 `latency_rtt`）。
 
 对照组不使用 anliu 的内部符号，只调用公开 API；`test.c` 仍负责功能正确性，本程序负责性能与长稳。
 

@@ -11,7 +11,7 @@ A round is left out (SKIP) when its datagram loss beyond tc and the TBF
 drops, the tc loss drops and a --police round's policer drops) is more
 than 2% of what was sent: the path or the receiver dropped on its own,
 e.g. concurrent rounds over the path's capacity
-(docs/testcases/realnet/README.md, egress capacity). Not for --unlimited
+(docs/testcases/03-realnet.md, egress capacity). Not for --unlimited
 rounds: there the path's own limit (a provider's token-bucket policer) is
 the bottleneck under test.
 

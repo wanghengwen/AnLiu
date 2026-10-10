@@ -2,7 +2,7 @@
 id: RN-06
 title: 开启自动 FEC 的媒体成对对照
 kind: agent
-where: 低 RTT 路径（g5→t1）加 tc 时延 +100 / +200 ms
+where: 低 RTT 路径（t1→g5，RN-02 的脚本）加 tc 时延 +100 / +200 ms，加 RN-03 的两条广域网路径
 automation: cmp_round.py 跑轮次（lane anl、anl@cand）；判定用 cmp_pair.py anl anl@cand --limits 加本文规则
 duration: 约 1.5 小时
 last_run: 2026-10-08 通过（fecon-20261008，3353b9d + TS_AHEAD_MAX 修复 对 44a963c，t1→g5 +100/+200、rb→t1、g5→hz，28 对，`LIMITS OK`；音频 −0.10、视频 −0.13、可解码 −0.13、关键帧 −0.20 个百分点，线上带宽 +0.44%，区间都含 0）
@@ -26,7 +26,7 @@ last_run: 2026-10-08 通过（fecon-20261008，3353b9d + TS_AHEAD_MAX 修复 对
 
 ## 通过规则
 
-- 有效轮次 ≥ 12 / 14；
+- 有效轮次 ≥ 24 / 28（四条链各 7 轮）；
 - `cmp_pair.py anl anl@cand --limits` 末行为 `LIMITS OK`；
 - 只看 FEC 的开销：线上带宽的均值差不超过 +3%。如果改动本来就是为了降低开销，在报告中给出各场景的节省比例。
 
