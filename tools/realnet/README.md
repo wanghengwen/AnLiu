@@ -1,6 +1,6 @@
 # 实网测试工具
 
-在真实网络上成对运行 AnLiu 的两个版本（或 AnLiu 与 SRT），同一路径、同一时间，按 600 秒一轮统计音视频准时率、带宽与 FEC/重传开销。performance.md 与 COMPARISON.md 中的实网数据都由这些脚本产生。
+在真实网络上成对运行 AnLiu 的两个版本（或 AnLiu 与 SRT），同一路径、同一时间，按 600 秒一轮统计音视频准时率、带宽与 FEC/重传开销。docs/PERFORMANCE.md 与 docs/COMPARISON.md 中的实网数据都由这些脚本产生。
 
 仓库里不包含任何主机地址或账号：主机表放在仓库外，由环境变量指定。
 
@@ -44,7 +44,7 @@ python3 tools/realnet/multi_sched_pair.py jobs.jsonl sched-log/
 
 结果在 `$ANL_REALNET_WORK/results/<tag>.{json,srv,cli,bw}`，两个变体成对轮次的差值用 `multi_pair.py BASE CAND`（tc、TBF 与限速器之外的丢包超过发送数 2% 的轮次判为 SKIP）；
 
-TBF 不是限速器：tc 的 TBF 队列上限是"速率 × latency + 桶"，1 MB 桶就是 1 MB 的排队；加 `--delay` 时 netem 是 TBF 的子队列，队列又被 netem 的 limit 截断。要模拟"线速很高、按令牌限速、超出即丢"的网络，用 `--police`。`analysis/` 里是 performance.md 各批次用过的成对分析脚本。
+TBF 不是限速器：tc 的 TBF 队列上限是"速率 × latency + 桶"，1 MB 桶就是 1 MB 的排队；加 `--delay` 时 netem 是 TBF 的子队列，队列又被 netem 的 limit 截断。要模拟"线速很高、按令牌限速、超出即丢"的网络，用 `--police`。`analysis/` 里是 docs/PERFORMANCE.md 各批次用过的成对分析脚本。
 
 ## 流的打开与关闭（`churn_round.py`）
 
@@ -79,7 +79,7 @@ python3 tools/realnet/srt/cmp_ana.py
 python3 tools/realnet/capacity_probe.py a b 9940 2,4,8,12,16      # 批次前：发送端出口容量（主机表的 cap_kbps 可能过时）
 ```
 
-`cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；统计口径见 COMPARISON.md 2.1。
+`cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；统计口径见 docs/COMPARISON.md 2.1。
 
 `--delay MS` 只增加发送方向的时延，因此 `srt-rec` 的延迟取 `max(120, ceil(4 × (ping RTT + MS)))` 毫秒。结果记录原始 `rtt_min_ms` 和包含人工延迟的 `effective_rtt_ms`。
 

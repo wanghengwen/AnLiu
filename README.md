@@ -15,7 +15,7 @@ AnLiu 是一个基于 UDP 的传输协议，实现方式参考 [ikcp](https://gi
 | 现代丢包恢复 | 区间确认（SACK）+ 基于时间的丢包判定（RACK）+ 乱序自适应 |
 | 精简头部 | 数据报头 23 字节（含 12 字节认证和 4 字节包号），默认 MTU 下基础 DATA 段头 6~7 字节，分片扩展、帧号、流 ID 扩展和 OPEN 参数另计；kcp 每段 24 字节且不加密 |
 
-详细设计见 [DESIGN.md](DESIGN.md)，性能测试数据见 [performance.md](performance.md)，代码里各条规则的实验依据见 [TUNING.md](TUNING.md)，对照测试工具位于 `bench/`。
+详细设计见 [DESIGN.md](docs/DESIGN.md)，性能测试数据见 [PERFORMANCE.md](docs/PERFORMANCE.md)，对照测试工具位于 `bench/`。
 
 ## 编译与安装
 
@@ -92,7 +92,7 @@ static void on_rate(anl_t *w, uint32_t target_rate, void *user)
 anl_set_rate_callback(w, on_rate);
 ```
 
-它比直接用 `bw_estimate` 多做了三件事：应用受限（编码器发得比估计值少）且没有排队时，目标值最多每秒上调 25%，让编码器逐步试探；常规上升最多每秒 25%，持续交付受限时可在已测交付上界内恢复；RTT 显示瓶颈在排队时，立刻降到实际交付速率——带宽骤降后编码器还没跟上时，半可靠流的数据会在确认前过期，BBR 数秒内拿不到样本，而 RTT 仍然看得到队列。相关对照结果见 [performance.md](performance.md)。
+它比直接用 `bw_estimate` 多做了三件事：应用受限（编码器发得比估计值少）且没有排队时，目标值最多每秒上调 25%，让编码器逐步试探；常规上升最多每秒 25%，持续交付受限时可在已测交付上界内恢复；RTT 显示瓶颈在排队时，立刻降到实际交付速率——带宽骤降后编码器还没跟上时，半可靠流的数据会在确认前过期，BBR 数秒内拿不到样本，而 RTT 仍然看得到队列。相关对照结果见 [PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 **接收端时延反馈**（DESIGN 6.9）：接收端（两种流默认都开启）每 `max(srtt, 100 ms)` 把测得的抖动、排队时延、帧时延（最早分片发出到整帧收齐，扣除传播时延）、完成帧数和跳过帧数报告给发送端：
 
@@ -125,7 +125,7 @@ AnLiu 的做法：
 - 丢包判定（RACK）用整条连接的送达证据：低速的控制流即使自己没有后续分片，也能借视频流的送达及时发现丢包；
 - 每个流独立选择可靠 / 半可靠、窗口、FEC、优先级，两端都可以随时打开和关闭流：关闭时本端立即释放，待发、在途及未读数据全部丢弃，并通知对端；对端那一端随之结束，已按序到达的数据仍可读完，之后返回 `ANL_ECLOSED`，句柄由对端应用 close。可靠流需要送达时，应用先等 `anl_stream_waitsnd` 为 0，再关闭。
 
-已知上行配额时，可用 `cfg.pace_rate` 设置 BBR 的发送速率上限；优先级与混合流测试结果见 [performance.md](performance.md)。
+已知上行配额时，可用 `cfg.pace_rate` 设置 BBR 的发送速率上限；优先级与混合流测试结果见 [PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 ---
 
@@ -141,7 +141,7 @@ AnLiu 的做法：
 - 校验包后续发送间隔至少 5 ms，实际时机取决于 flush、pacing 与调度；小块校验包可搭载在同一流下一块的数据报中，其他校验包单独发送（可能附带 ECHO），以减少与本块数据同时丢失的机会；
 - 被校验包覆盖的包，发送端的 RACK 等待从该块最后一个校验包的发送时刻起算，RTO 也可延后，但受帧期限和重传能否赶上的约束，具体见 DESIGN 8.2。
 
-**自适应冗余**（`opt.fec_ratio = 0`，DESIGN 8.5）：按未能及时恢复的丢失调整名义比例，并结合连接丢包估计、块大小与冗余预算决定实际校验包数。自适应模式的名义比例在 10%~100% 间变化；校验包数还受每块上限、低时延下的重传能力及容量不足状态影响。比例和时延的对照数据见 [performance.md](performance.md)。
+**自适应冗余**（`opt.fec_ratio = 0`，DESIGN 8.5）：按未能及时恢复的丢失调整名义比例，并结合连接丢包估计、块大小与冗余预算决定实际校验包数。自适应模式的名义比例在 10%~100% 间变化；校验包数还受每块上限、低时延下的重传能力及容量不足状态影响。比例和时延的对照数据见 [PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 **默认值**：可靠流默认不开 FEC；半可靠流默认 `fec = ANL_FEC_RTT_AUTO`，结合预计修复时间、`fec_deadline_ms` 和近期硬丢失证据决定是否开启，并提供一次有界音频启动保护与关键帧保护。容量不足时暂停生成自适应冗余。要持续开启可显式设 `fec = 1`：`fec_ratio = 25` 为固定比例，`0` 为自适应。收发两端均需启用 FEC；接收端可在 accept 回调里设置本地选项（详见 DESIGN 8.6）。
 
@@ -149,7 +149,7 @@ AnLiu 的做法：
 
 ## 4. 性能测试
 
-模拟网络、真实 UDP 路径、吞吐、媒体时延、优先级和 FEC 冗余率的测试条件及历史数据统一放在 [performance.md](performance.md)。测试工具和运行方法见第 6 节。
+模拟网络、真实 UDP 路径、吞吐、媒体时延、优先级和 FEC 冗余率的测试条件及历史数据统一放在 [PERFORMANCE.md](docs/PERFORMANCE.md)。测试工具和运行方法见第 6 节。
 
 ---
 
@@ -259,9 +259,9 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 - **一个端口两种协议**：每个数据报多 1 字节协议标记（工具层），客户端先发 20 个 ping 测路径 RTT。
 - **同时对比**：媒体测试中 AnLiu 与 kcp 同时各跑一个进程（端口不同），同一时刻的网络条件相同；吞吐测试两者先后各跑一段，避免互相抢带宽。
 - **一轮约 12.5 分钟**：媒体上行 150 s、媒体下行 150 s（两协议同时）、可靠流上行 AnLiu / kcp / TCP 各 75 s、下行各 75 s。每个组合跑 15 轮，分布在一天的不同时段。
-- **TCP 对照**：记录实际拥塞控制算法与缓冲配置，使用相同的逐秒吞吐统计；若 TCP 经过代理而 UDP 直连，应单独标注路径差异。历史测试环境见 performance.md。
+- **TCP 对照**：记录实际拥塞控制算法与缓冲配置，使用相同的逐秒吞吐统计；若 TCP 经过代理而 UDP 直连，应单独标注路径差异。历史测试环境见 docs/PERFORMANCE.md。
 - **并行**：多个组合可以同时跑，同一台主机不同时跑同一种测试（媒体 / 流），各组合用不同端口。
-- **排查**：`REALNET_SECS=1` 打印逐秒吞吐；`make realnet_trace` 后 `REALNET_TRACE=1` 每 100 ms 输出一次拥塞控制内部状态（cwnd、带宽估计、`bw_lo`、`inflight_hi`、PROBE_BW 相位、丢包率、限速器状态）。时钟与限速器问题可通过这些状态定位，相应历史测量见 performance.md。
+- **排查**：`REALNET_SECS=1` 打印逐秒吞吐；`make realnet_trace` 后 `REALNET_TRACE=1` 每 100 ms 输出一次拥塞控制内部状态（cwnd、带宽估计、`bw_lo`、`inflight_hi`、PROBE_BW 相位、丢包率、限速器状态）。时钟与限速器问题可通过这些状态定位，相应历史测量见 docs/PERFORMANCE.md。
 - **应用集成提示**：`anl_input` 以最近一次 `anl_update` 的时间计算 RTT，收包前先调用 `anl_update(now)` 能让 RTT 样本准确（运行 `realnet` 时设置 `REALNET_CLOCK=1`）。
 
 ### 6.4 每一轮修改的流程
@@ -270,7 +270,7 @@ export REALNET_CLOCK=1                # 收包批次内按当前毫秒刷新协�
 2. 模拟对照：修改前后同一组种子对照（6.2），任何场景的退化都要先找到原因，再决定修正还是撤回；
 3. 1000 种子扫描；
 4. 涉及拥塞控制、FEC、调度的修改，再做真实网络对照（6.3）；
-5. 测试数据、代码版本与限制写入 performance.md；实现规则有变化时同步更新 DESIGN.md。
+5. 测试数据、代码版本与限制写入 docs/PERFORMANCE.md；实现规则有变化时同步更新 docs/DESIGN.md。
 
 ---
 
@@ -324,7 +324,7 @@ anl_stream_close(video);                      /* 关闭后句柄失效 */
 anl_release(w);
 ```
 
-完整 API 见 `anliu.h`，协议细节见 [DESIGN.md](DESIGN.md)。音视频应用什么时候用 FEC、各参数怎么设，见 [VIDEO_GUIDE.md](VIDEO_GUIDE.md)。
+完整 API 见 `anliu.h`，协议细节见 [DESIGN.md](docs/DESIGN.md)。音视频应用什么时候用 FEC、各参数怎么设，见 [VIDEO_GUIDE.md](docs/VIDEO_GUIDE.md)。
 
 ## 许可
 

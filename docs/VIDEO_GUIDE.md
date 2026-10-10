@@ -1,6 +1,6 @@
 # 视频应用使用指南
 
-本文面向用 AnLiu 传输实时音视频的应用：什么时候用 FEC，相关参数怎么设。参数的完整定义见 [anliu.h](anliu.h)，机制见 [DESIGN.md](DESIGN.md)（FEC 在第 8 节），文中引用的实测数据见 [COMPARISON.md](COMPARISON.md) 第 2 节与 [progress.md](progress.md)。
+本文面向用 AnLiu 传输实时音视频的应用：什么时候用 FEC，相关参数怎么设。参数的完整定义见 [anliu.h](../anliu.h)，机制见 [DESIGN.md](DESIGN.md)（FEC 在第 8 节），文中引用的实测数据见 [COMPARISON.md](COMPARISON.md) 第 2 节与 [PROGRESS.md](PROGRESS.md)。
 
 ## 1. 先确定时延预算
 

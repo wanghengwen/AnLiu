@@ -414,7 +414,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define REO_DIV         16      /* RACK reordering window starts at min_rtt / 16 */
 #define RCV_WAIT_PCT    60      /* rcv_deadline_ms -1: a gap is waited for this % of the local max_age
                                    (DESIGN 7.5); all of it held the frames behind an unfillable gap past
-                                   any playout budget shorter than max_age (TUNING.md 1) */
+                                   any playout budget shorter than max_age */
 #define REO_MULT_MAX    16      /* and grows up to min_rtt */
 #define REO_DECAY       16      /* round trips without a spurious retransmission before it shrinks */
 #define PARITY_HDR      6       /* base(3) k(1) m(1) j(1), after type|sid sub len */
@@ -492,7 +492,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define FEC_START_RATIO   25    /* RTT auto: key frames while the loss is unknown (the first one) */
 #define FEC_BUDGET_MS     500   /* parity budget: the bucket holds this long at the budget rate */
 #define FEC_FLOOR_CAP     30    /* adaptive: parities of a large non-key block, at most this % of k; the
-                                   auto ratio's ceiling while the budget's bucket is short (TUNING.md 2) */
+                                   auto ratio's ceiling while the budget's bucket is short */
 #define FEC_SMALL_BLOCK   2048  /* data bytes up to which a block counts as small (audio) */
 #define FEC_SMALL_RATIO   100   /* adaptive, a retransmission too late: parities of a small block, % */
 #define FEC_RIDE_MS       25    /* a small block's parity waits this long for the stream's next first
@@ -1291,7 +1291,7 @@ static void dg_output(anl_t *w, int force_pad)
     ANL_TRACE(tx_output, w, w->ptr, w->dg_has_data);
     /* paced at a start_rate hint, the hint is the path's rate: the IP/UDP
        header counts too, or datagrams without the padding they used to carry
-       overran the bottleneck (TUNING.md 3) */
+       overran the bottleneck */
     if (w->dg_has_data) w->pace_tokens -= (int64_t)w->ptr + (w->start_cap != 0 ? START_IPUDP : 0);
     dg_begin(w);
 }
@@ -1375,8 +1375,7 @@ static void write_report_seg(anl_t *w, anl_stream *st)
     p = enc16(p, (uint16_t)umin32(r->frames, 0xffff));
     p = enc16(p, (uint16_t)r->frames_skipped);
     /* rebuilds net of the ones whose original arrived after all (reordering,
-       not loss) and of the ones too young for the original to have come yet
-       (TUNING.md 4) */
+       not loss) and of the ones too young for the original to have come yet */
     uint32_t i, young = 0;
     for (i = 0; i < FEC_REC_RING && i < st->fec_rec_i; i++)
         if (st->fec_rec_ts[i] != 0 && tdiff(w->current, st->fec_rec_ts[i]) < FEC_REC_GRACE_MS) young++;
@@ -1457,7 +1456,7 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
            retransmission (at least a round trip) completed it - late where
            one cannot make the deadline. Its loss is counted already. A
            rebuild waits for its block's parity, up to fec_blk_ms after the
-           frame: beyond that as well (TUNING.md 5) */
+           frame: beyond that as well */
         if (r->frames > 0 && w->rx_srtt > 0 &&
             r->frame_delay_max_ms > r->qdelay_max_ms + (uint32_t)w->rx_srtt * 3 / 4 +
                                     (fec_active(st) ? umax32(st->fec_blk_ms, FEC_BLOCK_MS) : 0) &&
@@ -1616,7 +1615,7 @@ static uint32_t compute_pace_rate(const anl_t *w)
     if (w->btl_bw != 0) rate = (uint64_t)bbr_bw(w) * gain / BBR_UNIT;
     else rate = (uint64_t)w->init_cwnd * w->mss * 1000u / srtt * BBR_STARTUP_GAIN / BBR_UNIT;
     /* A lower-rate trial must be executable: the floor stays outside policer
-       control, explicit up-probes are allowed (TUNING.md 6) */
+       control, explicit up-probes are allowed */
     if (w->lt.state != 0 && w->lt.rate != 0) {
         uint32_t target = w->lt.state == 3 ? bbr_lt_probe_rate(w) : w->lt.rate;
         if (floor > target) floor = target;
@@ -2479,7 +2478,7 @@ static int rack_candidate(const anl_t *w, const anl_stream *st, const anl_seg *s
        empty part of a policer's token cycle: repeated fast retries are spaced
        by 4, 8, 16 ... ms, capped by the segment's RTO - which a lost
        retransmission backs off (flush, as for a timeout). The first fast
-       retry and semi deadlines keep their original timing (TUNING.md 7) */
+       retry and semi deadlines keep their original timing */
     if (st->mode == ANL_RELIABLE && seg->xmit > 1) {
         uint32_t shift = seg->xmit > 16 ? 16 : seg->xmit;
         uint32_t pause = umin32(seg->rto, 1u << shift);
@@ -2517,7 +2516,7 @@ static int rack_detect(anl_t *w, anl_stream *st)
                for a segment the RTO already retransmitted: after an outage
                the first ACK marks everything sent during it at once; those
                count when their recovery is acknowledged (handle_ack), spread
-               over the rounds it takes (TUNING.md 8) */
+               over the rounds it takes */
             if (!s->lost_cnt && s->rack_rtx != 2) {
                 s->lost_cnt = 1;
                 w->lost_bytes += seg_wire(s);
@@ -2567,7 +2566,7 @@ static uint32_t bbr_bw(const anl_t *w)
     uint32_t bw = w->bw_lo != 0 && w->bw_lo < w->btl_bw ? w->bw_lo : w->btl_bw;
     /* policed: the policer's rate itself - without probing
        (compute_pace_rate) the filter only saw its own pace minus the loss and
-       ratcheted down; testing: at most that rate (TUNING.md 9) */
+       ratcheted down; testing: at most that rate */
     if (w->lt.state == 2) return w->lt.rate;
     /* probing above it: one step of a quarter per interval (bbr_policer) */
     if (w->lt.state == 3) return bbr_lt_probe_rate(w);
@@ -2599,8 +2598,7 @@ static uint32_t bbr_bw(const anl_t *w)
  * resumes for twice as many intervals (up to BBR_LT_SPAN_MAX); after
  * BBR_LT_PROBE_MAX steps without a ceiling the policer is gone, and the
  * bandwidth filter restarts from what the last step delivered. A
- * persistent queue during a probe yields to ordinary congestion control.
- * The paths that shaped each rule: TUNING.md 10. */
+ * persistent queue during a probe yields to ordinary congestion control. */
 static uint32_t bbr_lt_probe_rate(const anl_t *w)
 {
     return sat32((uint64_t)w->lt.rate * (4u + w->lt.k) / 4u);
@@ -2665,13 +2663,13 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
        large bucket lets STARTUP measure a multiple of its rate). The round's
        delivery rate is where the model restarts; probing finds any more. Not
        the policer test itself: it passes whenever the rate is below the
-       capacity (TUNING.md 11) */
+       capacity */
     if (w->lt.post_startup > 0) {
         w->lt.post_startup--;
         /* a round of at least half the window: losses are counted when RACK
            marks them (rack_detect), and a short round of a random-loss path
            (a few segments delivered between two marks) reads far above the
-           loss (TUNING.md 12) */
+           loss */
         if (!app_limited && rd > 0 && lost * 4 > rd + lost && rd + lost >= (uint64_t)w->cwnd * w->avg_seg / 2) {     /* over 25%: a burst or jitter makes 10% */
             uint32_t dur0 = (uint32_t)tdiff(w->current, w->round_ts);
             uint32_t r = dur0 > 0 ? (uint32_t)umin32((uint32_t)(rd * 1000 / dur0), 0xffffffffu) : 0;
@@ -2686,7 +2684,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     }
     /* the first round at a new pace is the transition: what was in flight at
        the old pace is still being dropped and would be the new interval's
-       loss; it is left out (TUNING.md 13) */
+       loss; it is left out */
     if (w->lt.skip) {
         w->lt.skip = 0;
         bbr_lt_begin(w, 0);
@@ -2701,7 +2699,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     if (w->lt.rounds < BBR_LT_ROUNDS || dur < BBR_LT_MS) return;
     /* Intervals ending within LT_GAP_MS of a resumed input gap are dropped:
        the outage's losses, abandoned frames and backlog retransmissions read
-       as a policer. A real policer is found that much later (TUNING.md 14) */
+       as a policer. A real policer is found that much later */
     if (w->lt.gap_ts != 0 && tdiff(w->current, w->lt.gap_ts) < LT_GAP_MS) {
         w->lt.prev_rate = 0;
         bbr_lt_begin(w, 1);
@@ -2716,7 +2714,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
        frame expired, drop_until_key took the rest of its GOP in flight) -
        a media stream behind a policer read 22% below what the path carried
        and the test locked at two thirds of the policer's rate. ACK-based
-       without sufficient report coverage (TUNING.md 56, 57) */
+       without sufficient report coverage */
     {
         uint64_t ms = w->prx_ms - w->lt.prx_ms0;
         int fresh = w->lt.prx_valid && ms * 2 >= dur && ms <= dur + bbr_report_age(w) && bbr_report_fresh(w);
@@ -2728,14 +2726,14 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
     }
     /* Two bases: the rate may be the reports' (what arrived), counted and
        loss below are ACK-based (what was acknowledged and marked lost), and
-       the test's supply is what was sent here - TUNING.md 56, 57 */
+       the test's supply is what was sent here */
     counted = w->lt.rd + w->lt.lost > 0 ? (uint32_t)(w->lt.lost * 1000 / (w->lt.rd + w->lt.lost)) : 0;
     /* The interval's loss from what it sent and what was delivered - what is
        still in flight at its end was sent but could not be delivered yet,
        what was in flight at its start is delivered in it but was sent before:
        both are taken out, or a 4-round interval is a quarter off. The losses
        counted (RACK) are mostly of what was sent before, found a round or
-       more later (TUNING.md 15) */
+       more later */
     {
         uint64_t sent = (uint64_t)(w->sent_wire - w->lt.sent0) + w->lt.infl0;
         uint64_t infl = bbr_inflight_bytes(w);
@@ -2783,7 +2781,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            a media stream whose encoder follows the estimate (down to the
            test rate): it counts when at least half the test rate was sent -
            random loss does not halve at any rate, and the probe that
-           follows measures the ceiling (TUNING.md 55) */
+           follows measures the ceiling */
         uint64_t sent = w->sent_wire - w->lt.sent0;
         /* supplied: enough was sent to judge the test - half its rate for
            the initial one (an app-limited encoder), 7/8 and no queue for a
@@ -2797,7 +2795,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
                that much more, or random loss on top would pace below the
                rate. The smaller of the two measures: what was sent includes
                the retransmissions of the intervals before, what was counted
-               includes their tail (RACK, a round late) (TUNING.md 16) */
+               includes their tail (RACK, a round late) */
             w->lt.res = umin32(umin32(loss, counted), 500);
             w->lt.res_checked = 0;
             w->lt.rate = sat32((uint64_t)w->lt.rate * 1000 / (1000 - w->lt.res));
@@ -2827,7 +2825,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
                1 MB bucket full: 2.0 MB/s tested on a 1.5 MB/s policer, and
                the 48-interval hold put confirmation off by 27 s). Once more
                at what this interval delivered; random loss over an eighth
-               fails again (TUNING.md 56) */
+               fails again */
             w->lt.retest = 1;
             w->lt.rate = rate;
             w->lt.skip = 1;
@@ -2860,7 +2858,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            above the rate. A ceiling drops it: the loss rises by that much
            over the residual (lt.res). Random loss does not depend on the pace
            - it is the rise that tells. Half the share: a jittery ceiling
-           drops less (TUNING.md 17) */
+           drops less */
         uint32_t excess = 1000u * w->lt.k / (4u + w->lt.k);
         uint32_t sent_rate = sat32((uint64_t)(w->sent_wire - w->lt.sent0) * 1000 / dur);
         /* A window stall can leave a tail below the offered probe rate with
@@ -2885,7 +2883,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            load: on a 10 Mbit policer at 20 ms such stalls came every few
            seconds until the policer was confirmed, and one in the first
            probe step held the detector off for 48 intervals - confirmation
-           at 32..49 s instead of 7..23 (real network, TUNING.md 58) */
+           at 32..49 s instead of 7..23 (real network) */
         int stalled = (w->lt.bad & 2) && (uint64_t)rate * 4 < w->lt.rate;
         if ((w->lt.bad & 2) && !stalled) {
             /* A single queued round can taint a whole short-RTT interval.
@@ -2905,7 +2903,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
                next probe - the first confirmation too: giving it up left a
                media stream (its encoder cut back after the step's loss, so
                the tail was underfed) at 3-10x a 10 Mbit policer for minutes
-               with most of what it sent lost (TUNING.md 55) */
+               with most of what it sent lost */
             w->lt.state = 2; w->lt.left = w->lt.span;
             w->lt.tail = 0;
         } else if (w->lt.tail) {
@@ -2914,7 +2912,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
                policed state had refilled on top of the rate). Its delivery,
                plus the residual, is the policer's rate; not below 7/8 of the
                estimate - one tail can be unlucky, the next probe measures
-               again (TUNING.md 18) */
+               again */
             uint32_t r = sat32((uint64_t)rate * 1000 / (1000 - w->lt.res));
             w->lt.rate = umax32(umin32(r, bbr_lt_probe_rate(w)), w->lt.rate / 8 * 7);
             w->lt.state = 2;
@@ -3002,17 +3000,16 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
         /* During capacity_short, expiring frames and the source cutting
            back contaminate the loss-halving test. A short FIFO can pass it
            at a tiny rate, then the shortage prevents feeding any recovery
-           probe. Wait until media supply has recovered (TUNING.md 57). */
+           probe. Wait until media supply has recovered. */
         /* over 10% lost, rates within 1/4: a test costs one interval at the
            delivery rate, and the test itself tells a policer from random
-           loss; stricter thresholds missed a jittery uplink (TUNING.md 19).
+           loss; stricter thresholds missed a jittery uplink.
            App-limited intervals count at over a quarter lost: what was
            delivered is then what the path took, whatever the sender had
            left over (a media stream is app-limited in nearly every interval
            while 3-10x a policer's rate is paced for its bursts), and no
            random loss does that - a small flow's 5% reads over 10% in an
-           interval now and then, and the test's loss regresses to the mean
-           (TUNING.md 55) */
+           interval now and then, and the test's loss regresses to the mean */
         /* The test starts after STARTUP: a STARTUP interval is evidence, the
            second of the pair and the test are not. In STARTUP the encoder
            is still ramping (tens of kB/s) and the losses are STARTUP's own
@@ -3022,7 +3019,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
            video at 0.3 Mbit for the whole round. A policer's pair spans
            STARTUP's exit (a 1 MB bucket at 100 ms: 16.1 s in STARTUP, 16.5
            s after it, simulation) or follows it (19 of 19 real ones were
-           tested after it) (TUNING.md 59) */
+           tested after it) */
         if (w->bbr_state != ANL_BBR_STARTUP && w->lt.prev_rate != 0 &&
             rate + w->lt.prev_rate / 4 >= w->lt.prev_rate && rate <= w->lt.prev_rate + w->lt.prev_rate / 4) {
             w->lt.state = 1;
@@ -3048,7 +3045,7 @@ static void bbr_policer(anl_t *w, uint64_t rd, uint64_t lost, int app_limited)
  * RTT samples are taken against the time of the last anl_update, up to an
  * interval old when a datagram arrives in between: on a path of a few ms a
  * too small sample collapsed cwnd (2 x bw x min_rtt) and the delivery rate
- * with it (TUNING.md 20). The model also allows for the periodic flush interval. */
+ * with it. The model also allows for the periodic flush interval. */
 static uint32_t bbr_rtt(const anl_t *w)
 {
     return umax32(w->min_rtt, (uint32_t)w->interval);
@@ -3148,7 +3145,7 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
            min_rtt to the drained round's RTT, a few ms above the path when
            the pipe does not fully drain, and the 10 s expiry takes any
            sample; the path's own RTT then read as new every few seconds and
-           re-armed the probe against the same standing queue (TUNING.md 21) */
+           re-armed the probe against the same standing queue */
         if (w->min_rtt == 0 || ((uint32_t)rtt < w->min_rtt && (w->path.probed_rtt == 0 || (uint32_t)rtt < w->path.probed_rtt))) w->path.min_rtt_probed = 0;   /* a new value: no PROBE_RTT has seen it yet */
         w->min_rtt = umax32((uint32_t)rtt, 1);
         w->min_rtt_ts = w->current;
@@ -3176,7 +3173,7 @@ static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
        still holds the rate). The rounds counted must also agree on the RTT
        (within a quarter): a longer path's RTT stays put while we cut, a
        queue's moves with the cuts. And each counted round must deliver less
-       than the last one counted (TUNING.md 22) */
+       than the last one counted */
 static void bbr_path_rtt(anl_t *w, uint64_t rd, uint64_t lost, uint32_t rate, int app_limited)
 {
     int cong = rd + lost > 0 && lost * 100 > BBR_LOSS_THRESH * (rd + lost) && bbr_queue_signal(w);
@@ -3211,7 +3208,7 @@ static void bbr_path_rtt(anl_t *w, uint64_t rd, uint64_t lost, uint32_t rate, in
        the path does not. Once per min_rtt value (min_rtt_probed): a
        sender whose bursts keep a standing queue at the bottleneck would
        otherwise drain it every few seconds, each drain holding the
-       control stream behind the minimum cwnd (TUNING.md 23) */
+       control stream behind the minimum cwnd */
     if (!cong && bbr_queue_signal(w) && w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase <= BBR_CRUISE) {
         uint32_t r = w->prev_round_min_rtt;
         int flat = r + r / 16 >= w->path.qflat_rtt && w->path.qflat_rtt + w->path.qflat_rtt / 16 >= r;
@@ -3270,8 +3267,7 @@ static void bbr_round_end(anl_t *w, int app_limited)
            loss averages a few percent even though a single short round can
            show more. inflight_hi is not bounded by an app-limited round at
            all (BBRv2: an app-limited sample does not probe the volume the
-           path takes): the window is what keeps the sender app-limited
-           (TUNING.md 24) */
+           path takes): the window is what keeps the sender app-limited */
         if (app_limited && rdur > 0) {
             uint32_t frac = (uint32_t)(lost * 256 / (rd + lost));
             uint32_t smoothed = (uint32_t)((int32_t)w->loss_rate + ((int32_t)frac - (int32_t)w->loss_rate) / 4);
@@ -3299,7 +3295,7 @@ static void bbr_round_end(anl_t *w, int app_limited)
        doubling run far past its rate. Only once the model has grown to 4x the
        initial rate: a path that dropped everything in its first second
        otherwise left STARTUP at almost nothing. No inflight bound: the loss
-       may be random (TUNING.md 25) */
+       may be random */
     if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && w->min_rtt != 0 &&
         (uint64_t)w->btl_bw * w->min_rtt >= 4000ull * w->init_cwnd * w->mss &&
         lost > 8u * w->avg_seg && lost * 100 > 40 * (rd + lost)) {
@@ -3307,8 +3303,7 @@ static void bbr_round_end(anl_t *w, int app_limited)
         /* ... and the round's delivery rate, well below the estimate, is
            where the model restarts (as bbr_policer does after STARTUP):
            RACK's marks put the bucket's whole overshoot into this round, the
-           rounds after it saw little and kept the peak for a filter window
-           (TUNING.md 26) */
+           rounds after it saw little and kept the peak for a filter window */
         if (rrate != 0 && (uint64_t)rrate * 2 < w->btl_bw) {
             for (i = 0; i < BBR_BW_ROUNDS; i++) w->bw_round[i] = umin32(w->bw_round[i], rrate);
             w->btl_bw = rrate;
@@ -3334,7 +3329,7 @@ static void bbr_round_end(anl_t *w, int app_limited)
     if (w->bbr_state == ANL_BBR_PROBE_BW && w->probe_phase == BBR_UP) {
         /* growing by an eighth per round keeps the probe going: the pace is
            1.25x, so a quarter - the most a round can show - failed on any
-           noise and every probe ended after two rounds (TUNING.md 27) */
+           noise and every probe ended after two rounds */
         if (w->btl_bw >= w->up_bw + w->up_bw / 8) { w->up_bw = w->btl_bw; w->up_stall = 0; }
         else w->up_stall++;
     }
@@ -3452,8 +3447,7 @@ static void bbr_on_send(anl_t *w, anl_seg *seg)
    sent: other traffic in flight (audio) does not matter. Not for the model -
    an estimate that full at once filled bottleneck queues - but burst_bw, the
    rate an app-limited sender paces at (compute_pace_rate): 1.25x of it, so
-   that the next burst can find more; less by a fifth when the burst queued
-   (TUNING.md 28). */
+   that the next burst can find more; less by a fifth when the burst queued. */
 static void burst_on_acked(anl_t *w, const anl_seg *s)
 {
     uint32_t el;
@@ -3528,7 +3522,7 @@ static uint32_t bbr_window_ms(const anl_t *w)
  * for the delivery rate over a window of at least span ms: bbr_window_bw. A
  * rate sample spans about one RTT; when that is below the clock's resolution
  * the sample's interval is truncated - up to twice the rate, and the pace set
- * from it doubled the next sample too (TUNING.md 29). Over 10 ms the
+ * from it doubled the next sample too. Over 10 ms the
  * truncation is 10% at most. Returns 0 without enough history. */
 static void bbr_dw_checkpoint(anl_t *w)
 {
@@ -3601,7 +3595,7 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
                first ACKs came back before the queue it built, and the credit
                put the estimate at 1.1..1.4x the link at 200..300 ms
                (closed-loop encoder, no random loss), which the STARTUP gain
-               then tripled (TUNING.md 54).
+               then tripled.
                data against data: the parities are in the send rate in full
                but in the delivery rate only as their fec_share credit - at a
                high ratio the difference alone passed for loss, and on a
@@ -3630,7 +3624,7 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
         /* An app-limited burst that came back queued (RTT as
            bbr_queue_signal) filled the path: the estimate is the path, as
            after a network-limited sample - no STARTUP-gain headroom for
-           BBR_BW_ROUNDS (bbr_headroom) (TUNING.md 30) */
+           BBR_BW_ROUNDS (bbr_headroom) */
         if (rs->app_limited && w->min_rtt > 0 && w->last_rtt > 0 &&
             (uint32_t)w->last_rtt > bbr_rtt(w) + umax32(bbr_rtt(w) / 4, 5)) {
             w->net_round = w->round_count | 1;
@@ -3640,7 +3634,7 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
                went out at 2.9x the path into its queue (closed loop 2 Mbit
                200 ms: video on time 70%, key frames 24%). Once a
                network-limited sample has been seen (test_pacing: not on the
-               initial window's own queue) (TUNING.md 53) */
+               initial window's own queue) */
             if (w->bbr_state == ANL_BBR_STARTUP && !w->full_bw_reached && w->net_sample_ts != 0)
                 w->full_bw_reached = 1;
         }
@@ -3674,8 +3668,7 @@ static void update_ack(anl_t *w, int32_t rtt)
        to a quarter of the RTT at once, faster than rttval follows; losses are
        RACK's job, the RTO is the fallback for tails. Two update intervals at
        least: the peer's ACK waits up to one for its flush, and a lost ACK's
-       repeat comes one later (write_ack_segs) - with one, the RTO raced both
-       (TUNING.md 31) */
+       repeat comes one later (write_ack_segs) - with one, the RTO raced both */
     rto = w->rx_srtt + (int32_t)umax32(umax32(2u * (uint32_t)w->interval, 4u * (uint32_t)w->rx_rttval), (uint32_t)w->rx_srtt / 4);
     w->rx_rto = (int32_t)ubound32(RTO_MIN, (uint32_t)rto, RTO_MAX);
 }
@@ -3766,7 +3759,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                            a segment its block covered while the peer reports:
                            its rebuild is in that report, and the RTO usually
                            fires before the rebuild's ACK (counted twice);
-                           still the gate's hard evidence (TUNING.md 32) */
+                           still the gate's hard evidence */
                         if (st->fec && !(st->peer_rp.valid && s->fec_ts)) fec_loss_add(w, 0, 1, 1);
                         else if (st->fec) w->fec_loss_ts = w->current | 1;
                     }
@@ -4283,7 +4276,7 @@ static void fec_send_parity(anl_t *w, anl_stream *st) { fec_write_parity(w, st, 
  * header and tag (about 65 bytes with IP/UDP) on a 176-byte audio parity.
  * Judged by the block's size alone - audio, or video at a low rate. Not
  * while a queue shows: the wait adds to the queue's. Not from FEC_RIDE_LOSS
- * on either: a block that needs several parities waits for each (TUNING.md 33). */
+ * on either: a block that needs several parities waits for each. */
 static int fec_ride(const anl_t *w, const anl_stream *st)
 {
     if (!st->fec_out_small || st->fec_out_m == 0 || st->fec_out[0].len > FEC_RIDE_MAX) return 0;
@@ -4344,7 +4337,7 @@ static uint32_t fec_repair_ms(const anl_t *w, const anl_stream *st, uint32_t byt
      * policy; explicit FEC modes keep their existing estimate. The stricter
      * target of a drop_until_key stream is for its key frames: a non-key
      * frame whose second retry still beats max_age comes late, not lost -
-     * its GOP survives - and takes the looser one (TUNING.md 34). */
+     * its GOP survives - and takes the looser one. */
     if (!single && st->fec_rtt_auto && bytes > FEC_SMALL_BLOCK / 8 &&
         w->fec_loss_valid && w->fec_loss) {
         uint32_t n = bytes / st->mss + (bytes % st->mss != 0);
@@ -4395,8 +4388,7 @@ static void fec_gate_update(anl_t *w, anl_stream *st)
            packet, with hard evidence, in the last FEC_LOSS_RECENT_MS:
            otherwise parity ran at a good share of the media on lossless
            paths. Small frames (audio) then on the repair time alone (the
-           estimate dips between windows); large frames need 1% as well
-           (TUNING.md 35) */
+           estimate dips between windows); large frames need 1% as well */
         if (st->fec_gate)
             on = (recent || startup) && !(need * 4 < d * 3 ||
                              (!small && w->fec_loss_valid >= 2 && w->fec_loss < FEC_GATE_LOSS_OFF));
@@ -4501,8 +4493,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
                                           (!st->drop_until_key || fec_one_retry(w, st)) ? FEC_BLOCK_FAIL : FEC_SMALL_FAIL));
             /* a small block (audio) as many parities as packets while the
                loss estimate settles: its bytes are few, and nothing else kept
-               long-RTT audio on time. Once it has, the binomial floor above
-               (TUNING.md 36) */
+               long-RTT audio on time. Once it has, the binomial floor above */
             if (k * lmax <= FEC_SMALL_BLOCK && (w->fec_loss >= FEC_GATE_LOSS_ON ||
                 st->fec_rtt_auto) && w->fec_loss_valid < FEC_LOSS_WARM) m = umax32(m, k * FEC_SMALL_RATIO / 100);
         }
@@ -4593,7 +4584,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
            Not beyond: where FEC fails, that early retransmission is what
            keeps the frame on time, and one that only just arrives counts as
            late - the ratio ran to its ceiling where retransmissions are in
-           time (TUNING.md 37) */
+           time */
         if (st->fec_deadline > reach) {
             uint32_t defer = last + s->rto, latest = s->ts_enq + st->fec_deadline - reach;
             if (tdiff(defer, latest) > 0) defer = latest;
@@ -4684,7 +4675,7 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
            half): those losses are likely our own congestion, more parity
            would add to it. Only while network-limited or queueing: app-
            limited, the budget follows an estimate that shows only what was
-           sent, and the losses are not ours (TUNING.md 38) */
+           sent, and the losses are not ours */
         if (w->rate.capacity_short || (st->fec_frame_avg * 8 > FEC_SMALL_BLOCK && w->par_rate != 0xffffffffu &&
                                   w->par_tokens * 2 < (int64_t)par_bucket(w) &&
                                   (w->app_limited == 0 || bbr_queue_signal(w)))) {
@@ -4707,7 +4698,7 @@ static void fec_auto_count(anl_t *w, anl_stream *st, int lost)
  * of a drop_until_key stream, or a typical frame whose repair is past half
  * of fec_deadline. The gate is judged when the block closes, with the RTT
  * of then: a key frame's own queue raises it within the frame - hence the
- * margin, and key frames whatever their repair (TUNING.md 39). Otherwise the
+ * margin, and key frames whatever their repair. Otherwise the
  * block's copies are not made and the buffers go; the first block collected
  * again is the one that can open the gate */
 static int fec_collect(anl_t *w, anl_stream *st, const anl_seg *seg)
@@ -4723,8 +4714,8 @@ static int fec_collect(anl_t *w, anl_stream *st, const anl_seg *seg)
 /* How long the block opening now collects (DESIGN 8.2). Adaptive parity: as
  * long as fec_deadline leaves after the trip (srtt / 2), the last block's
  * parities FEC_GAP apart and the jitter (two update intervals, 4 rttvar) -
- * a longer block needs fewer parities for the same failure target
- * (TUNING.md 40). At least FEC_BLOCK_MS: below that the parities would cost
+ * a longer block needs fewer parities for the same failure target.
+ *At least FEC_BLOCK_MS: below that the parities would cost
  * more than a late frame; a fixed ratio keeps it. */
 static uint32_t fec_block_ms(const anl_t *w, const anl_stream *st)
 {
@@ -4922,7 +4913,7 @@ static void semi_drop_check(anl_t *w, anl_stream *st)
  * ACK has shown the hole to the sender, about a round trip after the data was
  * sent, and half a round trip on its way - would arrive when the data is
  * older than its lifetime (max_age here). Waiting for it then only holds back
- * the frames behind it (head of line, TUNING.md 41). From the path's RTT
+ * the frames behind it (head of line). From the path's RTT
  * (min_rtt, or what CTRL_ECHO gives a receive-only peer; not srtt: a noisy
  * one would skip holes a retransmission still fills). Not while parities
  * arrive: FEC may rebuild it sooner. rcv_deadline still bounds the wait as
@@ -5134,8 +5125,7 @@ static void vq_add(anl_t *w, uint32_t wire)
  * last segments and the frames after it, and their RTOs retransmitted what
  * the peer already had. Drained at the faster of the estimate and the rate
  * bursts went through, at most one srtt, and not while capacity is short: an
- * app-limited or collapsed estimate read a backlog the link did not have
- * (TUNING.md 42). */
+ * app-limited or collapsed estimate read a backlog the link did not have. */
 static uint32_t vq_ms(const anl_t *w)
 {
     uint32_t rate = umax32(bbr_bw(w), w->burst_bw);
@@ -5236,7 +5226,7 @@ static void rate_update(anl_t *w)
            few steps (dlv_avg) - a key frame's burst into a slow shaper queues
            for a step, and its few acknowledgements in that step read as a
            tiny rate. A bottleneck that got slower loses what is sent and gets
-           this step's rate (TUNING.md 43) */
+           this step's rate */
         uint64_t floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000 / (uint32_t)w->rx_srtt * w->rate.share / 256;
         uint64_t now_pay = dd * 1000 / (uint32_t)dt * w->rate.share / 256, cut;
         if (!w->rate.cs_loss && now_pay < w->rate.dlv_avg) now_pay = w->rate.dlv_avg;
@@ -5279,8 +5269,7 @@ static void rate_update(anl_t *w)
        capacity (8.6): not above what the path delivers, less the margin;
        parities are not payload, so they are out already. The delivered
        payload is compared with what was sent a step earlier: a key frame's
-       step sends 2x the average and its delivery shows a step later
-       (TUNING.md 44) */
+       step sends 2x the average and its delivery shows a step later */
     /* During the existing 1.5 s capacity test, allow the ordinary bounded
        upward ramp to produce the load whose delivery the test measures.
        Capping it at old delivery otherwise defeats the requested probe. */
@@ -5320,7 +5309,7 @@ static void rate_update(anl_t *w)
        the estimate cannot tell, a token bucket's burst or a key frame
        measured it. Nor is the sender app-limited then (anl_flush_internal):
        its queue is empty because it discarded the application's data, not
-       because the application had nothing to send (TUNING.md 45). */
+       because the application had nothing to send. */
     {
         uint64_t dlv_pay = (w->rate.delivered_pay - w->rate.dpay0) * 1000 / (uint32_t)dt;
         uint64_t dun = w->rate.tx_unsent - w->rate.unsent0, un_rate = dun * 1000 / (uint32_t)dt, off_rate = pay_rate + un_rate;
@@ -5400,7 +5389,7 @@ static void rate_update(anl_t *w)
            network-limited the model could only grow by PROBE_BW's quarter per
            2..3 s cycle. Not a state entered on loss (an outage, a policer):
            ending that one on calm alone let the RTT jump after an outage
-           collapse the model (TUNING.md 46) */
+           collapse the model */
         w->rate.cs_loss = (uint64_t)w->rate.dlv_avg * 16 < (uint64_t)w->rate.pay_avg * 15;
         w->rate.cs_net = w->rate.cs_loss || queue > umax32(rmin / 4, 25);
         w->rate.cs_calm = w->rate.cs_net ? 0 : w->rate.cs_calm + 1;
@@ -5441,7 +5430,7 @@ static void rate_update(anl_t *w)
        itself, and a budget that read 0 for that step shrank the bucket and
        threw its tokens away. Nothing while capacity is short: the estimate
        itself is what a token bucket's burst or a key frame measured, not what
-       the path sustains (TUNING.md 47) */
+       the path sustains */
     if (w->rate.capacity_short) {
         w->par_rate = 0;
         if (w->par_tokens > 0) w->par_tokens = 0;
@@ -5468,7 +5457,7 @@ static void rate_update(anl_t *w)
  * due, once, while the block then fails at most FEC_HOLD_FAIL in 10000 (twice
  * the measured loss), and only while a retransmission after that still makes
  * max_age. The queue a key frame builds is no reason against it (it is there
- * all the time at a low rate); the losses already seen are (TUNING.md 48).
+ * all the time at a low rate); the losses already seen are.
  * Returns when to retransmit, 0: now. */
 static uint32_t fec_rto_hold(const anl_t *w, const anl_stream *st, const anl_seg *seg)
 {
@@ -5570,7 +5559,7 @@ static void anl_flush_internal(anl_t *w)
        then what is in flight - sent and not acknowledged, minus what RACK
        declared lost and is not resent yet (BBR's pipe): with the lost
        segments counted, a policer that dropped half of a STARTUP overshoot
-       kept DRAIN from ever ending (TUNING.md 49, DESIGN 6.8). Each stream's
+       kept DRAIN from ever ending (DESIGN 6.8). Each stream's
        drop check and count concern that stream only. */
     FOR_EACH_STREAM(w, st, n, nx) {
         if (st->latency_rtt) fec_deadline_follow(w, st);
@@ -5625,8 +5614,7 @@ static void anl_flush_internal(anl_t *w)
                        (repaired, its ACK still on the way) - only the peer's
                        skips tell (handle_report, DESIGN 8.5). But a loss with
                        hard evidence for the gate: unacknowledged for max_age
-                       while higher sn were - no reordering lasts that long
-                       (TUNING.md 50) */
+                       while higher sn were - no reordering lasts that long */
                     if (st->fec && st->rack_valid && tdiff(seg->sn, st->rack_hi) < 0) w->fec_loss_ts = w->current | 1;
                     abandon_through(w, st, seg->frame_no);
                     pos = &st->snd_buf;         /* a prefix was removed: restart at the new head */
@@ -5742,7 +5730,7 @@ static void anl_flush_internal(anl_t *w)
        age, not because the application had nothing to send - the network is
        the limit. With the path delivering everything the app-limited samples
        are what lets the model climb back; held network-limited it fell
-       further (TUNING.md 51) */
+       further */
     queued = 0;
     FOR_EACH_STREAM(w, st, n, nx) {
         if (stream_sendable(st) && st->nsnd_que > 0) { queued = 1; break; }

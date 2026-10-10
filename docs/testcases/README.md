@@ -11,9 +11,9 @@
 
 相关文档：
 
-- 测试结果的历史：[progress.md](../../progress.md)；
-- 性能数据：[performance.md](../../performance.md)；
-- 对比数据：[COMPARISON.md](../../COMPARISON.md)；
+- 测试结果的历史：[PROGRESS.md](../PROGRESS.md)；
+- 性能数据：[PERFORMANCE.md](../PERFORMANCE.md)；
+- 对比数据：[COMPARISON.md](../COMPARISON.md)；
 - 实网工具：[tools/realnet/README.md](../../tools/realnet/README.md)。
 
 ## 目录

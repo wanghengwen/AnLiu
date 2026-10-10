@@ -1,6 +1,6 @@
 # 模糊测试：持有 PSK 的对端
 
-`fuzz_peer.c` 是 libFuzzer 目标，针对"对端持有 PSK"的威胁模型（[SECURITY_AUDIT.md](../../SECURITY_AUDIT.md) 第 4 节）。持有 PSK 的一方能让任意明文通过认证，它能触达的就是解析器 `anl_input_plain`：数据报头和全部段类型。目标把输入直接交给它，等同于认证通过之后 `siv_open` 交给解析器的内容。
+`fuzz_peer.c` 是 libFuzzer 目标，针对"对端持有 PSK"的威胁模型（[SECURITY_AUDIT.md](../../docs/SECURITY_AUDIT.md) 第 4 节）。持有 PSK 的一方能让任意明文通过认证，它能触达的就是解析器 `anl_input_plain`：数据报头和全部段类型。目标把输入直接交给它，等同于认证通过之后 `siv_open` 交给解析器的内容。
 
 - 每个输入在一个新连接上运行（服务端，自己开了一个可靠流和一个带 FEC 的半可靠流，对端还可以再开），发现的问题只凭输入本身即可复现；
 - 输入是一串数据报，每个是 2 字节小端长度加相应字节。conv 和版本位被改成正确值，使段被解析；ts、pn 保持模糊值；

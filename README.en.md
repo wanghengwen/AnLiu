@@ -17,7 +17,7 @@ AnLiu is a UDP-based transport protocol whose implementation style follows [ikcp
 | Modern loss recovery | Selective acknowledgment (SACK) + time-based loss detection (RACK) + reordering adaptation |
 | Compact headers | 23-byte datagram header (including a 12-byte authentication tag and a 4-byte packet number), 6~7-byte base DATA segment header at the default MTU; fragmentation extension, frame number, stream-ID extension and OPEN parameters are extra. ikcp uses 24 bytes per segment, unencrypted |
 
-See [DESIGN.md](DESIGN.md) for the detailed design, [performance.md](performance.md) for performance data and [TUNING.md](TUNING.md) for the measurements behind the rules in the code; comparison tools are in `bench/`. (The first two are currently in Chinese.)
+See [DESIGN.md](docs/DESIGN.md) for the detailed design and [PERFORMANCE.md](docs/PERFORMANCE.md) for performance data; comparison tools are in `bench/`. (The first two are currently in Chinese.)
 
 ## Build and install
 
@@ -94,7 +94,7 @@ static void on_rate(anl_t *w, uint32_t target_rate, void *user)
 anl_set_rate_callback(w, on_rate);
 ```
 
-Compared with using `bw_estimate` directly, it does three more things: when application-limited (the encoder sends less than the estimate) with no queuing, the target rises by at most 25% per second so the encoder probes gradually; normal increases are capped at 25% per second, and sustained delivery-limited periods may recover within the measured delivery bound; when RTT shows the bottleneck is queuing, it drops immediately to the actual delivery rate — after a sudden bandwidth drop, before the encoder has caught up, semi-reliable data can expire before being acknowledged and BBR gets no samples for seconds, but RTT still reveals the queue. Comparison results are in [performance.md](performance.md).
+Compared with using `bw_estimate` directly, it does three more things: when application-limited (the encoder sends less than the estimate) with no queuing, the target rises by at most 25% per second so the encoder probes gradually; normal increases are capped at 25% per second, and sustained delivery-limited periods may recover within the measured delivery bound; when RTT shows the bottleneck is queuing, it drops immediately to the actual delivery rate — after a sudden bandwidth drop, before the encoder has caught up, semi-reliable data can expire before being acknowledged and BBR gets no samples for seconds, but RTT still reveals the queue. Comparison results are in [PERFORMANCE.md](docs/PERFORMANCE.md).
 
 **Receiver delay feedback** (DESIGN 6.9): every `max(srtt, 100 ms)` the receiver of a stream (both modes, on by default) reports the measured jitter, queuing delay, frame delay (from the first fragment sent to the whole frame received, minus propagation delay), completed frames and skipped frames back to the sender:
 
@@ -127,7 +127,7 @@ AnLiu's approach:
 - Loss detection (RACK) uses delivery evidence from the whole connection: a low-rate control stream with no later fragments of its own can still detect loss promptly from video deliveries;
 - Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing any stream immediately frees local queued, unacknowledged and unread data and tells the peer, whose end is then over: data that had arrived in order can still be read, then calls return `ANL_ECLOSED`, and the peer application closes its own handle. To ensure reliable delivery, the application must wait for `anl_stream_waitsnd` to reach zero before closing.
 
-If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate. Priority and mixed-stream test results are in [performance.md](performance.md).
+If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate. Priority and mixed-stream test results are in [PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ---
 
@@ -143,7 +143,7 @@ In real-time scenarios, retransmission is usually too late: a loss costs "loss d
 - Subsequent parity packets are spaced at least 5 ms apart; actual timing depends on flushes, pacing and scheduling. Small-block parity can ride with data from the same stream’s next block; other parity is sent separately (possibly with ECHO);
 - For packets covered by parity, the sender's RACK wait starts from the send time of the block's last parity packet, RTO can also be delayed, subject to frame deadlines and whether a retry can still arrive in time (DESIGN 8.2).
 
-**Adaptive redundancy** (`opt.fec_ratio = 0`, DESIGN 8.5): the nominal ratio is adjusted according to losses that were not recovered in time, and the actual parity count is decided together with the connection loss estimate, block size and redundancy budget. In adaptive mode the nominal ratio varies between 10% and 100%; the parity count is further limited by the per-block cap, the retransmission capability at low latency, and the capacity-shortage state. Ratio and latency comparisons are in [performance.md](performance.md).
+**Adaptive redundancy** (`opt.fec_ratio = 0`, DESIGN 8.5): the nominal ratio is adjusted according to losses that were not recovered in time, and the actual parity count is decided together with the connection loss estimate, block size and redundancy budget. In adaptive mode the nominal ratio varies between 10% and 100%; the parity count is further limited by the per-block cap, the retransmission capability at low latency, and the capacity-shortage state. Ratio and latency comparisons are in [PERFORMANCE.md](docs/PERFORMANCE.md).
 
 **Defaults**: reliable streams have FEC off by default; semi-reliable streams default to `fec = ANL_FEC_RTT_AUTO`, which decides whether to enable FEC from the expected repair time, `fec_deadline_ms` and recent hard-loss evidence, and provides one bounded audio start-up protection plus key-frame protection. Adaptive redundancy is paused when capacity is insufficient. To keep FEC always on, set `fec = 1` explicitly: `fec_ratio = 25` for a fixed ratio, `0` for adaptive. Both ends must enable FEC; the receiver can set local options in the accept callback (see DESIGN 8.6).
 
@@ -151,7 +151,7 @@ In real-time scenarios, retransmission is usually too late: a loss costs "loss d
 
 ## 4. Performance tests
 
-Test conditions and historical data for simulated networks, real UDP paths, throughput, media latency, priority and FEC redundancy are collected in [performance.md](performance.md). Test tools and how to run them are described in section 6.
+Test conditions and historical data for simulated networks, real UDP paths, throughput, media latency, priority and FEC redundancy are collected in [PERFORMANCE.md](docs/PERFORMANCE.md). Test tools and how to run them are described in section 6.
 
 ---
 
@@ -261,9 +261,9 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 - **Two protocols on one port**: each datagram carries one extra protocol-marker byte (tool layer); the client first sends 20 pings to measure path RTT.
 - **Simultaneous comparison**: in media tests AnLiu and ikcp each run a process at the same time (different ports), so they see the same network conditions; throughput tests run one after the other to avoid competing for bandwidth.
 - **About 12.5 minutes per round**: media uplink 150 s, media downlink 150 s (both protocols simultaneously), reliable stream uplink AnLiu / ikcp / TCP 75 s each, downlink 75 s each. Each combination runs 15 rounds spread across different times of day.
-- **TCP baseline**: record the actual congestion control algorithm and buffer configuration and use the same per-second throughput statistics; if TCP goes through a proxy while UDP is direct, mark the path difference separately. Historical test environments are in performance.md.
+- **TCP baseline**: record the actual congestion control algorithm and buffer configuration and use the same per-second throughput statistics; if TCP goes through a proxy while UDP is direct, mark the path difference separately. Historical test environments are in docs/PERFORMANCE.md.
 - **Parallelism**: several combinations can run at once, but one host never runs the same kind of test (media / stream) twice at the same time; each combination uses its own ports.
-- **Troubleshooting**: `REALNET_SECS=1` prints per-second throughput; after `make realnet_trace`, `REALNET_TRACE=1` prints congestion control internals every 100 ms (cwnd, bandwidth estimate, `bw_lo`, `inflight_hi`, PROBE_BW phase, loss rate, rate-limiter state). Clock and rate-limiter issues can be located from these; related historical measurements are in performance.md.
+- **Troubleshooting**: `REALNET_SECS=1` prints per-second throughput; after `make realnet_trace`, `REALNET_TRACE=1` prints congestion control internals every 100 ms (cwnd, bandwidth estimate, `bw_lo`, `inflight_hi`, PROBE_BW phase, loss rate, rate-limiter state). Clock and rate-limiter issues can be located from these; related historical measurements are in docs/PERFORMANCE.md.
 - **Integration tip**: `anl_input` computes RTT using the time of the most recent `anl_update`; calling `anl_update(now)` before receiving packets keeps RTT samples accurate (set `REALNET_CLOCK=1` when running `realnet`).
 
 ### 6.4 Process for each change
@@ -272,7 +272,7 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 2. Simulated comparison: same seed set before and after the change (6.2); any regression in any scenario must be explained before deciding to fix or revert;
 3. 1000-seed sweep;
 4. Changes to congestion control, FEC or scheduling also get a real-network comparison (6.3);
-5. Test data, code version and limitations go into performance.md; when implementation rules change, DESIGN.md is updated as well.
+5. Test data, code version and limitations go into docs/PERFORMANCE.md; when implementation rules change, docs/DESIGN.md is updated as well.
 
 ---
 
@@ -326,7 +326,7 @@ anl_stream_close(video);                      /* the handle is invalid after clo
 anl_release(w);
 ```
 
-See `anliu.h` for the full API and [DESIGN.md](DESIGN.md) for protocol details.
+See `anliu.h` for the full API and [DESIGN.md](docs/DESIGN.md) for protocol details.
 
 ## License
 
