@@ -76,6 +76,8 @@ for s in $(seq 1 24); do ANL_TEST_SEED=$s build/anl_test > /tmp/seed$s.log; grep
 - 自适应冗余不上调的检查（偶发）；
 - `test_fec_loss_onset` 的"parity within 1.5 s of the first loss"：偶尔为 1520 ms，同一随机数状态下基线相同（2026-10-08）。
 
+2026-10-10 后续核查（详见仓库根目录 `TESTREPORT-20261010.md`）：`test_fec_rtt_default` 的无报告音频保护检查（种子 17），以及 `test_close_confirm(10)` 的关闭确认时间检查（种子 18），在旧基线上同一随机状态也失败。关闭确认是连续四次 RST 丢失超过 20 s 测试预算，随后重试成功，未修改原有断言。容量退出窗口修复后，容量恢复种子 1..100 全部通过；整轮 1..24 剩余失败种子为 17、18、21，比直接基线 `f6c6250` 的 5 个少 2 个，也满足原基线 `57feafd` 的 2 个加 2 的数量门槛。
+
 出现其他检查失败时，先用 `ANL_TEST_TRACE=1` 找到失败前的随机数状态，再用 `ANL_TEST_RND=<状态> ANL_TEST_ONLY=<测试名>` 分别在基线和候选上回放：
 
 - 两者结果相同，就是原有的不稳定检查；

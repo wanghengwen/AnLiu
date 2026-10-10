@@ -874,7 +874,8 @@ struct anl_s {
         uint32_t cs_retry;                 /* steps without queueing before a recovery probe */
         uint32_t cs_recover;               /* successful probe: observation deadline (| 1), 0 otherwise */
         uint32_t cs_test_ts, cs_test_dlv;   /* bounded probe: start time and prior delivered payload rate */
-        uint32_t cs_cnt, cs_clear, cs_ts;   /* consecutive steps that read short / clear; last change or failed recovery probe (| 1) */
+        uint32_t cs_cnt, cs_clear, cs_ts;   /* consecutive short steps / clear-window ms; last change or failed recovery probe (| 1) */
+        uint64_t cs_sent, cs_delivered, cs_unsent; /* clear-window payload totals, scaled by 1000 */
         int cs_by_unsent;                   /* entered on expiring frames alone (the path delivered what was sent) */
         int cs_loss;                        /* the network shows the shortage by loss (a sixteenth of the payload):
                                                app-limited marking is suppressed only then */
@@ -5380,7 +5381,8 @@ static void move_and_send(anl_t *w, anl_stream *st)
    because the application had nothing to send. */
 static void rate_capacity_short(anl_t *w, int32_t dt, uint64_t pay_rate, uint32_t queue, uint32_t qthresh)
 {
-    uint64_t dlv_pay = (w->rate.delivered_pay - w->rate.dpay0) * 1000 / (uint32_t)dt;
+    uint64_t delivered = w->rate.delivered_pay - w->rate.dpay0;
+    uint64_t dlv_pay = delivered * 1000 / (uint32_t)dt;
     uint64_t dun = w->rate.tx_unsent - w->rate.unsent0, un_rate = dun * 1000 / (uint32_t)dt, off_rate = pay_rate + un_rate;
     int enter, leave, repeated, retry_ok, grew, net;
     w->rate.unsent0 = w->rate.tx_unsent;
@@ -5402,11 +5404,12 @@ static void rate_capacity_short(anl_t *w, int32_t dt, uint64_t pay_rate, uint32_
        path (the first key frame went unprotected). Three steps in a
        row: a key frame's burst into a shallow queue reads the same for
        a step or two (start_rate's 4-datagram queue, every key frame),
-       a slow bottleneck for as long as it lasts. Out after ten steps
-       in a row that read clear and at least 3 s: frames expire in
-       bunches (a GOP at a time, every second or two) and the sender
-       backs off in between; leaving at each lull let the gate reopen
-       and the parity return for a few seconds at a time. */
+       a slow bottleneck for as long as it lasts. Exit needs a complete
+       two-second window and at least 3 s in the state: frames expire in
+       bunches (a GOP at a time) and the sender backs off in between.
+       Compare totals over that window, not ten consecutive instantaneous
+       ratios: a key frame is sent before its ACK arrives, so its step
+       could reset the old counter every two seconds on a recovered path. */
     if (w->rate.steps < 0xffffffffu) w->rate.steps++;
     retry_ok = w->lt.state == 0 && queue < qthresh;
     /* A failed retry is still the known shortage, not a new suspicion:
@@ -5423,7 +5426,19 @@ static void rate_capacity_short(anl_t *w, int32_t dt, uint64_t pay_rate, uint32_
     }
     enter = w->rate.steps >= 5 && !w->rate.cs_recover && w->rate.dlv_avg != 0 &&
             ((uint64_t)w->rate.dlv_avg * 2 < w->rate.pay_avg || (repeated && (uint64_t)w->rate.unsent_avg * 16 > w->rate.off_avg));
-    leave = (uint64_t)w->rate.dlv_avg * 4 > (uint64_t)w->rate.pay_avg * 3 && (uint64_t)w->rate.unsent_avg * 64 < w->rate.off_avg;
+    leave = 0;
+    if (w->rate.capacity_short && retry_ok) {
+        w->rate.cs_sent += pay_rate * (uint32_t)dt;
+        w->rate.cs_delivered += delivered * 1000;
+        w->rate.cs_unsent += dun * 1000;
+        w->rate.cs_clear += (uint32_t)dt;
+        if (w->rate.cs_clear >= 2000) {
+            leave = w->rate.cs_sent != 0 && w->rate.cs_delivered * 4 > w->rate.cs_sent * 3 &&
+                    w->rate.cs_unsent * 64 < w->rate.cs_sent + w->rate.cs_unsent;
+            w->rate.cs_clear = 0;
+        }
+    } else w->rate.cs_clear = 0;
+    if (!w->rate.cs_clear) w->rate.cs_sent = w->rate.cs_delivered = w->rate.cs_unsent = 0;
     /* Random loss can keep delivery below the 75% exit threshold even
        after capacity returns: retransmitted payload is counted in what
        we send, and abandoned frames never acknowledge their tail. With
@@ -5476,11 +5491,10 @@ static void rate_capacity_short(anl_t *w, int32_t dt, uint64_t pay_rate, uint32_
     grew = w->rate.cs_test_ts && tdiff(w->current, w->rate.cs_test_ts) >= 1000 &&
            (uint64_t)w->rate.dlv_avg * 4 > (uint64_t)w->rate.cs_test_dlv * 5;
     w->rate.cs_cnt = enter ? w->rate.cs_cnt + 1 : 0;
-    w->rate.cs_clear = leave ? w->rate.cs_clear + 1 : 0;
     if (!w->rate.capacity_short && w->rate.cs_cnt >= 3) {
         w->rate.capacity_short = 1; w->rate.cs_ts = w->current | 1;
         w->rate.cs_by_unsent = !((uint64_t)w->rate.dlv_avg * 2 < w->rate.pay_avg);
-    } else if (w->rate.capacity_short && (w->rate.cs_clear >= 10 || grew || (w->rate.cs_by_unsent && w->rate.cs_calm >= 5)) &&
+    } else if (w->rate.capacity_short && (leave || grew || (w->rate.cs_by_unsent && w->rate.cs_calm >= 5)) &&
                tdiff(w->current, w->rate.cs_ts) >= 3000) {
         if (w->rate.cs_test_ts) w->rate.cs_recover = (w->current + 4000) | 1;
         w->rate.capacity_short = 0; w->rate.cs_ts = w->current | 1;
@@ -5491,6 +5505,10 @@ static void rate_capacity_short(anl_t *w, int32_t dt, uint64_t pay_rate, uint32_
         w->rate.cs_test_ts = 0;
         w->rate.cs_retry = 0;
         if (w->rate.capacity_short) w->rate.cs_ts = w->current | 1;
+    }
+    if (!w->rate.capacity_short) {
+        w->rate.cs_clear = 0;
+        w->rate.cs_sent = w->rate.cs_delivered = w->rate.cs_unsent = 0;
     }
     ANL_TRACE(capacity, w, enter, leave);
 }
@@ -5569,7 +5587,13 @@ static void rate_update(anl_t *w)
     w->rate.deliv0 = w->delivered;
     w->rate.ts = w->current ? w->current : 1;
     if (w->rate.share == 0) w->rate.share = RATE_SHARE_INIT;
-    if (dt <= 0 || dt > 10 * RATE_STEP_MS) return;              /* first call, or after idling */
+    if (dt <= 0 || dt > 10 * RATE_STEP_MS) {                   /* first call, or after idling */
+        w->rate.cs_clear = 0;
+        w->rate.cs_sent = w->rate.cs_delivered = w->rate.cs_unsent = 0;
+        w->rate.dpay0 = w->rate.delivered_pay;
+        w->rate.unsent0 = w->rate.tx_unsent;
+        return;
+    }
     if (dp >= 2u * w->mss && dwire >= 4u * w->mss) {            /* not from retransmissions alone */
         uint32_t sh = ubound32(128, (uint32_t)umin32((uint32_t)(dp * 256 / dwire), 256), 256);
         w->rate.share = (uint32_t)((int32_t)w->rate.share + ((int32_t)sh - (int32_t)w->rate.share) / 4);

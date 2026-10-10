@@ -4086,6 +4086,98 @@ static void test_report_capacity_recovery(void)
     g_seed0 = saved;
 }
 
+/* A key frame's ACK trails its send step. The whole clear window must
+ * account for it without treating that phase difference as new shortage. */
+static void test_capacity_clear_window(void)
+{
+    anl_t w;
+    int mode, i;
+    printf("[capacity: clear windows survive key bursts, reject loss/expiry/queue/policer]\n");
+    for (mode = 0; mode < 6; mode++) {
+        uint64_t previous = 10000;
+        memset(&w, 0, sizeof(w));
+        w.current = mode == 5 ? UINT32_MAX - 1000 : 4000;
+        w.rate.cs_ts = (w.current - 3000) | 1;
+        w.rate.capacity_short = 1;
+        w.rate.pay_avg = w.rate.dlv_avg = 50000;
+        for (i = 0; i < 10; i++) {
+            uint64_t sent = i == 0 ? 100000 : 10000;
+            w.current += 200;
+            w.rate.delivered_pay += mode == 1 ? previous / 2 : previous;
+            if (mode == 2 && i == 4) w.rate.tx_unsent += 10000;
+            w.lt.state = mode == 4 && i == 4 ? 1 : 0;
+            rate_capacity_short(&w, 200, sent * 5, mode == 3 && i == 4 ? 50 : 0, 25);
+            if (i < 9) CHECK(w.rate.capacity_short, "no exit before the full window, mode %d step %d", mode, i);
+            previous = sent;
+        }
+        CHECK(w.rate.capacity_short == (mode > 0 && mode < 5), "clear only with sustained delivery, mode %d", mode);
+    }
+    /* An idle gap cannot join two partial windows into recovery evidence. */
+    memset(&w, 0, sizeof(w));
+    w.current = 10000; w.rate.ts = 7000;
+    w.rate.delivered_pay = 50000; w.rate.tx_unsent = 10000;
+    w.rate.cs_clear = 1800;
+    w.rate.cs_sent = w.rate.cs_delivered = w.rate.cs_unsent = 1234;
+    rate_update(&w);
+    CHECK(w.rate.cs_clear == 0 && w.rate.cs_sent == 0 && w.rate.cs_delivered == 0 && w.rate.cs_unsent == 0,
+          "idle discards partial clear-window evidence");
+    CHECK(w.rate.dpay0 == w.rate.delivered_pay && w.rate.unsent0 == w.rate.tx_unsent,
+          "delivery and expiry snapshots restart with the sending snapshot");
+}
+
+static void test_capacity_recovery_replay(void)
+{
+    uint64_t saved = g_seed0;
+    printf("[capacity: recovery regression seeds 1 / 10%% and 8 / 15%%]\n");
+    g_seed0 = 0x9E3779B97F4A7C15ULL * 2;
+    test_fec_capacity_recovery(10);
+    g_seed0 = 0x9E3779B97F4A7C15ULL * 9;
+    test_fec_capacity_recovery(15);
+    g_seed0 = saved;
+}
+
+/* Four consecutive RST losses after an outage can exceed the stochastic
+ * close test's 20 s budget. Verify bounded retry and slot release without
+ * changing that test's deadline or the protocol's five-second backoff. */
+static void test_close_confirm_lost_replies(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    uint32_t attempts, fourth_at = 0;
+    int i, sid, confirmed;
+    printf("[close: four lost replies after a one-way outage]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 20;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    sid = anl_stream_id(a);
+    n.block[0] = 1;
+    anl_stream_close(a);
+    for (i = 0; i < 3000; i++) net_tick(&n);
+    attempts = srec_find(n.ep[0], sid)->xmit;
+    n.block[0] = 0;
+    n.block[1] = 1;
+    for (i = 0; i < 30000 && nclos(n.ep[0]); i++) {
+        sid_rec *r;
+        net_tick(&n);
+        r = srec_find(n.ep[0], sid);
+        if (r && r->xmit >= attempts + 4 && !fourth_at) fourth_at = n.now;
+        /* The fourth CLOSE has reached the peer and its RST has been
+           dropped before replies are enabled for the fifth attempt. */
+        if (fourth_at && tdiff(n.now, fourth_at) >= 100) n.block[1] = 0;
+    }
+    confirmed = nclos(n.ep[0]) == 0;
+    printf("  confirmed=%d after %d ms, peer streams=%u\n", confirmed, i, n.ep[1]->nstab);
+    CHECK(fourth_at && confirmed && i < 30000, "four lost replies do not strand the close (%d ms)", i);
+    CHECK(stream_state(b) == ANL_STREAM_CLOSED && n.ep[1]->nstab == 1, "peer released its slot");
+    CHECK(srec_find(n.ep[0], sid) == NULL, "confirmation releases the local closing slot");
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "connection remains alive");
+    anl_stream_close(b);
+    net_stop(&n);
+}
+
 /* No loss, no parity (DESIGN 8.6): audio + video over 20 Mbit / 170 ms
  * without loss for 10 s, then 5% loss. Before the first loss only bounded
  * audio startup and the first key frame's parity go out; the gates open within a second of the first
@@ -5040,6 +5132,9 @@ int main(void)
     RUN(test_review_gf_tables());
     RUN(test_fec_buffers_release());      /* last: new tests leave the others' random sequences alone */
     RUN(test_echo_clock_rate());
+    RUN(test_capacity_clear_window());
+    RUN(test_capacity_recovery_replay());
+    RUN(test_close_confirm_lost_replies());
     if (g_fail) { printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("\nall tests passed\n");
     return 0;
