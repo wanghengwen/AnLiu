@@ -678,6 +678,9 @@ struct anl_s {
     uint32_t pace_burst;
 
     int32_t rx_rttval, rx_srtt, rx_rto;
+    uint32_t ackprog_ts;                /* the last ACK that acknowledged data (| 1): the path still delivers (rto_queued_hold) */
+    uint32_t acked_sent_max;            /* the latest send time among the segments acknowledged so far */
+    int acked_sent_valid;
     int rtt_resume;                  /* resumed after an RTO without input: drain old ACK echoes */
     int reo_mult;                       /* RACK reordering window = reo_mult * min_rtt / 16 */
     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
@@ -3771,6 +3774,10 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
                         fec_auto_count(w, st, st->fec_deadline && at <= (int32_t)st->fec_deadline ? FEC_LOST : FEC_LATE);
                     }
                 }
+                /* the path delivers what was sent up to here (rto_queued_hold) */
+                if (!w->acked_sent_valid || tdiff(s->ts_sent, w->acked_sent_max) > 0) w->acked_sent_max = s->ts_sent;
+                w->acked_sent_valid = 1;
+                w->ackprog_ts = w->current | 1;
                 /* the original was acknowledged: the send state recorded for
                    the retransmission would give a false rate sample and end
                    the round early */
@@ -5116,6 +5123,25 @@ static void vq_add(anl_t *w, uint32_t wire)
     w->vq_ts = w->current;
 }
 
+/* A segment's RTO has run out while the path is still delivering what was
+ * sent before it: the last ACK acknowledged data sent before the segment,
+ * less than the RTO's margin ago, and nothing sent after it has been
+ * acknowledged. It waits in a queue the backlog estimate (vq_ms) did not
+ * see - a token bucket's burst inflates the rate it drains at - not lost:
+ * its RTO moves to that ACK plus the margin. An ACK of anything sent after
+ * it makes it a hole - the RTO (or RACK) fires as before, so a lost frame
+ * tail waits no longer than it did. Returns the new deadline, 0 to fire
+ * (DESIGN 6.3). */
+static uint32_t rto_queued_hold(const anl_t *w, const anl_seg *seg)
+{
+    uint32_t margin = w->rx_rto > w->rx_srtt ? (uint32_t)(w->rx_rto - w->rx_srtt) : 0;
+    if (w->ackprog_ts == 0 || margin == 0 || seg->lost) return 0;
+    if (w->acked_sent_valid && tdiff(w->acked_sent_max, seg->ts_sent) > 0) return 0;   /* a hole: newer data arrived */
+    if (tdiff(w->ackprog_ts, seg->ts_sent) <= 0) return 0;                            /* nothing heard since it went out */
+    if (tdiff(w->current, w->ackprog_ts) >= (int32_t)margin) return 0;                 /* the ACKs stopped: fire */
+    return w->ackprog_ts + margin;
+}
+
 /* The time a segment just sent waits behind that backlog: its RTO waits as
  * much longer: a key frame's burst, paced above the bottleneck, delays its
  * last segments and the frames after it, and their RTOs retransmitted what
@@ -5622,6 +5648,11 @@ static void anl_flush_internal(anl_t *w)
                 if (retrans_spent >= retrans_limit) { rtx_capped = 1; next_rto = current; break; }
                 if (why == 2 && (hold = fec_rto_hold(w, st, seg)) != 0) {
                     seg->fec_m = 0;
+                    seg->resendts = hold;
+                    if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
+                    continue;
+                }
+                if (why == 2 && (hold = rto_queued_hold(w, seg)) != 0) {
                     seg->resendts = hold;
                     if (tdiff(seg->resendts, next_rto) < 0) next_rto = seg->resendts;
                     continue;
