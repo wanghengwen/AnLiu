@@ -75,11 +75,12 @@ g++ -O2 -static -x c tools/realnet/srt/srtnet.c -x none -Isrt-install/include -L
 python3 tools/realnet/srt/deploy_srt.py ./srtnet
 python3 tools/realnet/srt/cmp_round.py a b 2000 5 501 9960 --anl base   # AnLiu 与三种 SRT 配置同时运行
 python3 tools/realnet/srt/cmp_ana.py
+python3 tools/realnet/srt/cmp_play.py      # 播放缓冲口径（AnLiu 与 SRT 对比用，docs/COMPARISON.md 2.3）
 (cd tools/realnet/srt && python3 cmp_pair.py anl-nf anl-nf@cand --limits)   # 两个 AnLiu lane 的成对差值与回归限值
 python3 tools/realnet/capacity_probe.py a b 9940 2,4,8,12,16      # 批次前：发送端出口容量（主机表的 cap_kbps 可能过时）
 ```
 
-`cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；统计口径见 docs/COMPARISON.md 2.1。
+`cmp_round.py` 的丢包由 tc 在发送端两个方向完成（`multi_tc.py --loss`），不在应用内丢弃；AnLiu 与 SRT 对比的统计口径见 docs/COMPARISON.md 2.3。
 
 `--delay MS` 只增加发送方向的时延，因此 `srt-rec` 的延迟取 `max(120, ceil(4 × (ping RTT + MS)))` 毫秒。结果记录原始 `rtt_min_ms` 和包含人工延迟的 `effective_rtt_ms`。
 

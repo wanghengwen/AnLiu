@@ -127,7 +127,7 @@ AnLiu's approach:
 - Loss detection (RACK) uses delivery evidence from the whole connection: a low-rate control stream with no later fragments of its own can still detect loss promptly from video deliveries;
 - Each stream independently chooses reliable / semi-reliable, window, FEC and priority, and either side can open or close streams at any time: closing any stream immediately frees local queued, unacknowledged and unread data and tells the peer, whose end is then over: data that had arrived in order can still be read, then calls return `ANL_ECLOSED`, and the peer application closes its own handle. To ensure reliable delivery, the application must wait for `anl_stream_waitsnd` to reach zero before closing.
 
-If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate. Priority and mixed-stream test results are in [PERFORMANCE.md](docs/PERFORMANCE.md).
+If the uplink quota is known, `cfg.pace_rate` sets an upper limit on BBR's sending rate.
 
 ---
 
@@ -151,7 +151,7 @@ In real-time scenarios, retransmission is usually too late: a loss costs "loss d
 
 ## 4. Performance tests
 
-Test conditions and historical data for simulated networks, real UDP paths, throughput, media latency, priority and FEC redundancy are collected in [PERFORMANCE.md](docs/PERFORMANCE.md). Test tools and how to run them are described in section 6.
+Test conditions and data for reliable-stream throughput, media timeliness, latency and FEC cost on real networks are in [PERFORMANCE.md](docs/PERFORMANCE.md). Test tools and how to run them are described in section 6.
 
 ---
 
@@ -261,9 +261,9 @@ export REALNET_CLOCK=1                # refresh the protocol clock to the curren
 - **Two protocols on one port**: each datagram carries one extra protocol-marker byte (tool layer); the client first sends 20 pings to measure path RTT.
 - **Simultaneous comparison**: in media tests AnLiu and ikcp each run a process at the same time (different ports), so they see the same network conditions; throughput tests run one after the other to avoid competing for bandwidth.
 - **About 12.5 minutes per round**: media uplink 150 s, media downlink 150 s (both protocols simultaneously), reliable stream uplink AnLiu / ikcp / TCP 75 s each, downlink 75 s each. Each combination runs 15 rounds spread across different times of day.
-- **TCP baseline**: record the actual congestion control algorithm and buffer configuration and use the same per-second throughput statistics; if TCP goes through a proxy while UDP is direct, mark the path difference separately. Historical test environments are in docs/PERFORMANCE.md.
+- **TCP baseline**: record the actual congestion control algorithm and buffer configuration and use the same per-second throughput statistics; if TCP goes through a proxy while UDP is direct, mark the path difference separately.
 - **Parallelism**: several combinations can run at once, but one host never runs the same kind of test (media / stream) twice at the same time; each combination uses its own ports.
-- **Troubleshooting**: `REALNET_SECS=1` prints per-second throughput; after `make realnet_trace`, `REALNET_TRACE=1` prints congestion control internals every 100 ms (cwnd, bandwidth estimate, `bw_lo`, `inflight_hi`, PROBE_BW phase, loss rate, rate-limiter state). Clock and rate-limiter issues can be located from these; related historical measurements are in docs/PERFORMANCE.md.
+- **Troubleshooting**: `REALNET_SECS=1` prints per-second throughput; after `make realnet_trace`, `REALNET_TRACE=1` prints congestion control internals every 100 ms (cwnd, bandwidth estimate, `bw_lo`, `inflight_hi`, PROBE_BW phase, loss rate, rate-limiter state). Clock and rate-limiter issues can be located from these.
 - **Integration tip**: `anl_input` computes RTT using the time of the most recent `anl_update`; calling `anl_update(now)` before receiving packets keeps RTT samples accurate (set `REALNET_CLOCK=1` when running `realnet`).
 
 ### 6.4 Process for each change
