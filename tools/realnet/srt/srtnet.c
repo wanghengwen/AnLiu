@@ -1,7 +1,7 @@
 /* srtnet: the realnet media workload (frame_v1) over SRT live mode, for a
  * side-by-side comparison with AnLiu on the same path at the same time.
  *
- *   srtnet server --port P --dur S --seed N            (sender: listens)
+ *   srtnet server --port P --dur S --seed N [--scale M]   (sender: listens; video at M per mille)
  *   srtnet client --host H --port P --lat-audio MS --lat-video MS [--fec CFG]
  *
  * Audio (flow 1: 160 B every 20 ms) and video (flow 2: 30 fps, GOP 30, key
@@ -47,8 +47,10 @@ static uint64_t mono_us(void)
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* realnet media_frame_size_raw: a stable size for each (seed, flow, sequence) */
+/* realnet media_frame_size: a stable size for each (seed, flow, sequence); video
+ * scaled by --scale per mille as realnet's REALNET_FIXED_SCALE does */
 static uint64_t g_seed;
+static int g_scale = 1000;
 static int frame_size(int id, uint32_t seq, int key)
 {
     int a, b;
@@ -59,7 +61,12 @@ static int frame_size(int id, uint32_t seq, int key)
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
     x ^= x >> 31;
-    return a + (int)(x % (uint32_t)(b - a + 1));
+    a += (int)(x % (uint32_t)(b - a + 1));
+    if (g_scale != 1000) {
+        a = (int)((int64_t)a * g_scale / 1000);
+        if (a < 200) a = 200;
+    }
+    return a;
 }
 
 static void die(const char *what)
@@ -174,7 +181,7 @@ static int server(int port, int dur)
     return 0;
 }
 
-static unsigned char got_chunks[3][MAXSEQ];
+static uint16_t got_chunks[3][MAXSEQ];     /* a key frame at --scale 20000 is ~550 chunks */
 static int client(const char *host, int port, int lat_a, int lat_v, const char *fec, int dur)
 {
     SRTSOCKET s[3];
@@ -248,11 +255,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--lat-audio")) lat_a = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--lat-video")) lat_v = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--fec")) fec = argv[i + 1];
+        else if (!strcmp(argv[i], "--scale")) g_scale = atoi(argv[i + 1]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     setvbuf(stdout, NULL, _IOFBF, 1 << 20);
     srt_startup();
-    printf("SRTNET role=%s port=%d dur=%d seed=%llu srt=%s\n", role, port, dur, (unsigned long long)g_seed, SRT_VERSION_STRING);
+    if (g_scale < 1 || g_scale > 40000) { fprintf(stderr, "--scale: 1..40000 per mille\n"); return 2; }
+    printf("SRTNET role=%s port=%d dur=%d seed=%llu scale=%d srt=%s\n", role, port, dur, (unsigned long long)g_seed, g_scale, SRT_VERSION_STRING);
     if (!strcmp(role, "server")) rc = server(port, dur);
     else if (!strcmp(role, "client")) rc = client(host, port, lat_a, lat_v, fec, dur);
     else { fprintf(stderr, "usage: srtnet server|client ...\n"); rc = 2; }

@@ -165,7 +165,7 @@ def more_metrics(meta,s,c,bw,row,errors):
  for tag,name in [(1,'audio'),(2,'video')]:
   mm=re.search(r'^FECCOST tag='+str(tag)+r' (.*)$',sender,re.M)
   if mm:row['fec_by_flow'][name]={k:int(v) for k,v in fields(mm[1]).items()}
- for f,name in [(1,'audio'),(2,'video')]:
+ for f,name in ([(1,'audio'),(2,'video')] if meta['workload']=='media' else []):
   sent=[list(map(int,l.split()[1:])) for l in sender.splitlines() if l.startswith(f'MDIAG_S {f} ')]
   row[name]['generated_payload_kbps']=round(sum(v[3] for v in sent)*8/600/1000,3)
   row[name]['received_pct']=round(100*row[name]['received']/max(1,row[name]['generated']),3)

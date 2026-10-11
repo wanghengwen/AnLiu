@@ -404,6 +404,12 @@ static void flows_init(void)
     v->name = "video"; v->id = 2; v->semi = 1; v->prio = 1; v->wnd = 512;
     v->period_ms = 33; v->gop = 30; v->key_min = 25000; v->key_max = 35000; v->size_min = 2500; v->size_max = 3500;
     v->max_age = 500; v->budget_ms = 300; v->until_key = 1; v->kcp_thr = 140000 / 2 / 1376 + 1;
+    /* REALNET_VIDEO_WND: the video stream's send / receive window in segments (default 512,
+       ~700 KB: a key frame at REALNET_FIXED_SCALE 20000 is ~700 KB); test tool only */
+    if (getenv("REALNET_VIDEO_WND")) {
+        int w = atoi(getenv("REALNET_VIDEO_WND"));
+        if (w >= 64 && w <= ANL_MAX_WND) v->wnd = w;
+    }
     /* REALNET_VIDEO_MAX_AGE: video max_age in ms (a longer latency budget); test tool only */
     if (getenv("REALNET_VIDEO_MAX_AGE")) {
         int ma = atoi(getenv("REALNET_VIDEO_MAX_AGE"));
@@ -606,7 +612,7 @@ static int ep_recv(int id, char *buf, int cap)
 /*--------------------------------------------------------------------
  * traffic
  *-------------------------------------------------------------------*/
-static char g_buf[1 << 20];      /* a key frame at REALNET_VIDEO_MAX 8000 is ~280 KB */
+static char g_buf[1 << 21];      /* a key frame at REALNET_FIXED_SCALE 40000 is ~1.4 MB */
 
 static void put_hdr(char *p, const flow *f, int key, uint32_t seq, uint64_t t)
 {
@@ -1116,7 +1122,7 @@ int main(int argc, char **argv)
         g_mdiag = getenv("REALNET_MDIAG") && atoi(getenv("REALNET_MDIAG")) > 0;
         if (getenv("REALNET_FIXED_SCALE")) {
             g_fixed_scale = atoi(getenv("REALNET_FIXED_SCALE"));
-            if (g_fixed_scale < 1 || g_fixed_scale > 1000) { fprintf(stderr, "REALNET_FIXED_SCALE: 1..1000 per mille\n"); exit(2); }
+            if (g_fixed_scale < 1 || g_fixed_scale > 40000) { fprintf(stderr, "REALNET_FIXED_SCALE: 1..40000 per mille\n"); exit(2); }
         }
         if (getenv("REALNET_VIDEO_MAX")) {
             g_adapt_max = atoi(getenv("REALNET_VIDEO_MAX"));

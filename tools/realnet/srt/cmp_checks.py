@@ -53,6 +53,8 @@ def validate_lane(name, duration, sender, receiver, require_exit=True):
         except ValueError:
             errors.append('malformed source record')
     for fid, fps in ((1, 50), (2, 30)):
+        if fid == 2 and name.partition('@')[0] == 'anl-ref':
+            continue                        # audio only: the round's delay base
         if sorted(seqs[fid]) != list(range(duration * fps)):
             errors.append(f'flow {fid}: incomplete/duplicate source sequence')
     rprefix = 'MDIAG_R' if anl else 'SRTR'

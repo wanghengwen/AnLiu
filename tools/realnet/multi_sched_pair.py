@@ -8,7 +8,10 @@ fixed (video per mille, no encoder feedback), unlimited, audio_only,
 audio_max_age, delay, burst, queue_ms, video_max, drive ("check"), tc_loss (loss by
 tc, true), fec_off (true), police (true: tc police at rate, bucket burst, in front of
 a line of `line` kbit, default 40000; charge it the line), charge (the
-bandwidth the job takes instead of rate - an unlimited round's real peak).
+bandwidth the job takes instead of rate - an unlimited round's real peak), stream
+(true: a reliable stream round, multi_round.py --stream), exclusive (true: the
+round takes the whole budget of its sender and receiver - a stream that fills
+the path).
 
 Budget per host (hosts.py: cap_kbps, slots, pool): the concurrent jobs'
 rates stay 5 Mbit below cap_kbps, charged on the sender and the receiver;
@@ -31,9 +34,22 @@ pool = lambda h: HOSTS[h]['pool']
 slots_of = lambda h: max(HOSTS[x]['slots'] for x in HOSTS if pool(x) == pool(h))
 
 
+RX_CHARGE = 300     # a media round's receiver only sends ACKs and reports back
+
+
+def charge(j, h):
+    """what j takes of host h: its rate (or charge), at most h's budget; all of it when
+    exclusive. A media round's receiver is charged its reverse traffic only: the hosts'
+    limits are on their egress (a token-bucket policer), what they receive is not bound by it"""
+    budget = HOSTS[h]['cap_kbps'] - RESERVE
+    if j.get('exclusive'): return budget
+    if h == j['rcv'] and not j.get('stream'): return min(RX_CHARGE, budget)
+    return min(j.get('charge', j['rate']), budget)
+
+
 def take(j, sign):
     for h in (j['snd'], j['rcv']):
-        used_bw[h] += sign * j.get('charge', j['rate']); used_slot[pool(h)] = used_slot.get(pool(h), 0) + sign
+        used_bw[h] += sign * charge(j, h); used_slot[pool(h)] = used_slot.get(pool(h), 0) + sign
 
 
 def port_for(s):
@@ -50,7 +66,8 @@ def command(j):
             + (['--delay', str(j['delay'])] if j.get('delay') else []) + (['--audio-only'] if j.get('audio_only') else [])
             + (['--video-max', str(j['video_max'])] if j.get('video_max') else []) + (['--burst', str(j['burst'])] if j.get('burst') else []) + (['--queue-ms', str(j['queue_ms'])] if j.get('queue_ms') else [])
             + (['--drive-check'] if j.get('drive') == 'check' else []) + (['--tc-loss'] if j.get('tc_loss') else [])
-            + (['--fec-off'] if j.get('fec_off') else []) + (['--police', '--line', str(j.get('line', 40000))] if j.get('police') else []))
+            + (['--fec-off'] if j.get('fec_off') else []) + (['--police', '--line', str(j.get('line', 40000))] if j.get('police') else [])
+            + (['--stream'] if j.get('stream') else []))
 
 
 def one(j, k, attempt):

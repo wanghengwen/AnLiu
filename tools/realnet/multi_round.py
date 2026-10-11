@@ -16,6 +16,8 @@ Usage: multi_round.py SENDER RECEIVER VARIANT SEED RATE_KBPS PORT [FIXED_SCALE]
                              the band's TBF with the --queue-ms queue)
          [--audio-only] [--audio-max-age MS] [--video-max PERMILLE]
          [--drive-check]     the endpoints drive anl_update from anl_check, as an application does
+         [--stream]          a reliable stream instead of media: --test stream --wnd 1024 --verify 1,
+                             goodput per second (REALNET_SECS), every byte checked
 
 Hosts come from ANL_REALNET_HOSTS (hosts.py). The sender is the server (UDP
 PORT, its own multi_tc.py band), the receiver the client. VARIANT is a
@@ -48,7 +50,7 @@ def flag(name):
 loss = opt('--loss', default=15)
 delay = opt('--delay'); burst = opt('--burst'); queue_ms = opt('--queue-ms'); video_max = opt('--video-max'); audio_max_age = opt('--audio-max-age')
 unlimited = flag('--unlimited'); audio_only = flag('--audio-only'); drive_check = flag('--drive-check')
-tc_loss = flag('--tc-loss'); fec_off = flag('--fec-off'); police = flag('--police'); line = opt('--line', default=40000)
+tc_loss = flag('--tc-loss'); fec_off = flag('--fec-off'); stream = flag('--stream'); police = flag('--police'); line = opt('--line', default=40000)
 if not 0 <= loss <= 15: raise SystemExit('loss 0..15')
 if not 0 <= delay <= 200: raise SystemExit('delay 0..200')
 if burst and not 1600 <= burst <= 4 << 20: raise SystemExit('burst 1600..4 MB')
@@ -65,14 +67,14 @@ RS, RC = H.remote(S, variant), H.remote(C, variant)
 LOCAL = H.WORK / variant
 kind = 'unl' if unlimited else 'multi'
 tag = (f'{variant}_{kind}_{snd}{rcv}_{rate}_l{loss}' + (f'_am{audio_max_age}' if audio_max_age else '') + (f'_d{delay}' if delay else '')
-       + ('_ao' if audio_only else '') + (f'_vm{video_max}' if video_max else '') + (f'_b{burst}' if burst else '') + (f'_q{queue_ms}' if queue_ms else '')
+       + ('_st' if stream else '') + ('_ao' if audio_only else '') + (f'_vm{video_max}' if video_max else '') + (f'_b{burst}' if burst else '') + (f'_q{queue_ms}' if queue_ms else '')
        + (f'_pol{line}' if police else '') + ('_chk' if drive_check else '') + ('_tl' if tc_loss else '') + ('_nf' if fec_off else '') + f'_seed{seed}' + (f'_fx{fixed}' if fixed else '') + f'_{time.time_ns()}')
 RES = H.WORK / 'results'; RES.mkdir(exist_ok=True)
 manifest = json.loads((LOCAL / 'deployment-manifest.json').read_text())
 meta = dict(tag=tag, sender=snd, receiver=rcv, server=snd, client=rcv, direction='down', rate_kbps=rate, loss_pct=loss,
             unlimited=unlimited, audio_max_age=audio_max_age or 200, extra_delay_ms=delay, audio_only=audio_only,
             video_max=video_max or 1000, tbf_burst=burst or 16384, tbf_queue_ms=queue_ms or 100, drive='check' if drive_check else 'poll1ms',
-            workload='media', duration_s=R.DUR, seed=seed, revision=manifest['revision'], variant=variant,
+            workload='stream' if stream else 'media', duration_s=R.DUR, seed=seed, revision=manifest['revision'], variant=variant,
             fixed_scale=fixed, port=port, tc_loss=tc_loss, fec_off=fec_off, valid=False)
 if police: meta.update(police=True, line_kbps=line, police_burst=burst or 65536)
 state = f'{RS}/mtc-state-{tag}.json'
@@ -83,6 +85,7 @@ tcargs = (f" --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --sta
 env = {'REALNET_MDIAG': '1', 'REALNET_TIMEBASE': '1', 'REALNET_CLOCK': '1', 'REALNET_RATE': '1', 'REALNET_FECCOST': '1',
        'REALNET_TRACE': '1000'}
 if fixed: env['REALNET_FIXED_SCALE'] = str(fixed)
+if stream: env['REALNET_SECS'] = '1'; del env['REALNET_MDIAG']
 if audio_max_age: env['REALNET_AUDIO_MAX_AGE'] = str(audio_max_age)
 if audio_only: env['REALNET_AUDIO_ONLY'] = '1'
 if video_max: env['REALNET_VIDEO_MAX'] = str(video_max)
@@ -123,9 +126,10 @@ scripts = []; started = False
 
 def launch(h, rd, role):
     path = f"{rd}/logs/{tag}.{'srv' if role == 'server' else 'cli'}"
-    args = [role, '--port', str(port), '--proto', 'anl', '--test', 'media', '--dir', 'down', '--dur', str(R.DUR),
+    args = [role, '--port', str(port), '--proto', 'anl', '--test', 'stream' if stream else 'media', '--dir', 'down', '--dur', str(R.DUR),
             '--interval', '10', '--loss', '0', '--rx-loss', '0' if tc_loss else str(loss), '--seed', str(seed), '--rcv-deadline', '-1',
             '--init-cwnd', '16', '--fec-rtt-auto', '0' if fec_off else '1', '--adapt', '0' if fixed else '1', '--prio-audio', '0', '--prio-video', '1']
+    if stream: args += ['--wnd', '1024', '--verify', '1']
     if role == 'client': args += ['--host', S['ip']]
     code = (LAUNCHER.replace('REMOTEDIR', repr(rd)).replace('LOGNAME', repr(path.rsplit('/', 1)[1]))
             .replace('ENVIRON', repr(env)).replace('ARGLIST', repr(args)))

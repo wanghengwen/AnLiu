@@ -108,9 +108,13 @@ if __name__ == '__main__':
             continue
         if rows is None:
             continue
+        if m.get('start_rate_kbps'):        # AnLiu with anl_config.start_rate: its own lane in the tables
+            rows = {(n + '+sr' if n.startswith('anl') else n): r for n, r in rows.items()}
         print(f"{m['sender']}>{m['receiver']} rtt {m['rtt_min_ms']:.1f}{' +delay %d' % m['delay_ms'] if m.get('delay_ms') else ''} rate {m['rate_kbps']} loss {m['loss_pct']}% seed {m['seed']}"
               + (f" budget audio {m['budget_ms']['1']} / video {m['budget_ms']['2']} ms" if m.get('budget_ms') else ''))
         for name, r in rows.items():
+            if name.partition('@')[0] == 'anl-ref':
+                continue                    # audio only: the delay base of an SRT round
             lf = f"{r['loss_fwd']:.2f}/{r['loss_rev']:.2f}" if r['loss_fwd'] is not None else '-'
             print(f"  {name:8} audio {r['audio']['ontime']:6.2f} ({r['audio']['delivered']:6.2f} p50 {r['audio']['p50']:6.1f}) "
                   f"video {r['video']['ontime']:6.2f} ({r['video']['delivered']:6.2f} p95 {r['video']['p95']:6.1f}) dec {r['dec']:6.2f} keys {r['keys']:5.1f} "
