@@ -251,6 +251,27 @@ static void test_kat(void)
         CHECK(memcmp(buf, exp, len) == 0, "chacha20 encryption vector");
     }
 
+    /* the four-block path agrees with the single block at every length
+       (whole passes, a partial last pass, a tail of less than a word) */
+    {
+        static const size_t lens[] = {1, 3, 63, 64, 65, 100, 127, 128, 129, 191, 255, 256, 257, 300, 1200, 1400};
+        static uint8_t a[1400], b[1400], ks[64];
+        size_t k, n, c, ok = 1;
+        for (k = 0; k < sizeof lens / sizeof lens[0]; k++) {
+            n = lens[k];
+            for (i = 0; i < n; i++) a[i] = b[i] = (uint8_t)(i * 7 + k);
+            chacha20_xor(key, nonce, 7, a, n);
+            for (i = 0, c = 7; i < n; c++) {         /* the reference: block by block */
+                size_t m = n - i < 64 ? n - i : 64, q;
+                chacha20_block(key, (uint32_t)c, nonce, ks);
+                for (q = 0; q < m; q++) b[i + q] ^= ks[q];
+                i += m;
+            }
+            if (memcmp(a, b, n) != 0) ok = 0;
+        }
+        CHECK(ok, "chacha20 four blocks at a time == one at a time, all lengths");
+    }
+
     /* SipHash-2-4-128 reference vectors, key 00..0f, msg 00..len-1 */
     {
         uint8_t k[16], msg[16], tag[16];
@@ -4994,6 +5015,33 @@ static void test_review_scheduler(int low_prio)
     net_stop(&n);
 }
 
+/* a connection with nothing pending is not looked at every interval: the
+ * keepalive (or the idle timeout) is its next wake; anything queued, in
+ * flight or to be acknowledged brings the interval back */
+static void test_check_quiet(void)
+{
+    net n; anl_config ca, cb; char buf[100]; int i;
+    puts("[anl_check: a quiet connection waits for the keepalive, not the interval]");
+    net_init(&n, &ca, &cb);
+    ca.keepalive_ms = cb.keepalive_ms = 3000;
+    net_start(&n, &ca, &cb);
+    CHECK(anl_check(n.ep[0], n.now) - n.now <= (uint32_t)ca.interval, "opening (OPEN unanswered): within an interval");
+    for (i = 0; i < 300; i++) net_tick(&n);
+    CHECK(conn_quiet(n.ep[0]) && conn_quiet(n.ep[1]), "both ends quiet once the OPENs are answered");
+    CHECK(anl_check(n.ep[0], n.now) - n.now > 1000 && anl_check(n.ep[0], n.now) - n.now <= 3000,
+          "quiet: the next look is the keepalive, not the interval");
+    memset(buf, 1, sizeof buf);
+    anl_stream_send(anl_default_stream(n.ep[0]), buf, sizeof buf);
+    CHECK(!conn_quiet(n.ep[0]) && anl_check(n.ep[0], n.now) - n.now <= (uint32_t)ca.interval, "data queued: within an interval");
+    for (i = 0; i < 300 && !(conn_quiet(n.ep[0]) && conn_quiet(n.ep[1])); i++) net_tick(&n);
+    CHECK(i < 300, "quiet again once acknowledged, with the receiver's ACKs out (%d ms)", i);
+    while (anl_stream_recv(anl_default_stream(n.ep[1]), buf, sizeof buf) > 0) ;
+    for (i = 0; i < 4000; i++) net_tick(&n);
+    CHECK(anl_state(n.ep[0]) >= 0 && anl_state(n.ep[1]) >= 0 && conn_quiet(n.ep[0]) && conn_quiet(n.ep[1]),
+          "keepalives came and went: alive and quiet");
+    net_stop(&n);
+}
+
 static int review_sink(char *buf, int len, anl_t *w, void *user)
 { (void)buf; (void)len; (void)w; (void)user; return 0; }
 
@@ -5226,6 +5274,7 @@ int main(void)
     RUN(test_review_scheduler(3));
     RUN(test_review_scheduler(0));
     RUN(test_review_timers());
+    RUN(test_check_quiet());
     RUN(test_review_backlog());
     RUN(test_review_gf_tables());
     RUN(test_fec_buffers_release());      /* last: new tests leave the others' random sequences alone */

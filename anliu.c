@@ -201,10 +201,113 @@ static void chacha20_block(const uint8_t key[32], uint32_t counter,
     for (i = 0; i < 16; i++) st32(out + 4 * i, x[i] + s[i]);
 }
 
+/* Four blocks at once where the compiler has 128-bit vectors (SSE2 on x86,
+ * NEON on little-endian ARM): lane j of every state word is block
+ * counter + j, the quarter rounds run on the four lanes together, the words
+ * are transposed back into blocks in registers; a datagram of 1200 bytes is
+ * 19 blocks, 5 passes instead of 19. The single block above stays for the
+ * KDF, the PRNG and other targets. */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#define CHACHA_X4 1
+typedef __m128i cc_v;
+#define CC_ADD(a, b)  _mm_add_epi32(a, b)
+#define CC_XOR(a, b)  _mm_xor_si128(a, b)
+#define CC_ROTL(x, n) _mm_or_si128(_mm_slli_epi32(x, n), _mm_srli_epi32(x, 32 - (n)))
+#define CC_ROTL16(x)  _mm_shufflehi_epi16(_mm_shufflelo_epi16(x, 0xb1), 0xb1)
+#define CC_SET1(x)    _mm_set1_epi32((int)(x))
+#define CC_LOAD(p)    _mm_loadu_si128((const __m128i *)(p))
+#define CC_STORE(p, v) _mm_storeu_si128((__m128i *)(p), v)
+/* a, b, c, d (word i of blocks 0..3) -> r0..r3 (words i..i+3 of block 0..3) */
+#define CC_TRANSPOSE(a, b, c, d, r0, r1, r2, r3) do {                      \
+    cc_v t0_ = _mm_unpacklo_epi32(a, b), t1_ = _mm_unpacklo_epi32(c, d);   \
+    cc_v t2_ = _mm_unpackhi_epi32(a, b), t3_ = _mm_unpackhi_epi32(c, d);   \
+    r0 = _mm_unpacklo_epi64(t0_, t1_); r1 = _mm_unpackhi_epi64(t0_, t1_);  \
+    r2 = _mm_unpacklo_epi64(t2_, t3_); r3 = _mm_unpackhi_epi64(t2_, t3_);  \
+} while (0)
+#elif (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(__BYTE_ORDER__) \
+      && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_neon.h>
+#define CHACHA_X4 1
+typedef uint32x4_t cc_v;
+#define CC_ADD(a, b)  vaddq_u32(a, b)
+#define CC_XOR(a, b)  veorq_u32(a, b)
+#define CC_ROTL(x, n) vsliq_n_u32(vshrq_n_u32(x, 32 - (n)), x, n)
+#define CC_ROTL16(x)  vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(x)))
+#define CC_SET1(x)    vdupq_n_u32(x)
+#define CC_LOAD(p)    vld1q_u32((const uint32_t *)(p))
+#define CC_STORE(p, v) vst1q_u32((uint32_t *)(p), v)
+#define CC_TRANSPOSE(a, b, c, d, r0, r1, r2, r3) do {                                  \
+    uint32x4x2_t p_ = vtrnq_u32(a, b), q_ = vtrnq_u32(c, d);                           \
+    r0 = vcombine_u32(vget_low_u32(p_.val[0]), vget_low_u32(q_.val[0]));               \
+    r1 = vcombine_u32(vget_low_u32(p_.val[1]), vget_low_u32(q_.val[1]));               \
+    r2 = vcombine_u32(vget_high_u32(p_.val[0]), vget_high_u32(q_.val[0]));             \
+    r3 = vcombine_u32(vget_high_u32(p_.val[1]), vget_high_u32(q_.val[1]));             \
+} while (0)
+#endif
+
+#ifdef CHACHA_X4
+#define CC_QR(a, b, c, d) \
+    a = CC_ADD(a, b); d = CC_XOR(d, a); d = CC_ROTL16(d);   \
+    c = CC_ADD(c, d); b = CC_XOR(b, c); b = CC_ROTL(b, 12); \
+    a = CC_ADD(a, b); d = CC_XOR(d, a); d = CC_ROTL(d, 8);  \
+    c = CC_ADD(c, d); b = CC_XOR(b, c); b = CC_ROTL(b, 7);
+
+/* the keystream of blocks counter .. counter + 3 xored into buf (len <= 256) */
+static void chacha20_x4(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t *buf, size_t len)
+{
+    uint32_t s[16], ctr[4];
+    cc_v v[16];
+    size_t i, k;
+    s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+    for (i = 0; i < 8; i++) s[4 + i] = ld32(key + 4 * i);
+    s[12] = counter;
+    s[13] = ld32(nonce); s[14] = ld32(nonce + 4); s[15] = ld32(nonce + 8);
+    for (i = 0; i < 4; i++) ctr[i] = counter + (uint32_t)i;
+    for (i = 0; i < 16; i++) v[i] = CC_SET1(s[i]);
+    v[12] = CC_LOAD(ctr);
+    for (i = 0; i < 10; i++) {
+        CC_QR(v[0], v[4], v[8],  v[12]);
+        CC_QR(v[1], v[5], v[9],  v[13]);
+        CC_QR(v[2], v[6], v[10], v[14]);
+        CC_QR(v[3], v[7], v[11], v[15]);
+        CC_QR(v[0], v[5], v[10], v[15]);
+        CC_QR(v[1], v[6], v[11], v[12]);
+        CC_QR(v[2], v[7], v[8],  v[13]);
+        CC_QR(v[3], v[4], v[9],  v[14]);
+    }
+    for (i = 0; i < 16; i++) v[i] = CC_ADD(v[i], i == 12 ? CC_LOAD(ctr) : CC_SET1(s[i]));
+    for (k = 0; k < 4; k++) {               /* words 4k..4k+3 of each block: bytes 16k..16k+15 */
+        cc_v r[4];
+        size_t j;
+        CC_TRANSPOSE(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3], r[0], r[1], r[2], r[3]);
+        for (j = 0; j < 4; j++) {
+            size_t off = 64 * j + 16 * k;
+            if (off + 16 <= len) {
+                CC_STORE(buf + off, CC_XOR(CC_LOAD(buf + off), r[j]));
+            } else if (off < len) {         /* the last bytes: not a whole 16 */
+                uint8_t t[16];
+                CC_STORE(t, r[j]);
+                for (i = 0; off + i < len; i++) buf[off + i] ^= t[i];
+            }
+        }
+    }
+}
+#endif
+
 static void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12],
                          uint32_t counter, uint8_t *buf, size_t len)
 {
     uint8_t ks[64];
+#ifdef CHACHA_X4
+    while (len > 64) {                      /* more than a block: four at a time (a partial last pass too) */
+        size_t n = len < 256 ? len : 256;
+        chacha20_x4(key, counter, nonce, buf, n);
+        counter += 4;
+        buf += n;
+        len -= n;
+    }
+#endif
     while (len > 0) {
         size_t n = len < 64 ? len : 64, i;
         chacha20_block(key, counter++, nonce, ks);
@@ -6216,6 +6319,31 @@ void anl_update(anl_t *w, uint32_t current)
     }
 }
 
+/* Nothing the periodic flush would do: no stream has data queued or in
+ * flight (RTO, RACK, zero-window probes), no ACK, report, OPEN or FWD due,
+ * no parity block open or parities left to send, no out-of-order frames
+ * waiting for a semi-reliable stream's deadline, no CLOSE or RST to send,
+ * no datagram held by pacing. Then the flush can wait for the next input
+ * or send (both flush at once), the keepalive or the idle timeout:
+ * an idle connection costs no wakeups (anl_check). */
+static int conn_quiet(const anl_t *w)
+{
+    const anl_node *n;
+    if (w->pace_blocked || w->nrstq || w->nsrec) return 0;
+    for (n = w->slist.next; n != &w->slist; n = n->next) {
+        const anl_stream *st = STREAM_OF(n);
+        if (st->state == ANL_STREAM_CLOSED) continue;
+        if (st->nsnd_que || st->nsnd_buf || st->ctl || st->ack_pending || st->ack_rep_ts
+            || st->probe_ask || st->probe_tell || !st->peer_opened || st->fwd_pending
+            || st->rp_qn || st->rp_fn || st->fec_n || (st->fec_out_i < st->fec_out_m)
+            || (st->mode == ANL_SEMI && st->nrcv_buf))
+            return 0;
+    }
+    return 1;
+}
+
+#define QUIET_CHECK_MS 5000     /* a quiet connection is still looked at this often: a case conn_quiet misses waits that long, not for good */
+
 uint32_t anl_check(const anl_t *w, uint32_t current)
 {
     /* The next time anl_update acts: keepalive/idle expiry, periodic flush,
@@ -6252,6 +6380,12 @@ uint32_t anl_check(const anl_t *w, uint32_t current)
         int32_t d = tdiff(w->last_rx + w->idle_timeout_ms, current);
         if (d <= 0) return current;
         if (d < tm_min) tm_min = d;
+    }
+    if (conn_quiet(w)) {
+        /* the periodic flush has nothing to do: not every interval, only
+           the keepalive, the idle timeout or the pacing bucket (tm_min) */
+        minimal = (uint32_t)(tm_min < QUIET_CHECK_MS ? tm_min : QUIET_CHECK_MS);
+        return current + minimal;
     }
     minimal = (uint32_t)(tm_min < tm_flush ? tm_min : tm_flush);
     if (minimal >= (uint32_t)w->interval) minimal = (uint32_t)w->interval;

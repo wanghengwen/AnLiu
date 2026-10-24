@@ -450,7 +450,7 @@ rto    = srtt + max(2 × interval, 4 × rttval, srtt / 4)
 
 普通速率为 `pacing_gain × 有效带宽模型`；未有模型时按 `init_cwnd × mss / max(srtt或200ms, interval)` 乘 STARTUP 增益。普通下限为每 `max(srtt, interval)` 至少 4 个 mss；限速器测试或已确认上限时下限也受测试目标约束。`cfg.pace_rate > 0` 始终作为最终上限。`start_rate` 与应用受限的突发速率约束见 6.8。
 
-桶容量默认 `4 × mtu`；启用 start_rate 且未显式设桶时为 1 个 mtu。空闲积累不超过桶容量；上次因令牌不足而停止时，可容纳至多一个 interval 应得的令牌，避免调用间隔限制吞吐。`anl_check` 返回周期 flush、因令牌不足暂停时下一个包令牌凑齐、keepalive（已设置 output）及 idle timeout 中最早的时刻，即 `anl_update` 真正会动作的时刻；各流的 ACK、封块、校验包、RTO、RACK 等定时都在 flush 中处理，不单独唤醒。实时流建议 1..5 ms 的驱动精度。
+桶容量默认 `4 × mtu`；启用 start_rate 且未显式设桶时为 1 个 mtu。空闲积累不超过桶容量；上次因令牌不足而停止时，可容纳至多一个 interval 应得的令牌，避免调用间隔限制吞吐。`anl_check` 返回周期 flush、因令牌不足暂停时下一个包令牌凑齐、keepalive（已设置 output）及 idle timeout 中最早的时刻，即 `anl_update` 真正会动作的时刻；各流的 ACK、封块、校验包、RTO、RACK 等定时都在 flush 中处理，不单独唤醒。连接上没有任何待办时（没有流有排队或在途的数据、待发的 ACK、报告、OPEN、FWD 或校验包、半可靠流没有等期限的乱序帧、没有待发的 CLOSE 或 RST、没有被节拍器扣住的包），周期 flush 无事可做，`anl_check` 不再按 interval 返回，只返回 keepalive、idle timeout 与节拍器三者中最早者（至多 5 s 后再看一次）：一条空闲连接不产生唤醒，输入或发送到来时各自立即 flush 并恢复周期。实时流建议 1..5 ms 的驱动精度。
 
 没有关闭 BBR 或 pacing 的选项。应用码率超过路径时，半可靠队列由期限/字节上限回收；编码器应参考 `target_rate`，以 `backlog_bytes`、丢帧与接收报告辅助判断。
 
