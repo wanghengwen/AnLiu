@@ -78,7 +78,7 @@ meta = dict(tag=tag, sender=snd, receiver=rcv, server=snd, client=rcv, direction
             fixed_scale=fixed, port=port, tc_loss=tc_loss, fec_off=fec_off, valid=False)
 if police: meta.update(police=True, line_kbps=line, police_burst=burst or 65536)
 state = f'{RS}/mtc-state-{tag}.json'
-tcbase = f'python3 {RS}/multi_tc.py'
+tcbase = f'python3 {RS}/multi_tc.py'; dlog = f'{RS}/logs/{tag}.deadman'
 tcargs = (f" --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --state {state}"
           + (f' --delay {delay}' if delay else '') + (f' --burst {burst}' if burst else '') + (f' --queue-ms {queue_ms}' if queue_ms else '') + (f' --loss {loss}' if tc_loss and loss else '')
           + (f' --police --line {line}' if police else ''))
@@ -172,7 +172,7 @@ try:
     started = True
     out = R.ssh(S, tcbase + ' setup' + tcargs).stdout.decode()
     band = int(out.split('band')[-1].split()[0]); meta['tc_band'] = band
-    R.ssh(S, f'nohup {tcbase} deadman{tcargs} </dev/null > {RS}/deadman_{port}.log 2>&1 &')
+    R.ssh(S, f'nohup {tcbase} deadman{tcargs} --done {RS}/logs/{tag}.srv.rc </dev/null > {dlog} 2>&1 &')
     R.save_meta(RES / f'{tag}.json', meta); R.event('multi_start', tag=tag, variant=variant, rate=rate, seed=seed, port=port)
     launch(S, RS, 'server')
     srv = f'{RS}/logs/{tag}.srv'
@@ -185,6 +185,7 @@ try:
     bw = f'{RS}/logs/{tag}.bw'
     R.ssh(S, f"nohup python3 {RS}/sample_bandwidth.py {srv} {R.DUR} {S['dev']} {0x6b0 + band:x}: > {bw} 2> {bw}.err </dev/null &")
     launch(C, RC, 'client')
+    R.be_patient(R.DUR + R.PATIENCE)   # from here the round runs on the hosts without us
     deadline = time.monotonic() + R.DUR + 180; rc = {}
     while time.monotonic() < deadline:
         for h, rd, path in scripts:
@@ -210,7 +211,7 @@ finally:
         except Exception as e: meta.setdefault('errors', []).append('owned stop ' + str(e)); meta['valid'] = False
     if started:
         try:
-            out = R.ssh(S, tcbase + ' clear' + tcargs).stdout.decode()
+            out = R.tc_finish(S, tcbase, tcargs, dlog)
             m = re.search(r'LOSS_STATS fwd_pkts (\d+) fwd_drop (\d+) rev_pkts (\d+) rev_drop (\d+)', out)
             if m:
                 fp, fd, rp, rdp = map(int, m.groups())

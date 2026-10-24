@@ -86,18 +86,26 @@ SSH = ['ssh', '-x', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', '-o', 'Ser
        '-o', 'ControlMaster=auto', '-o', f'ControlPath=/tmp/anliu-cmp-%C-{pbase}', '-o', 'ControlPersist=900']
 
 
+# once the clients are started the round runs on the hosts without us (each band's deadman counts and
+# clears it when its server exits): a lost connection on our side is then waited out until patient_until
+patient_until = 0.0
+
+
 def ssh(h, cmd, check=True, timeout=120):
-    for attempt in range(4):
+    attempt = 0
+    while True:
         try:
             r = subprocess.run(SSH + [h['ssh'], cmd], capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            if attempt == 3: raise
-            time.sleep(10); continue
-        if r.returncode == 255 and attempt < 3:
-            time.sleep(10); continue
-        if check and r.returncode: raise RuntimeError(f"{h['ssh']}: {cmd[:80]}: rc={r.returncode} {r.stderr.decode()[:300]}")
-        return r
-    raise RuntimeError('ssh retries exhausted')
+            r = None
+        if r is not None and r.returncode != 255: break
+        attempt += 1
+        if attempt >= 4 and time.monotonic() >= patient_until:
+            if r is None: raise subprocess.TimeoutExpired(cmd, timeout)
+            break
+        time.sleep(10 if attempt < 4 else 30)
+    if check and r.returncode: raise RuntimeError(f"{h['ssh']}: {cmd[:80]}: rc={r.returncode} {r.stderr.decode()[:300]}")
+    return r
 
 
 CMP = lambda h: H.remote(h, 'srt')
@@ -110,6 +118,22 @@ meta = dict(tag=tag, sender=snd, receiver=rcv, rate_kbps=rate, loss_pct=loss, se
             valid=False, protocols={})
 bands = {}
 procs = []
+finished = set()
+
+
+def tc_finish(name):
+    """a band's counters and release: its deadman's clear output, or a clear run now"""
+    port, band, state = bands[name]
+    o = ssh(S, f"cat {CMP(S)}/logs/{tag}.{name}.deadman 2>/dev/null", check=False).stdout.decode(errors='replace')
+    if 'CLEARED' not in o:
+        o = ssh(S, f"python3 {CMP(S)}/multi_tc.py clear --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()
+    finished.add(name)
+    m = re.search(r'LOSS_STATS fwd_pkts (\d+) fwd_drop (\d+) rev_pkts (\d+) rev_drop (\d+)', o)
+    if m: meta['protocols'][name]['loss_stats'] = dict(zip(('fwd_pkts', 'fwd_drop', 'rev_pkts', 'rev_drop'), map(int, m.groups())))
+    m = re.search(r'QDISC_STATS (\{.*\})', o)
+    if m: meta['protocols'][name]['tc'] = json.loads(m.group(1))
+
+
 try:
     # the path's RTT for srt-rec
     for h, peer in ((C, S), (S, C)):          # ICMP is filtered one way on some paths
@@ -154,7 +178,8 @@ try:
         o = ssh(S, f"python3 {CMP(S)}/multi_tc.py setup --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --delay {delay} --state {state}").stdout.decode()
         band = int(o.split('band')[-1].split()[0])
         bands[name] = (port, band, state)
-        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 2700} </dev/null > {CMP(S)}/logs/deadman_{port}.log 2>&1 &")
+        ssh(S, f"nohup python3 {CMP(S)}/multi_tc.py deadman --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state} --hold {dur + 2700}"
+               f" --done {CMP(S)}/logs/{tag}.{name}.srv.rc </dev/null > {CMP(S)}/logs/{tag}.{name}.deadman 2>&1 &")
         meta['protocols'][name] = dict(port=port, band=band, cfg=cfg)
         if name.startswith('anl'):
             meta['protocols'][name]['revision'] = json.loads((H.WORK / lane_variant(name) / 'deployment-manifest.json').read_text())['revision']
@@ -163,9 +188,12 @@ try:
         rel = f"logs/{tag}.{name}.{role}"; log = f"{CMP(h)}/{rel}"
         # The detached shell records the child's exit, including a crash. Its
         # process group is retained for cleanup if the command does not finish.
-        wrapped = ('cmp_begin=$(date +%s); ' + cmd + '; cmp_rc=$?; '
+        # timeout: the process ends on the host even if we never come back to stop it; the .rc
+        # file tells the band's deadman that the server is done
+        wrapped = (f'cmp_begin=$(date +%s); timeout --foreground -k 10 {dur + 300} ' + cmd + '; cmp_rc=$?; '
                    'cmp_end=$(date +%s); '
                    'printf "CMP_EXIT rc=%s elapsed_s=%s\\n" "$cmp_rc" "$((cmp_end-cmp_begin))"; '
+                   f'echo "$cmp_rc" > {rel}.rc; '
                    'exit "$cmp_rc"')
         ssh(h, f"cd $HOME/{CMP(h)} || exit 1; {env} setsid nohup sh -c {q(wrapped)} > {rel} 2>&1 < /dev/null & echo $! > $HOME/{log}.pid")
         procs.append((h, log))
@@ -205,20 +233,19 @@ try:
             la, lv, fec = cfg
             logs[name, 'cli'] = start(C, name, 'cli', f"./srtnet client --host {S['ip']} --port {port} --lat-audio {la} --lat-video {lv} --dur {dur}"
                                       + (f" --fec {q(fec)}" if fec else ''))
+    patient_until = time.monotonic() + dur + 3600
     time.sleep(dur + 15)
     deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
+    while True:
+        # an unreachable host blocks in ssh() until it answers: the deadline only fails a process seen running
         alive = [l for h, l in procs if ssh(h, f"kill -0 $(cat {l}.pid) 2>/dev/null && echo ALIVE", check=False).stdout.strip() == b'ALIVE']
         if not alive: break
+        if time.monotonic() > deadline: raise RuntimeError('processes still running: ' + str(alive))
         time.sleep(5)
-    else:
-        raise RuntimeError('processes still running: ' + str(alive))
-    # tc counters of each band before clearing
-    tcj = json.loads(ssh(S, f"sudo -n /usr/sbin/tc -s -j qdisc show dev {S['dev']}").stdout)
-    for name, (port, band, state) in bands.items():
-        qd = [x for x in tcj if x.get('handle') == f'{0x6b0 + band:x}:']
-        meta['protocols'][name]['tc'] = {k: qd[0].get(k) for k in ('bytes', 'packets', 'drops', 'overlimits')} if qd else None
-        if not qd or qd[0].get('bytes') is None:
+    # each band's TBF and loss counters, from its deadman's clear (or a clear now if it has not run)
+    for name in bands: tc_finish(name)
+    for name in bands:
+        if (meta['protocols'][name].get('tc') or {}).get('bytes') is None:
             raise RuntimeError(f'{name}: missing tc byte counter')
     fetched = {}
     for (name, role), log in logs.items():
@@ -241,11 +268,9 @@ finally:
             ssh(h, f"kill -- -$(cat {log}.pid) 2>/dev/null; true", check=False)
         except Exception as e:
             meta.setdefault('errors', []).append('stop ' + str(e)); meta['valid'] = False
-    for name, (port, band, state) in bands.items():
-        try:
-            o = ssh(S, f"python3 {CMP(S)}/multi_tc.py clear --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()
-            m = re.search(r'LOSS_STATS fwd_pkts (\d+) fwd_drop (\d+) rev_pkts (\d+) rev_drop (\d+)', o)
-            if m: meta['protocols'][name]['loss_stats'] = dict(zip(('fwd_pkts', 'fwd_drop', 'rev_pkts', 'rev_drop'), map(int, m.groups())))
+    for name in bands:
+        if name in finished: continue
+        try: tc_finish(name)
         except Exception as e:
             meta.setdefault('errors', []).append('clear ' + str(e)); meta['valid'] = False
     (RES / f'{tag}.json').write_text(json.dumps(meta, indent=1))

@@ -9,6 +9,17 @@ SSH = ['ssh', '-x', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', '-o', 'Ser
        '-o', 'ControlPersist=900']
 q = shlex.quote
 _mutex = threading.Lock()
+# Once a round is running on the hosts it no longer needs us: the processes, the tc band (its deadman
+# clears it when the sender exits) and the logs all live there. From then on a lost connection on our
+# side is waited out rather than failing the round: ssh() keeps retrying transport errors until
+# patient_until (time.monotonic()), set by the round after it starts the client.
+PATIENCE = 3600
+patient_until = 0.0
+
+
+def be_patient(seconds):
+    global patient_until
+    patient_until = time.monotonic() + seconds
 
 
 def event(kind, **kw):
@@ -31,6 +42,13 @@ def ssh(h, command, timeout=45, check=True, retries=4):
               command_sha256=hashlib.sha256(command.encode()).hexdigest())
         if attempt < retries - 1:
             time.sleep(15)
+    while r.returncode == 255 and time.monotonic() < patient_until:
+        # our side is cut off: wait for it to come back
+        time.sleep(30)
+        try:
+            r = sp.run(SSH + [h['ssh'], command], capture_output=True, timeout=timeout)
+        except sp.TimeoutExpired as e:
+            r = sp.CompletedProcess(e.cmd, 255, e.stdout or b'', b'local SSH timeout')
     if check and r.returncode:
         raise RuntimeError(f"{h['name']} SSH rc={r.returncode}: {r.stderr.decode(errors='replace')[-300:]}")
     return r
@@ -52,13 +70,24 @@ def upload(h, src, dst):
 
 def fetch(h, path, timeout=300):
     """a remote file's content, retried when the transfer is cut"""
-    for attempt in range(4):
+    attempt = 0
+    while True:
         try:
             return gzip.decompress(ssh(h, 'gzip -c ' + q(path), timeout=timeout).stdout)
         except (EOFError, OSError, RuntimeError):
-            if attempt == 3:
+            attempt += 1
+            if attempt >= 4 and time.monotonic() >= patient_until:
                 raise
             time.sleep(20)
+
+
+def tc_finish(h, tcbase, tcargs, dlog):
+    """the clear output of a round's band: the deadman's (it clears when the sender exits, on the
+    host) or, when it has not cleared yet, a clear run now"""
+    out = ssh(h, 'cat ' + q(dlog) + ' 2>/dev/null', check=False).stdout.decode(errors='replace')
+    if 'CLEARED' in out:
+        return out
+    return ssh(h, tcbase + ' clear' + tcargs).stdout.decode()
 
 
 def save_meta(path, meta):

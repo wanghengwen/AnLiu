@@ -17,7 +17,11 @@ p=argparse.ArgumentParser()
 p.add_argument('action',choices=['setup','clear','deadman'])
 p.add_argument('--dev',default='eth0');p.add_argument('--peer',required=True);p.add_argument('--port',type=int,required=True)
 p.add_argument('--rate',type=int,default=2000);p.add_argument('--delay',type=int,default=0);p.add_argument('--hold',type=int,default=850);p.add_argument('--loss',type=int,default=0);p.add_argument('--burst',type=int,default=0);p.add_argument('--state',required=True)
-p.add_argument('--queue-ms',type=int,default=100)   # the band's queue: 100 ms shapes; a few ms behaves like a policer (drops once the bucket is empty)
+p.add_argument('--queue-ms',type=int,default=100)
+# deadman --done FILE: clear as soon as FILE exists (the round's sender process wrote its exit code), so the
+# band is counted and released on the host even when the controller has lost its connection; the output
+# (QDISC_STATS, LOSS_STATS, POLICE_STATS, CLEARED) goes to the deadman's log for the controller to read later
+p.add_argument('--done',default='')   # the band's queue: 100 ms shapes; a few ms behaves like a policer (drops once the bucket is empty)
 # --police: a token-bucket policer (tc police on the band's filter: --rate, bucket --burst, drops what
 # exceeds, no queue) in front of a line of --line kbit (the band's TBF, its --queue-ms queue)
 p.add_argument('--police',action='store_true');p.add_argument('--line',type=int,default=40000)
@@ -79,6 +83,9 @@ def clear():
     s=json.loads(state.read_text());b=s['band'];r=load()
     ent=r['bands'].get(str(b))
     if not ent or ent['port']!=a.port or ent['peer']!=a.peer:raise RuntimeError('ownership mismatch')
+    # the band's TBF counters (bytes the round sent through its shaper), read before the band goes
+    qd=[x for x in json.loads(tc('-s','-j','qdisc','show','dev',a.dev)) if x.get('handle')==f'{0x6b0+b:x}:']
+    if qd:print('QDISC_STATS '+json.dumps({k:qd[0].get(k) for k in ('bytes','packets','drops','overlimits')}),flush=True)
     if ent.get('loss'):
         st={}
         for d,par in (('fwd','6a0:'),('rev','ffff:')):
@@ -103,4 +110,10 @@ def clear():
 if a.action=='setup':locked(setup)
 elif a.action=='clear':locked(clear)
 else:
-    time.sleep(a.hold);locked(clear)
+    # exit as soon as the round clears its band: an hour of idle deadmen per round
+    # filled a 1 GB sender (OOM, 2026-10-24)
+    end=time.time()+a.hold;done=pathlib.Path(a.done) if a.done else None
+    while time.time()<end and state.exists():
+        if done and done.exists():time.sleep(2);break
+        time.sleep(2 if done else 5)
+    locked(clear)

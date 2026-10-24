@@ -122,7 +122,7 @@ def run(argv):
     meta = dict(tag=tag, server=snd, client=rcv, variant=variant, revision=manifest['revision'], loss_pct=loss, extra_delay_ms=delay,
                 conc=conc, duration_s=dur, rate_kbps=rate, seed=seed, port=port, valid=False)
     state = f'{RS}/mtc-state-{tag}.json'
-    tcbase = f'python3 {RS}/multi_tc.py'
+    tcbase = f'python3 {RS}/multi_tc.py'; dlog = f'{RS}/logs/{tag}.deadman'
     tcargs = (f" --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --state {state} --hold {dur + 400}"
               + (f' --loss {loss}' if loss else '') + (f' --delay {delay}' if delay else ''))
     scripts = []; started = False
@@ -149,7 +149,7 @@ def run(argv):
         started = True
         out = R.ssh(S, tcbase + ' setup' + tcargs).stdout.decode()
         meta['tc_band'] = int(out.split('band')[-1].split()[0])
-        R.ssh(S, f'nohup {tcbase} deadman{tcargs} </dev/null > {RS}/deadman_{port}.log 2>&1 &')
+        R.ssh(S, f'nohup {tcbase} deadman{tcargs} --done {RS}/logs/{tag}.srv.rc </dev/null > {dlog} 2>&1 &')
         R.save_meta(RES / f'{tag}.json', meta); R.event('churn_start', tag=tag, variant=variant, loss=loss, delay=delay, conc=conc, port=port)
         launch(S, RS, 'server')
         srv = f'{RS}/logs/{tag}.srv'
@@ -160,6 +160,7 @@ def run(argv):
         else:
             raise RuntimeError('server not ready')
         launch(C, RC, 'client')
+        R.be_patient(dur + R.PATIENCE)   # from here the round runs on the hosts without us
         deadline = time.monotonic() + dur + 240; rc = {}
         time.sleep(min(dur, 60))
         while time.monotonic() < deadline:
@@ -194,7 +195,7 @@ def run(argv):
             except Exception as e: meta.setdefault('errors', []).append('owned stop ' + str(e)); meta['valid'] = False
         if started:
             try:
-                out = R.ssh(S, tcbase + ' clear' + tcargs).stdout.decode()
+                out = R.tc_finish(S, tcbase, tcargs, dlog)
                 m = re.search(r'LOSS_STATS fwd_pkts (\d+) fwd_drop (\d+) rev_pkts (\d+) rev_drop (\d+)', out)
                 if m:
                     fp, fd, rp, rdp = map(int, m.groups())

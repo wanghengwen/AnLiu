@@ -80,9 +80,23 @@ def one(j, k, attempt):
     return ok
 
 
+def wait_hosts(names):
+    """until we reach every host: a round runs on the hosts once started and waits out a lost
+    connection on our side, but an outage at its start should not use up an attempt"""
+    hosts = H.load()
+    for n in names:
+        while True:
+            try:
+                if subprocess.run(['ssh', '-x', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', hosts[n]['ssh'], 'true'],
+                                  capture_output=True, timeout=40).returncode == 0: break
+            except subprocess.TimeoutExpired: pass
+            time.sleep(60)
+
+
 def run_group(g):
     # the whole group again when any member failed: a lone retry is no longer a same-time pair
     for attempt in (1, 2):
+        wait_hosts(sorted({j[r] for _, j in g for r in ('snd', 'rcv')}))
         res = {}; ts = []
         for k, j in g:
             t = threading.Thread(target=lambda j=j, k=k: res.__setitem__(k, one(j, k, attempt))); t.start(); ts.append(t); time.sleep(3)
