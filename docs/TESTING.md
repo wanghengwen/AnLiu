@@ -41,6 +41,8 @@
 
 **第三步：实网成对对照，可以并行。**
 
+执行步骤、主机布局、批次脚本（`tools/realnet/regress/`）、清理和常见问题，见 [testcases/03-realnet.md](testcases/03-realnet.md) 的"完整回归的执行流程"。
+
 | 用例 | 内容 | 默认回归 |
 |---|---|---|
 | RN-02 | 低 RTT 路径加 tc 时延 +100 / +200 ms，关闭 FEC，媒体 | 做 |

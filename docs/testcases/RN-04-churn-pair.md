@@ -5,7 +5,7 @@ kind: agent
 where: 中 RTT 广域网（t1→rb、rb→t1；曾用 g5→rb）
 automation: tools/realnet/churn_round.py run 跑轮次，churn_ana.py 汇总，判定按本文
 duration: 约 1 小时（每轮 600 s，两条路径 × 两个版本同时运行）
-last_run: 2026-10-08 通过（3353b9d 对 44a963c，t1→rb 与 rb→t1，16 轮全部有效；约 32.4 万次打开、32.8 万次关闭全部确认，被拒绝 0，完整性错误 0，无 DEAD；关闭确认 p99 两版相同）
+last_run: 2026-10-24 通过（1b38b6f 对 707d9fe，g5⇄n2 与 lsj⇄n1 约 150 ms，16 轮全部有效；31.1 万次打开、31.6 万次关闭全部确认，被拒绝 0，完整性错误 0，无 DEAD；打开数 99.3–100.8%，关闭确认 p99 逐对在限值内）
 ---
 
 # RN-04 流的打开与关闭（churn）

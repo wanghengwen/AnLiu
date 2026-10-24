@@ -29,18 +29,26 @@ R=~/workspace/AnLiu_github/tools/realnet
 
 用例按路径的类别写，执行时从表中选择当时可达、而且出口容量够用的主机：
 
-| 类别 | RTT | 用途 | 例（主机表中的名字） |
+| 类别 | RTT | 用途 | 例（主机表中的名字，2026-10-24） |
 |---|---|---|---|
-| 低 RTT | ≈1 ms | 加 tc 时延做受控时延（RN-02） | t1→g5、g5→t1（曾用 zjg→t1，zjg 已于 2026-10-09 下线） |
+| 低 RTT | ≈1 ms | 加 tc 时延做受控时延（RN-02、RN-06），瓶颈闭环（RN-05） | g5→lsj、lsj→g5、t1→lsj（t1、g5、lsj 在同一机房） |
 | 内网 | <1 ms | 约 90 Mbit，做瓶颈与闭环（RN-05） | F→G（G 为 macOS 客户端；F 只能被 G 访问） |
-| 中 RTT 广域网 | ≈99 ms | RN-03、RN-04 | rb→t1、t1→rb、g5→rb |
-| 长 RTT 广域网 | ≈167 ms | RN-03 | g5→hz |
+| 中 RTT 广域网 | ≈150 ms | RN-03、RN-06、RN-04 | s_ld→t1；RN-04 用 g5⇄n2、lsj⇄n1（n1、n2 只做客户端） |
+| 长 RTT 广域网 | ≈185 ms | RN-03、RN-06 | t1→hz |
 
-注意以下几点：
+各主机的限制：
 
-- hz 不能整形，只能做接收端；
-- F 在内网里，公网上的主机连不到它，因此 F 只能和 G 配对；
-- G 在 NAT 之后，churn 用 G 做客户端时，tc 过滤器匹配不到它的数据报（`churn_round.py` 会判为无效）。
+| 主机 | 出口 | 限制 |
+|---|---|---|
+| t1 | 约 30 Mbit 令牌桶 | 1 核、960 MB 内存；运行着维护者的服务（npf、postgres），UDP 9910 / 9911 / 9920 已占用，只接受 99xx 的 UDP |
+| g5 | 约 10 Mbit 令牌桶 | 1 核、960 MB；npf 占用 UDP 9910 / 9911 / 9920 |
+| lsj | 约 11.6 Mbit，桶约 1.2 MB | 1 核、960 MB；和 n1 之间双向都不通 ICMP（`cmp_round.py` 要 ping，lsj→n1 不能跑媒体轮次，churn 可以） |
+| s_ld | 至少 8 Mbit | 1 核、960 MB；不回 ICMP（ping 只能从 s_ld 发出） |
+| hz | — | 不能整形，只能做接收端 |
+| n1、n2 | — | 借用的生产主机：防火墙只放行 TCP 22 / 80 / 443 和 UDP 9910 / 9911 / 9920（被服务占用），因此只能做接收端或 churn 客户端。主机表的 `base` 写 `../../tmp`，部署在 `/tmp/anliu-realnet`；用完必须清理，见"借用主机的部署与清理" |
+| F、G | 约 90 Mbit | F 只能和 G 配对；G 在 NAT 之后，churn 用 G 做客户端时 tc 过滤器匹配不到它的数据报 |
+
+已下线：zjg（2026-10-09）、rb（2026-10-24）。
 
 执行前测一次 RTT：
 
@@ -107,14 +115,21 @@ python3 $R/churn_round.py deploy ccand HEAD --tools-from-rev <主机...>
 
 ## 批次脚本的写法
 
-参考以往批次（`anliu-realnet-work/*/batch.sh`）：
+用 [tools/realnet/regress/lib.sh](../../tools/realnet/regress/lib.sh) 里的函数写批次脚本：
+- `pairchain`：RN-02 / RN-06 的一条链；
+- `rn03`：RN-03 的一条链，带 SRT 参考 lane；
+- `rn04`：RN-04 的一条链；
+- `one` / `churn`：单个轮次，带重试，每次尝试前用 `waitnet` 等两端可达。
 
-- 每条"链"串行运行一组轮次，各链之间并行；
-- 各链的端口段不同；
-- 链之间间隔 20 s 启动；
-- 同一条链内，种子为奇数和偶数时交换两个版本 lane 的顺序（端口随之交换）；
-- 输出写到 `lane.log`，最后打印 `ALLDONE`；
-- 在后台运行：`nohup bash batch.sh > lane.log 2>&1 &`。
+[waves.example.sh](../../tools/realnet/regress/waves.example.sh) 是 2026-10-24 那次完整回归的布局，复制到批次目录后按当时的主机修改。规则：
+
+- **每个发送端同时只跑一条链**，各发送端的链并行。不要把所有链都压在一台主机上：2026-10-24 第一版布局把 4 条链和 RN-05 都放在 t1（约 15 Mbit、12 个 lane），带宽与 CPU 都会干扰测量，t1 还因内存耗尽卡住约 2.5 分钟，该批作废重跑。
+- 各链的端口段不同；链之间间隔约 45 s 启动。
+- 同一条链内，种子为奇数和偶数时交换两个版本 lane 的顺序（端口随之交换）。
+- 每条链写自己的 `chain-*.log`，一批结束时打印 `WAVE*_DONE`。下一批用 `until grep -q WAVEA_DONE waveA.log` 等前一批结束，或者像示例那样写在同一个脚本里。
+- 在后台运行：`nohup bash waveA.sh > waveA.log 2>&1 &`。
+- 正在运行的 bash 脚本不要修改：bash 边执行边读文件，已经 `source` 的函数也不会更新。要改就先停掉，再重新启动。
+- 测试工具（`tools/realnet/*.py`）每轮重新加载。批次运行中修改工具，会影响此后启动的所有轮次；先在副本上测好（见"修改工具后的验证"）再放回。
 
 ## 分析
 
@@ -122,6 +137,7 @@ python3 $R/churn_round.py deploy ccand HEAD --tools-from-rev <主机...>
 |---|---|
 | 每轮每个 lane 的明细 | `python3 $R/srt/cmp_ana.py` |
 | 两个 AnLiu lane 的成对差值与限值判定 | `cd $R/srt && python3 cmp_pair.py anl-nf anl-nf@cand --limits` |
+| 同上，自动 FEC（RN-06） | `cd $R/srt && python3 cmp_pair.py anl anl@cand --limits` |
 | 流的开关 | `cd $R && python3 churn_ana.py` |
 | `multi_round.py` 的轮次 | `results/*.json` 的 `metrics` |
 | 两个 `multi_round.py` lane 的成对差值 | `cd $R && python3 multi_pair.py base+nf cand+nf`：tc 和 TBF 之外的丢包超过发送数 2% 的轮次判为 SKIP |
@@ -142,3 +158,86 @@ pgrep -fa 'realnet_trace|srtnet|bench/churn'   # 没有本批次留下的进程
 ```
 
 工作目录中的 `events.jsonl` 含有地址，留在仓库之外，不要复制进仓库。
+
+## 完整回归的执行流程
+
+2026-10-24 那次完整回归（RN-01 .. RN-06，约 5 小时）的实际步骤。下次照着做，按当时可用的主机调整。
+
+1. **单机部分先通过**（[../TESTING.md](../TESTING.md) 的"版本回归"第一步）。候选必须是一个提交。
+2. **建批次目录**：`~/workspace/anliu-realnet-work/reg-<日期>/`。
+   - 从上一批复制 `hosts-batch.json`（主机表）和 `rn05.jsonl`（RN-05 的 16 个任务）。
+   - 先确认每台主机都能 ssh 登录，下线的主机从表中去掉。
+3. **测出口容量**：每个发送端测一次（见"出口容量"一节），结果写进批次目录的 `capacity.txt`。按"容量 − 5 Mbit"核对布局：
+   - 每个 lane 约 1.1 Mbit（自动 FEC 约 1.3–1.5 Mbit）；
+   - churn 每轮每个方向约 2.3 Mbit；
+   - RN-05 每个 lane 最多 2 Mbit。
+4. **部署**（RN-01）：`deploy.py base|cand` 和 `churn_round.py deploy cbase|ccand`，都加 `--tools-from-rev`。另外用 `srt/deploy_srt.py <srtnet>` 部署 srtnet。
+   - 本批次用到的每台主机都要部署，包括只做接收端的主机。
+   - 每台主机一行 `ok <哈希>`，两个版本在所有主机上的哈希必须一致。
+5. **冒烟**（RN-01，120 s）：一条低 RTT、一条广域网媒体轮次，加一个 churn 轮次。冒烟结果放进批次目录的 `smoke/`，不参与对比。
+6. **写批次脚本并在后台运行**：见"批次脚本的写法"。2026-10-24 用了三批：
+   - A：RN-02 + RN-03，约 80 分钟；
+   - B：RN-06，约 80 分钟；
+   - C：RN-05 + RN-04，约 90 分钟。
+7. **运行中每 30 分钟检查一次**：
+   - `chain-*.log` 中非 `True` 的行，以及 `sched-*/sched.log` 中的 `ok=False`；
+   - 每个发送端的可用内存（`free -m`）；
+   - deadman 进程数（`pgrep -fc '[m]ulti_tc.py deadman'`），应当等于该主机上正在运行的频段数，不应积压。
+8. **分析**：见"分析"一节。
+   - `cmp_pair.py ... --limits` 要输出 `LIMITS OK`。
+   - RN-04 按 RN-04-churn-pair.md 的规则逐对检查打开数与 p99。
+   - 检查所有 `.srv` / `.cli` 中没有 `DEAD` 行。
+   - 某一对差异明显、但仍在规则内的，先用 TRACE（`srtt`、`target`）和两端的数据报计数，分清是路径问题还是版本问题；需要时在该场景加种子再跑。
+9. **与上一次回归对比**：
+   - 成对差值：对比上一批的 `cmp_pair.py` / `multi_pair.py` / `churn_ana.py` 输出，以及 PROGRESS.md 中的记录。
+   - 同类场景的绝对值：对比两批的 `cmp_ana.py` 汇总表。
+   - 同一路径绝对值变差时，先核对端到端丢包和 RTT：路径本身可能多丢包。2026-10-24 的 t1→hz 就多丢了 0.3–2.2 个百分点，RTT 也高了 2–16 ms。
+10. **清理**：见"清理"与"借用主机的部署与清理"。每台主机都要查 tc、进程和 deadman 状态文件。
+11. **报告与记录**：
+    - 中文报告，表格列为"编号 / 结果 / 实测值 / 证据"。
+    - 更新各 `RN-*.md` 的 `last_run`。
+    - PROGRESS.md 只写"做了版本回归"和测试总结。
+
+## 借用主机的部署与清理
+
+维护者临时借给测试的主机（2026-10-24 的 n1、n2）：
+
+- 部署到 `/tmp`：主机表的 `base` 写 `../../tmp`（工具在 `$HOME/<base>/anliu-realnet` 下工作）。
+- 不修改它们的防火墙，只用作接收端或客户端。
+- 需要装编译器时，装之前先保存包列表：`dpkg-query -W -f='${Package}\n' | sort > /tmp/anl-pkgs-before.txt`。装完再存一份 after，两者之差写进 `/tmp/anl-pkgs-new.txt`，本地也留一份。
+- 测试结束后：
+  1. 先模拟卸载（`apt-get -s purge $(cat /tmp/anl-pkgs-new.txt)`），确认要删的包正好是清单里的，不会连带删掉别的包；
+  2. 再执行卸载，然后核对包列表与 before 完全相同；
+  3. 删除 `/tmp/anliu-realnet`、`/tmp/anl-*`、`~/.anliu-multi-tc.*`；
+  4. 确认 tc 是原来的根队列，没有 ingress 过滤器，也没有残留进程。
+
+## 修改工具后的验证
+
+修改 `tools/realnet/` 下影响轮次流程的代码（启动、收尾、tc）后，先在副本上测，再放回仓库：
+
+- 把 `tools/realnet` 复制到 scratch 目录，另建一个工作目录：把 `base`、`cand` 等变体目录用符号链接接进来，`results/` 用空目录。
+- 跑一个 `--dur 120` 的短轮次，选一个不影响正在运行批次的发送端，或者负载在预算内的发送端。
+- **模拟本机断网**：只切断测试进程，不影响正在运行的批次。
+  ```sh
+  sudo groupadd anltest
+  sudo -g anltest -u $USER env HOME="$HOME" PATH=/usr/local/bin:/usr/bin:/bin ANL_REALNET_HOSTS=... ANL_REALNET_WORK=<副本工作目录> python3 <副本>/srt/cmp_round.py ...
+  # 客户端启动后：
+  sudo iptables -I OUTPUT -m owner --gid-owner anltest -d <发送端 ip> -j DROP   # 接收端同样处理
+  # 断开时间要覆盖整个收尾阶段（≥ 4 分钟）；期间从自己的 shell 查看发送端的 deadman 日志和 tc；然后：
+  sudo iptables -D OUTPUT -m owner --gid-owner anltest -d <发送端 ip> -j DROP
+  sudo groupdel anltest
+  ```
+- 断网期间应当看到：远端进程按时结束，deadman 日志里有 `QDISC_STATS`、`LOSS_STATS`、`CLEARED`，频段已清除。连接恢复后，这一轮应当判为有效（`True`）。
+- `cmp_round.py` 用的端口段不能和正在运行的批次相同：它的 ssh 主连接按端口段区分，端口段相同时测试进程会复用批次的连接，iptables 切不断它。
+
+## 常见问题
+
+- **`pkill -f` / `pgrep -f` 会匹配到执行它的 shell 自己**（命令行里含有同样的字符串），远端 `ssh host 'pkill -f ...'` 也一样，结果是把自己的 shell 杀掉。解决办法：
+  - 把命令写进脚本文件，用 `ssh host 'bash -s' < script.sh` 执行；
+  - 或者模式里写 `[r]ealnet_trace` 这样的字符类；
+  - 或者先用 `pgrep` 取 pid，再用 `kill` 逐个杀。
+- **1 核、960 MB 的主机**（t1、g5、lsj、s_ld）内存余量只有 400–650 MB。2026-10-24 曾因每轮留下一个约 55 分钟的 deadman（每个 10–14 MB）把 t1 的内存耗尽，OOM 杀掉了维护者的 postgres。工具已经改为本轮结束即退出；运行中仍要看 deadman 数和 `free -m`。
+- **t1 上维护者的 postgres 被 OOM 打断后，会卡在关闭阶段**（`systemctl` 显示 `deactivating`）。经维护者同意后，用 `pg_ctl -D /var/lib/postgresql/16/main stop -m immediate` 停掉，systemd 会把它启动起来，启动时重放 WAL。
+- **残留的 tc 频段会干扰后续轮次**：例如一轮在 setup 之后、deadman 启动之前中断，就会留下一个频段，它的过滤器优先于后来同一端口、同一对端的轮次。中断一批之后，在每个发送端查看 `~/.anliu-multi-tc.json`。每个残留频段都用它自己 deadman 的参数执行一次 `multi_tc.py clear`，再停掉 deadman。
+- **广域网路径在晚间可能自身丢包**（端到端丢包高于 tc 设定）。超出设定 2 个点以上的轮次由 `cmp_pair.py` 自动跳过；两个版本同时运行，受到的影响相同。
+- **`cmp_round.py` 需要两端之间至少一个方向能 ping 通**，用来量 RTT；都不通时报 `no ping`。

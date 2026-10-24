@@ -5,7 +5,7 @@ kind: agent
 where: 中 RTT（rb→t1 或 g5→rb，约 99 ms）与长 RTT（g5→hz，约 167 ms）
 automation: cmp_round.py 跑轮次；判定用 cmp_pair.py --limits 加本文规则
 duration: 约 1.5 小时（两条链并行，每条 7 轮）
-last_run: 2026-10-08 通过（3353b9d 对 44a963c，rb→t1 约 99 ms 与 g5→hz 约 170 ms，14 对；音频 +0.24、视频 −0.07、可解码 +0.01、关键帧 −0.37 个百分点，线上带宽 +0.26%；有丢包的场景中候选的可解码视频与关键帧都高于 srt-b）
+last_run: 2026-10-24 通过（1b38b6f 对 707d9fe，s_ld→t1 约 149 ms 与 t1→hz 约 185 ms，与 RN-02 合计 26 对，`LIMITS OK`；t1→hz 7% / 10% 两轮因路径自身多丢超过 2 个点被跳过；有丢包的场景中两版的可解码视频都不低于 srt-b）
 ---
 
 # RN-03 广域网路径的媒体（关闭 FEC）

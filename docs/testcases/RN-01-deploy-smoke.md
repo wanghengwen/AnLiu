@@ -5,7 +5,7 @@ kind: agent
 where: 本批次用到的全部主机
 automation: tools/realnet/deploy.py、churn_round.py deploy、cmp_round.py（--dur 120）
 duration: 10 分钟
-last_run: 2026-10-08 通过（候选 3353b9d 对基线 44a963c；g5→t1 5% 两个 lane 端到端丢包 4.8%；出口实测 g5 约 10、t1 约 14、rb 约 16 Mbit）
+last_run: 2026-10-24 通过（候选 1b38b6f 对基线 707d9fe；同机房与约 150 ms 广域网 5% 丢包两个 lane 完整，端到端丢包 4.8–5.3%；churn 4096 次打开全部确认；出口 16 Mbit 无丢包）
 ---
 
 # RN-01 部署与冒烟
