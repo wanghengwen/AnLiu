@@ -52,7 +52,7 @@ static void trace_fec_block(const anl_t *w, const anl_stream_t *st, uint32_t k, 
     tag = fec_diag_tag(st);
     g_fec_diag.blocks[tag]++;
     g_fec_diag.data[tag] += k; g_fec_diag.parities[tag] += m;
-    g_fec_diag.floor_blocks[tag] += st->fec_auto && m > (k * (uint32_t)st->fec_ratio + 50) / 100;
+    g_fec_diag.floor_blocks[tag] += ST_ON(st->fc->tx_f, FCT_AUTO) && m > (k * (uint32_t)st->fc->fec_ratio + 50) / 100;
 }
 
 static void fec_diag_output(const anl_t *w, uint32_t bytes)

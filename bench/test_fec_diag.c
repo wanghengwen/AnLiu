@@ -84,7 +84,7 @@ static void run_exact_cost(void)
     anl_config c; anl_t *w; anl_seg *s; uint8_t parity[200] = {0}; int kind;
     anl_config_default(&c, ANL_ROLE_CLIENT); c.pad_max = 0;
     w = anl_create(1, &c, NULL); anl_setoutput(w, review_sink);
-    w->dflt->peer_opened = 1;
+    w->dflt->state = ANL_STREAM_OPEN;
     s = seg_new(w, 100); memset(s->data, 42, 100);
     for (kind = 0; kind < 5; kind++) {
         memset(&g_fec_diag, 0, sizeof(g_fec_diag));

@@ -30,7 +30,7 @@ static void tx_diag_observe(tx_diag *d, const anl_t *w)
 {
     uint32_t mask = 0;
     int queued, sendable;
-    if (!d->enabled || !w || !w->updated || (d->owner && d->owner != w)) return;
+    if (!d->enabled || !w || w->life == ANL_LIFE_NEW || (d->owner && d->owner != w)) return;
     if (d->seen) {
         int32_t dt = tdiff(w->current, d->last);
         if (dt > 0) {

@@ -79,13 +79,13 @@ static void drain(anl_t *w)
 /* what no peer may break, whatever it sends */
 static void check_invariants(const anl_t *w)
 {
-    uint32_t i;
-    if (sget(w, ANL_SID_DEFAULT) != w->dflt || w->dflt->state != ANL_STREAM_OPEN) {
+    const anl_node *n;
+    if (sget(w, ANL_SID_DEFAULT) != w->dflt || w->dflt->state == ANL_STREAM_CLOSED) {
         fprintf(stderr, "invariant: the default stream is gone\n");
         abort();
     }
-    for (i = 0; i < w->nstab; i++) {
-        const anl_stream *st = w->stab[i];
+    for (n = w->slist.next; n != &w->slist; n = n->next) {
+        const anl_stream *st = STREAM_OF(n);
         if (st->nrcv_buf > st->rcv_wnd || st->nrcv_que > st->rcv_wnd) {
             fprintf(stderr, "invariant: sid %d holds %u + %u segments, window %u\n",
                     st->sid, st->nrcv_buf, st->nrcv_que, st->rcv_wnd);

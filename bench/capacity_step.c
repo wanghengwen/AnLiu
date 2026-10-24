@@ -68,7 +68,7 @@ int main(int argc, char **argv)
             }
             printf("FAIL dead t=%llu sender=%d receiver=%d lt=%d rate=%u pace=%u hold=%u"
                    " max_xmit=%u sn=%u last_rtx=%u\n", (unsigned long long)s.t,
-                   w->state, s.e[1].anl->state, w->lt.state, w->lt.rate, w->pace_rate,
+                   anl_state(w), anl_state(s.e[1].anl), w->lt.state, w->lt.rate, w->pace_rate,
                    w->lt.hold, most ? most->xmit : 0, most ? most->sn : 0,
                    most ? (unsigned)most->rack_rtx : 0);
             sim_finish(&s, &result, s.t / 1000.0);

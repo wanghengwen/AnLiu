@@ -51,12 +51,15 @@ static int g_lt_trace = -1;
     if (g_lt_trace < 0) g_lt_trace = getenv("MEDIA_LOSS_LT") != NULL; \
     if (g_lt_trace && !(after) && (w)->sent_wire > 0 && (rate) > 20000) \
         printf("LTINT ms=%u lt=%d from=%u k=%u tail=%u bad=%d hold=%u rate=%u send=%u lt_rate=%u loss=%u counted=%u res=%u pace=%u st=%d btl=%u\n", \
-               (w)->current, (w)->lt.state, (w)->lt.from, (w)->lt.k, (w)->lt.tail, (w)->lt.bad, (w)->lt.hold, (rate), \
+               (w)->current, (w)->lt.state, (w)->lt.from, (w)->lt.k, ST_ON((w)->lt.f, LT_F_TAIL), (w)->lt.bad, (w)->lt.hold, (rate), \
                (unsigned)((uint64_t)(uint32_t)((w)->sent_wire - (w)->lt.sent0) * 1000 / (dur)), (w)->lt.rate, (loss), (counted), \
                (w)->lt.res, (w)->pace_rate, (w)->bbr_state, (w)->btl_bw); \
 } while (0)
 #include "anl_trace.h"
 #include "../anliu.c"
+/* the FEC state of a stream that may run without FEC (MEDIA_LOSS_FEC_OFF) */
+#define ML_FC(st, f)  ((st)->fc ? (st)->fc->f : 0)
+#define ML_GATE(st)   ((st)->fc && ST_ON((st)->fc->tx_f, FCT_GATE))
 #include "gcc_model.h"
 static gcc_t g_gcc;
 #define SIM_SEND_HOOK(s, from, len, at, lost) do { if ((from) == 0) gcc_on_packet(&g_gcc, (double)(s)->t, (at), (len) + IPUDP_HDR, (lost)); } while (0)
@@ -112,7 +115,7 @@ static void loss_block(const anl_t *w, const anl_stream_t *st, uint32_t k, uint3
     blocks[id]++; block_data[id] += k; block_parities[id] += m;
     small_blocks[id] += k * lmax <= FEC_SMALL_BLOCK;
     if (getenv("MEDIA_LOSS_BLOCKS"))
-        printf("BLOCK ms=%u id=%d k=%u m=%u lmax=%u key=%d frame_avg=%u\n", w->current, id, k, m, lmax, key, st->fec_frame_avg);
+        printf("BLOCK ms=%u id=%d k=%u m=%u lmax=%u key=%d frame_avg=%u\n", w->current, id, k, m, lmax, key, st->fc->fec_frame_avg);
 }
 static unsigned rtx_why[2][4], rtx_cov[2][4], dup_rx[2], dup_why[2][4];
 static unsigned char last_why[2][65536];
@@ -264,7 +267,7 @@ int main(int argc, char **argv)
             if (drive_check) drv_rearm(&s, 1 - k, now32(&s));
         }
         if (s.t < (uint64_t)duration * 1000) {
-            scale_sum += scale; gate_ms += s.e[0].h[1]->fec_gate; short_ms += s.e[0].anl->rate.capacity_short;
+            scale_sum += scale; gate_ms += ML_GATE(s.e[0].h[1]); short_ms += ST_ON(s.e[0].anl->rate.f, CS_F_SHORT);
             for (i = 0; i < 2; i++) if (s.t >= f[i].next_t && !(i == 1 && audio_only)) {
                 int key = i && f[i].seq % 30 == 0;
                 int len = loss_size(&f[i], key, seed);
@@ -308,7 +311,7 @@ int main(int argc, char **argv)
             printf("BUDGET ms=%llu srtt=%d rmin=%u bw=%u pace=%u target=%u par_rate=%u tokens=%lld pay=%u delivered=%u offered=%u unsent=%u short=%d gate=%d audio_par=%llu video_par=%llu video_retry=%llu wire=%llu drops=%llu\n",
                 (unsigned long long)s.t,w->rx_srtt,umin32(w->rate.rtt_min,w->rate.rtt_old),bbr_bw(w),w->pace_rate,
                 w->rate.target,w->par_rate,(long long)w->par_tokens,w->rate.pay_avg,w->rate.dlv_avg,w->rate.off_avg,w->rate.unsent_avg,
-                w->rate.capacity_short,s.e[0].h[1]->fec_gate,(unsigned long long)parity_bytes[0],
+                ST_ON(w->rate.f, CS_F_SHORT),ML_GATE(s.e[0].h[1]),(unsigned long long)parity_bytes[0],
                 (unsigned long long)parity_bytes[1],(unsigned long long)retry_bytes[1],
                 (unsigned long long)(s.d[0].bytes+s.d[0].pkts*IPUDP_HDR),(unsigned long long)s.d[0].lost_queue);
             printf("STATE ms=%llu rto=%d cwnd=%u inflight_bytes=%llu pace_tokens=%lld cs_test=%u cs_recover=%u audio_queued=%u video_queued=%u audio_pending=%u video_pending=%u\n",
@@ -320,16 +323,16 @@ int main(int argc, char **argv)
             {
                 const anl_stream *a = s.e[0].h[0], *b = s.e[1].h[0];
                 printf("AUDIOSTATE ms=%llu remote_wnd=%u fwd_pending=%d fwd_ts=%u fwd_rto=%u peer_open=%d recv_nxt=%u recv_buf=%u recv_queue=%u block_since=%u gate=%d\n",
-                    (unsigned long long)s.t,a->rmt_wnd,a->fwd_pending,a->fwd_ts,a->fwd_rto,b!=NULL,
-                    b?b->rcv_nxt:0,b?b->nrcv_buf:0,b?b->nrcv_que:0,b?b->block_since:0,a->fec_gate);
+                    (unsigned long long)s.t,a->rmt_wnd,ST_ON(a->out, STO_FWD),a->sm->fwd_ts,a->sm->fwd_rto,b!=NULL,
+                    b?b->rcv_nxt:0,b?b->nrcv_buf:0,b?b->nrcv_que:0,b?b->sm->block_since:0,ML_GATE(a));
             }
         }
         if (s.t % 10000 == 0 && s.t <= (uint64_t)duration * 1000) {
             anl_t *w = s.e[0].anl; anl_stream *v = s.e[0].h[1];
             printf("SAMPLE ms=%llu ratio=%d/%d srtt=%d loss=%u gate=%d need=%u key_need=%u scale=%d short=%d parity_video=%llu\n",
-                (unsigned long long)s.t, s.e[0].h[0]->fec_ratio, v->fec_ratio, w->rx_srtt, w->fec_loss, v->fec_gate,
-                fec_repair_ms(w, v, v->fec_frame_avg, 0, 0), fec_repair_ms(w, v, v->fec_key_bytes, 1, 0), scale,
-                w->rate.capacity_short, (unsigned long long)parity_bytes[1]);
+                (unsigned long long)s.t, ML_FC(s.e[0].h[0], fec_ratio), ML_FC(v, fec_ratio), w->rx_srtt, w->fec_loss, ML_GATE(v),
+                v->fc ? fec_repair_ms(w, v, v->fc->fec_frame_avg, 0, 0) : 0u, v->fc ? fec_repair_ms(w, v, v->fc->fec_key_bytes, 1, 0) : 0u, scale,
+                ST_ON(w->rate.f, CS_F_SHORT), (unsigned long long)parity_bytes[1]);
         }
     }
     for (i = 0; i < 2; i++) {

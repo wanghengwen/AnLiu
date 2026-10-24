@@ -10,6 +10,17 @@
 
 ---
 
+## 2026-10-24
+
+- 连接与流的内存（`anliu.c`）。新连接（MTU 1400，只有默认流）12376 → 5152 字节：
+  - `anl_t` 5824 → 2064 字节：sid 保留表（2560 字节）和待发 RST 队列（512）改为用到时分配，空了即释放；流指针表（512）去掉，按 sid 查找改为遍历流链表；内置 PRNG 的种子只在 `anl_create` 时现算，不再常驻（32）；布尔标志按处理逻辑合并成位字（`in_f` / `out_f` / `bbr_f` / `lt.f` / `rate.f`），`updated` 与 `state` 合并为生命周期枚举 `life`（NEW / LIVE / DEAD），`acked_sent_valid`、`rx_pn_valid`、`burst_open` 与已有字段恒等而去掉，枚举和小计数器改为 1 字节，字段重排消掉对齐空洞。防重放窗口 `PN_WIN` 保持 4096 个包号（512 字节）。
+  - 收发缓冲 4 × MTU → 2 × MTU：数据报缓冲在 flush 之外为空、解析期间不写（运行时计数与 GCC 调用图都确认过），`anl_input` 直接解密到它，接收缓冲去掉；ACK 的 SACK 区间在线上字节里原地读取，不再解码到数组，临时区只需 1 个 MTU。顺带去掉了一个上限：此前一个 ACK 超过 MTU/4 个区间（MTU 1400 时 350 个）整个数据报按格式错误丢弃，合法的 ACK 最多可有约 680 个。
+  - 每流 952 → 288 字节：半可靠状态（56 字节）只给半可靠流分配；时延测量（100）在第一次收到数据时、对端报告（52）在第一次收到报告时分配，只发或只收的流少一半，空闲流都没有。流的标志合并为 `cfg` / `out` / `trk` 三个位字；`state` 吸收 `peer_opened`，存储的就是公开的 OPENING / OPEN / CLOSED；`probe_ask` 改为局部变量，`delivered_any` 以 `last_delivered` 初值 0xffffffff 代替。
+  - FEC（DESIGN 8.7）：流的 FEC 字段移到 `stream_fec`（160 字节），FEC 第一次打开时分配，从未打开过的流没有；其中的布尔标志合并为 `tx_f` / `rx_f` 两个位字，`fec_tx_held` / `fec_rx_held` 与"数组已分配"恒等而去掉，`fec_start_state` 取 `FEC_START_*` 常量。编码数组（1280 字节）与接收缓存原先在流打开时就分配、一直留着，两端各约 5.6 KB；现在编码数组在第一个要收集的块时、接收缓存在第一个要缓存的数据或校验包时分配，缓冲释放时数组一起释放。接收缓存的项不再嵌套 `fec_buf`（嵌套时按指针对齐补齐），缓冲长度改为 16 位，分片项 24 → 16 字节、校验包项 40 → 24 字节，接收缓存 4352 → 2816 字节。分段结构的 FEC 字段重排、数据改为柔性数组成员，每个分段 144 → 136 字节（另加数据）；`anl_t` 里 FEC 一段的对齐空洞消掉。
+  - 布尔标志的评估：逐个核对写入点后，只有流的生命周期和连接的 `updated` / `state` 是真正的状态机；BBR 状态与 `full_bw_reached`、policer 的 `state` 与各子标志、容量不足的各标志、burst 的两个标志都有枚举表示不了的可达组合，按位保存。policer 的 `lt.state` 与 `lt.from` 改用命名常量（`LT_WATCH` / `LT_TESTING` / `LT_POLICED` / `LT_PROBING`，`LT_FROM_INITIAL` / `LT_FROM_RETEST` / `LT_FROM_RESIDUAL`），值不变。
+- 修复（代码审查发现，在 `707d9fe` 上复现确认）：持 PSK 的对端可以构造校验包，让重建出的段在带 FEC 的可靠流上带帧号，流在解码中途被重置、接收缓存被释放，随后 `fec_drop_block`（丢一个分片）或 `fec_block_decode`（同块丢两个）访问空指针，进程崩溃。现在每交付一个重建段后检查缓存是否还在；回归测试 `test_fec_rebuild_reset`，SECURITY_AUDIT 4.1。
+- 已验证：以改动前的代码（`707d9fe`）为基线，8 个种子的单元测试（新增的 `test_fec_rebuild_reset` 除外）、攻击测试、FEC / 发送统计、`test_media_workload`、`media_loss`、`media_startup`、`anl_bench s1 s2`（0 / 3 / 10% × 20 / 300 ms）输出除内存数字外逐字节相同。Release 与 ASan/UBSan 下 CTest 6/6；`fuzz_peer` 用 gcc 驱动在 ASan/UBSan 下跑 900 万个随机与种子变异输入，无崩溃；FEC 关闭时的 `media_loss` 在 ASan/UBSan 下无错误。
+
 ## 2026-10-11
 
 - 发布候选的实网性能测试（`11e4589`，与合并后的 `e9cc568` 行为一致；[PERFORMANCE.md](PERFORMANCE.md) 重写为这次测试的报告）：6 条路径（RTT 约 1 / 100 / 185 / 275 ms），可靠流 30 轮（不限速与 0.8 / 2 / 5 / 10 Mbps TBF），音视频 276 条通道（自动 FEC 与关闭 FEC 同时运行；无人工丢包 5 档带宽，tc 双向丢包 1 / 2 / 3 / 5 / 10 / 15% × 2 / 5 / 10 Mbps），每轮 600 秒。已验证：
