@@ -4451,7 +4451,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
     uint32_t max_echo = 0;
 
     if (w == NULL || plain == NULL) return ANL_EINVAL;
-    if (size < ANL_HDR_SIZE || (uint32_t)size > w->mtu) return ANL_EFORMAT;
+    if (size < ANL_HDR_SIZE || size > (long)w->mtu) return ANL_EFORMAT;
     memset(&rs, 0, sizeof(rs));
 
     p = plain;
@@ -4705,7 +4705,7 @@ int anl_input(anl_t *w, const char *data, long size)
 {
     int r;
     if (w == NULL || data == NULL) return ANL_EINVAL;
-    if (size < ANL_OVERHEAD || (uint32_t)size > w->mtu) return ANL_EFORMAT;
+    if (size < ANL_OVERHEAD || size > (long)w->mtu) return ANL_EFORMAT;
     /* decrypted into the datagram builder: it is empty outside a flush, and
        parsing writes nothing to it - only the flushes after the parse do,
        when the plaintext has been read */
@@ -6647,7 +6647,8 @@ static int stream_apply_local(anl_t *w, anl_stream *st, const anl_stream_opt *op
         st->sm->max_age_ms = opt->max_age_ms > 0 ? opt->max_age_ms : 0;
         st->sm->max_bytes = opt->max_bytes > 0 ? opt->max_bytes : 0;
         ST_PUT(st->cfg, STC_DROP_KEY, opt->drop_until_key != 0);
-        st->sm->rcv_deadline_ms = opt->rcv_deadline_ms == -1 ? st->sm->max_age_ms * RCV_WAIT_PCT / 100 : opt->rcv_deadline_ms;
+        st->sm->rcv_deadline_ms = opt->rcv_deadline_ms == -1
+                               ? (int)((int64_t)st->sm->max_age_ms * RCV_WAIT_PCT / 100) : opt->rcv_deadline_ms;
         ST_PUT(st->cfg, STC_RCV_DROP_KEY, opt->rcv_drop_until_key != 0);
     }
     /* FEC changes only before anything was segmented (mss depends on it) */
@@ -6781,6 +6782,8 @@ static int frame_peeksize(anl_t *w, anl_stream *st)
     anl_seg *head;
     anl_node *pos;
     uint32_t n, i, length = 0;
+retry:
+    length = 0;
     for (;;) {
         head = qfirst_seg(&st->rcv_queue);
         if (head == NULL) return -1;
@@ -6807,7 +6810,7 @@ static int frame_peeksize(anl_t *w, anl_stream *st)
                 h = qfirst_seg(&st->rcv_queue);
             } while (h && !(h->flags & F_HAS_FRAME));
             st->frames_skipped++;
-            return frame_peeksize(w, st);
+            goto retry;                    /* a full window of broken starts must not consume the stack */
         }
         length += s->len;
     }
@@ -6929,6 +6932,20 @@ static uint32_t seg_limit(const anl_stream *st)
     return st->state == ANL_STREAM_OPENING ? st->mss - OPEN_BODY : st->mss;
 }
 
+/* Commit only after every allocation succeeds: returning ENOMEM must not
+ * leave a partial message / frame queued for the peer. O(1) list splice. */
+static void snd_commit(anl_stream *st, anl_node *pending, uint32_t count, uint32_t bytes)
+{
+    if (!QEMPTY(pending)) {
+        pending->next->prev = st->snd_queue.prev;
+        st->snd_queue.prev->next = pending->next;
+        pending->prev->next = &st->snd_queue;
+        st->snd_queue.prev = pending->prev;
+    }
+    st->nsnd_que += count;
+    st->backlog_bytes += bytes;
+}
+
 /*--------------------------------------------------------------------
  * reliable stream
  *-------------------------------------------------------------------*/
@@ -6936,16 +6953,21 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
 {
     anl_t *w;
     uint32_t count, i, mss;
+    uint32_t bytes = (uint32_t)len;
+    anl_node pending;
+    anl_seg *old = NULL, *replacement = NULL;
     int r;
     if (st == NULL || buf == NULL || len <= 0) return ANL_EINVAL;
     w = st->w;
     r = send_precheck(w, st, ANL_RELIABLE);
     if (r) return r;
+    if (bytes > 0xffffffffu - st->backlog_bytes) return ANL_ETOOBIG;
     mss = seg_limit(st);
+    QINIT(&pending);
 
     /* byte-stream mode: append to the last queued segment (ikcp) */
     if (ST_ON(st->cfg, STC_STREAM)) {
-        anl_seg *old = qlast_seg(&st->snd_queue);
+        old = qlast_seg(&st->snd_queue);
         if (old && old->len < mss) {
             uint32_t ext = umin32((uint32_t)len, mss - old->len);
             anl_seg *seg = seg_new(w, old->len + ext);
@@ -6954,33 +6976,39 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
             memcpy(seg->data + old->len, buf, ext);
             seg->frg = 0;
             seg->ts_enq = w->current;
-            qadd_after(&seg->node, &old->node);
-            qdel(&old->node);
-            seg_free(w, old);
-            st->backlog_bytes += ext;
+            replacement = seg;
             buf += ext;
             len -= (int)ext;
-            if (len <= 0) { if (ST_ON(st->cfg, STC_FLUSH)) anl_flush_internal(w); return ANL_OK; }
         }
     }
 
     count = ((uint32_t)len + mss - 1) / mss;
-    if (!ST_ON(st->cfg, STC_STREAM) && count > st->rcv_wnd) return ANL_ETOOBIG;     /* peer rcv_wnd == ours */
-    if (count > VARINT_MAX) return ANL_ETOOBIG;
+    if ((!ST_ON(st->cfg, STC_STREAM) && count > st->rcv_wnd) || count > VARINT_MAX) {
+        seg_free(w, replacement);
+        return ANL_ETOOBIG;
+    }
 
     for (i = 0; i < count; i++) {
         uint32_t size = umin32((uint32_t)len, mss);
         anl_seg *seg = seg_new(w, size);
-        if (seg == NULL) return ANL_ENOMEM;
+        if (seg == NULL) {
+            free_seg_list(w, &pending);
+            seg_free(w, replacement);
+            return ANL_ENOMEM;
+        }
         memcpy(seg->data, buf, size);
         seg->frg = ST_ON(st->cfg, STC_STREAM) ? 0 : (count - i - 1);
         seg->ts_enq = w->current;
-        qadd_tail(&seg->node, &st->snd_queue);
-        st->nsnd_que++;
-        st->backlog_bytes += size;
+        qadd_tail(&seg->node, &pending);
         buf += size;
         len -= (int)size;
     }
+    if (replacement) {
+        qadd_after(&replacement->node, &old->node);
+        qdel(&old->node);
+        seg_free(w, old);
+    }
+    snd_commit(st, &pending, count, bytes);
     if (ST_ON(st->cfg, STC_FLUSH)) anl_flush_internal(w);
     return ANL_OK;
 }
@@ -7008,46 +7036,54 @@ int anl_stream_send_frame(anl_stream_t *st, int flags, const char *buf, int len,
 {
     anl_t *w;
     uint32_t count, i, fno, mss;
+    uint32_t bytes = (uint32_t)len;
+    anl_node pending;
     int r, key = (flags & ANL_FRAME_KEY) != 0;
     if (st == NULL || buf == NULL || len <= 0) return ANL_EINVAL;
     w = st->w;
     r = send_precheck(w, st, ANL_SEMI);
     if (r) return r;
+    if ((uint32_t)len > 0xffffffffu - st->backlog_bytes) return ANL_ETOOBIG;
     mss = seg_limit(st);
 
     count = ((uint32_t)len + mss - 1) / mss;
     if (count > st->rcv_wnd) return ANL_ETOOBIG;                    /* peer rcv_wnd == ours */
 
-    fno = st->sm->frame_next++;
-    if (frame_no) *frame_no = fno;
-    if (key) {
-        ST_CLR(st->trk, STT_DROPPING);
-    } else if (ST_ON(st->trk, STT_DROPPING)) {
+    fno = st->sm->frame_next;
+    if (!key && ST_ON(st->trk, STT_DROPPING)) {
+        st->sm->frame_next++;
+        if (frame_no) *frame_no = fno;
         st->frames_dropped++;
         return ANL_EDROPPED;
     }
-    /* frame sizes for the FEC gate (DESIGN 8.6) */
-    if (st->fc == NULL) ;
-    else if (key) st->fc->fec_key_bytes = (uint32_t)len;
-    else st->fc->fec_frame_avg = st->fc->fec_frame_avg == 0 ? (uint32_t)len
-                           : (uint32_t)((int32_t)st->fc->fec_frame_avg + ((int32_t)len - (int32_t)st->fc->fec_frame_avg) / 8);
-
+    QINIT(&pending);
     for (i = 0; i < count; i++) {
         uint32_t size = umin32((uint32_t)len, mss);
         anl_seg *seg = seg_new(w, size);
-        if (seg == NULL) return ANL_ENOMEM;
+        if (seg == NULL) {
+            free_seg_list(w, &pending);
+            return ANL_ENOMEM;
+        }
         memcpy(seg->data, buf, size);
         seg->frg = count - i - 1;
         seg->frame_no = fno;
         seg->flags = i == 0 ? (uint8_t)(F_HAS_FRAME | (key ? F_KEY : 0)) : 0;
         seg->fkey = (uint8_t)key;
         seg->ts_enq = w->current;
-        qadd_tail(&seg->node, &st->snd_queue);
-        st->nsnd_que++;
-        st->backlog_bytes += size;
+        qadd_tail(&seg->node, &pending);
         buf += size;
         len -= (int)size;
     }
+    /* The list is still private here; publish metadata with the full frame. */
+    st->sm->frame_next++;
+    if (frame_no) *frame_no = fno;
+    if (key) ST_CLR(st->trk, STT_DROPPING);
+    if (st->fc != NULL) {
+        if (key) st->fc->fec_key_bytes = bytes;
+        else st->fc->fec_frame_avg = st->fc->fec_frame_avg == 0 ? bytes
+                 : (uint32_t)((int32_t)st->fc->fec_frame_avg + ((int32_t)bytes - (int32_t)st->fc->fec_frame_avg) / 8);
+    }
+    snd_commit(st, &pending, count, bytes);
     semi_drop_check(w, st);
     if (ST_ON(st->cfg, STC_FLUSH)) anl_flush_internal(w);
     return ANL_OK;
