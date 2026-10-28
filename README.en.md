@@ -180,12 +180,12 @@ Test conditions and data for reliable-stream throughput, media timeliness, laten
 
 Testing has three layers: unit tests (functionality and robustness, reproducible), simulated comparison tests (performance against ikcp on the same simulated network, reproducible), and real-network tests (performance on real UDP paths). Every change goes through the process in 6.4.
 
-### 6.1 Unit tests: `test.c`
+### 6.1 Unit tests: `testcases/`
 
-`test.c` directly `#include "anliu.c"` (so it can inspect internal state) and contains a reproducible simulated network: loss, dropping a specific datagram, delay, jitter and reordering, duplication, bandwidth bottleneck and queue. The whole run is determined by a seed.
+`testcases/harness.h` directly `#include "anliu.c"` (so it can inspect internal state) and contains a reproducible simulated network: loss, dropping a specific datagram, delay, jitter and reordering, duplication, bandwidth bottleneck and queue. The whole run is determined by a seed.
 
 ```sh
-gcc -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined test.c -o anl_test -lm
+gcc -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined testcases/main.c -o anl_test -lm
 ./anl_test                          # default seed
 ANL_TEST_SEED=1234 ./anl_test       # fixed seed, fully reproducible
 ANL_TEST_ONLY=priority ./anl_test   # run only tests whose name contains "priority"

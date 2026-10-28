@@ -254,7 +254,7 @@ typedef uint32x4_t cc_v;
     c = CC_ADD(c, d); b = CC_XOR(b, c); b = CC_ROTL(b, 7);
 
 /* the keystream of blocks counter .. counter + 3 xored into buf (len <= 256) */
-static void chacha20_x4(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t *buf, size_t len)
+static void chacha20_x4(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t *buf, const uint8_t *src, size_t len)
 {
     uint32_t s[16], ctr[4];
     cc_v v[16];
@@ -284,11 +284,11 @@ static void chacha20_x4(const uint8_t key[32], uint32_t counter, const uint8_t n
         for (j = 0; j < 4; j++) {
             size_t off = 64 * j + 16 * k;
             if (off + 16 <= len) {
-                CC_STORE(buf + off, CC_XOR(CC_LOAD(buf + off), r[j]));
+                CC_STORE(buf + off, CC_XOR(CC_LOAD(src + off), r[j]));
             } else if (off < len) {         /* the last bytes: not a whole 16 */
                 uint8_t t[16];
                 CC_STORE(t, r[j]);
-                for (i = 0; off + i < len; i++) buf[off + i] ^= t[i];
+                for (i = 0; off + i < len; i++) buf[off + i] = src[off + i] ^ t[i];
             }
         }
     }
@@ -296,23 +296,25 @@ static void chacha20_x4(const uint8_t key[32], uint32_t counter, const uint8_t n
 #endif
 
 static void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12],
-                         uint32_t counter, uint8_t *buf, size_t len)
+                         uint32_t counter, uint8_t *buf, const uint8_t *src, size_t len)
 {
     uint8_t ks[64];
 #ifdef CHACHA_X4
     while (len > 64) {                      /* more than a block: four at a time (a partial last pass too) */
         size_t n = len < 256 ? len : 256;
-        chacha20_x4(key, counter, nonce, buf, n);
+        chacha20_x4(key, counter, nonce, buf, src, n);
         counter += 4;
         buf += n;
+        src += n;
         len -= n;
     }
 #endif
     while (len > 0) {
         size_t n = len < 64 ? len : 64, i;
         chacha20_block(key, counter++, nonce, ks);
-        for (i = 0; i < n; i++) buf[i] ^= ks[i];
+        for (i = 0; i < n; i++) buf[i] = src[i] ^ ks[i];
         buf += n;
+        src += n;
         len -= n;
     }
 }
@@ -428,7 +430,7 @@ static void siv_seal(const anl_keys *keys, int dir, uint8_t *buf, size_t plen)
     uint8_t tag[16];
     siphash128(keys->mac[dir], buf + ANL_TAG_SIZE, plen, tag);
     memcpy(buf, tag, ANL_TAG_SIZE);
-    chacha20_xor(keys->enc[dir], buf, 0, buf + ANL_TAG_SIZE + 4, plen - 4);
+    chacha20_xor(keys->enc[dir], buf, 0, buf + ANL_TAG_SIZE + 4, buf + ANL_TAG_SIZE + 4, plen - 4);
     conv_mask(buf, buf + ANL_TAG_SIZE);
 }
 
@@ -439,9 +441,9 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
     size_t plen;
     if (size < (size_t)ANL_OVERHEAD) return ANL_EFORMAT;
     plen = size - ANL_TAG_SIZE;
-    memcpy(plain, wire + ANL_TAG_SIZE, plen);
+    memcpy(plain, wire + ANL_TAG_SIZE, 4);          /* conv; the rest is decrypted straight from the wire */
     conv_mask(wire, plain);
-    chacha20_xor(keys->enc[dir], wire, 0, plain + 4, plen - 4);
+    chacha20_xor(keys->enc[dir], wire, 0, plain + 4, wire + ANL_TAG_SIZE + 4, plen - 4);
     siphash128(keys->mac[dir], plain, plen, tag);
     if (!ct_equal(tag, wire, ANL_TAG_SIZE)) return ANL_EAUTH;
     return (int)plen;
@@ -514,7 +516,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define SID_LO_MASK     0x0f
 #define SID_F           0x10    /* b0: the sid's varint extension follows */
 #define SEG_RSV         0x20    /* b0: reserved, zero */
-#define DATA_HDR_MAX    12      /* type|sid(1) b1 frg_ext(3) sn(3) frame(2) len(2); + OPEN_BODY until the peer is
+#define DATA_HDR_MAX    13      /* type|sid(1) b1 frg_ext(3) sn(3) frame(2) len(3: mss >= 16384); + OPEN_BODY until the peer is
                                    heard; a sid >= 16 takes its extension off its stream's mss (stream_mss) */
 #define ACK_FIX         8       /* after type|sid: b1 una(3) wnd(2) ts_echo(2) */
 #define SKIP_BODY       4       /* CTRL_RCV_SKIP body: the retired una, 32 bits */
@@ -547,7 +549,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define SREC_INIT       8       /* sid_rec slots allocated first, doubled up to SREC_MAX */
 #define RSTQ_MAX        (2 * ANL_MAX_STREAMS)   /* stateless RSTs per flush; more wait for the peer's next segment */
 #define CANON_HDR_MAX   10      /* b1 frg_ext(varint, up to 5) frame(2) plen(2); the parser bounds
-                                   frg below ANL_MAX_WND (a 2-byte extension), the size is defensive */
+                                   frg below ANL_MAX_WND (a 3-byte extension), the size is defensive */
 #define BBR_UNIT            256
 #define BBR_STARTUP_GAIN    739     /* 2.885 = 2 / ln 2 */
 #define BBR_DRAIN_GAIN      88      /* 1 / 2.885 */
@@ -645,6 +647,7 @@ typedef struct anl_seg {
     uint32_t fec_base;      /* its FEC block: first sn, data packets, parities (fec_rto_hold;
                                m = 0: none, or the RTO was held once) */
     uint16_t fec_share;     /* its share of the block's parity bytes (delivery rate) */
+    uint16_t room;          /* byte stream: bytes allocated behind len, for appends to the unsent tail */
     uint8_t  fec_k, fec_m;
     uint8_t  fec_small;     /* ... a small block (k x Lmax <= FEC_SMALL_BLOCK) */
     uint8_t  lost_cnt;      /* counted in lost_bytes (RACK marked it; undone if the original arrives) */
@@ -807,6 +810,7 @@ typedef struct anl_stream {
     uint8_t mode;           /* ANL_RELIABLE, ANL_SEMI */
     uint8_t prio;           /* 0 .. ANL_MAX_PRIO - 1 */
     uint8_t cfg, out, trk;  /* flag words: STC_*, STO_*, STT_* */
+    uint16_t rcv_off;       /* byte stream: bytes of the first rcv_queue segment the application has read */
     anl_t *w;
     void *user;
     stream_semi *sm;        /* ANL_SEMI streams only (stream_create); NULL on a reliable stream */
@@ -1325,6 +1329,8 @@ static uint32_t sid_bytes(int sid)
 /* a stream's payload per segment: the connection's, less the sid extension */
 static uint32_t stream_mss_for(uint32_t mss, int sid) { return mss + 1 - sid_bytes(sid); }
 static uint32_t stream_mss(const anl_t *w, int sid) { return stream_mss_for(w->mss, sid); }
+/* the most data a datagram from the peer can carry: its mtu may exceed ours, up to mtu_max */
+static uint32_t rx_payload_max(const anl_t *w) { return w->mtu_max - ANL_OVERHEAD; }
 
 /* wire size of a CTRL segment with a body of blen bytes */
 static uint32_t ctrl_seg_size(int sid, uint32_t blen)
@@ -1585,18 +1591,30 @@ static void write_fwd_seg(anl_t *w, const anl_stream *st, uint32_t new_una)
     dg_commit(w, size, 0);
 }
 
-static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *body, uint32_t blen)
+/* a CTRL segment is written in two steps: the header, which returns where the
+   body of blen bytes goes, and the commit once the body is in */
+static char *ctrl_seg_begin(anl_t *w, int sid, uint8_t subtype, uint32_t blen)
 {
-    uint32_t size = ctrl_seg_size(sid, blen);
     char *p;
-    dg_need(w, size);
+    dg_need(w, ctrl_seg_size(sid, blen));
     p = dg_ptr(w);
     p = enc_sid(p, SEG_CTRL, sid);
     p = enc8(p, subtype);
-    p = enc_varint(p, blen);
-    if (blen) memcpy(p, body, blen);
+    return enc_varint(p, blen);
+}
+
+static void ctrl_seg_end(anl_t *w, int sid, uint8_t subtype, uint32_t blen)
+{
+    uint32_t size = ctrl_seg_size(sid, blen);
     dg_commit(w, size, subtype == CTRL_PARITY);
     if (subtype == CTRL_PARITY) ANL_TRACE(parity_seg, w, sid, size);
+}
+
+static void write_ctrl_seg(anl_t *w, int sid, uint8_t subtype, const uint8_t *body, uint32_t blen)
+{
+    char *p = ctrl_seg_begin(w, sid, subtype, blen);
+    if (blen) memcpy(p, body, blen);
+    ctrl_seg_end(w, sid, subtype, blen);
 }
 
 static void write_report_seg(anl_t *w, anl_stream *st)
@@ -2134,7 +2152,7 @@ static void stream_free_ex(anl_t *w, anl_stream *st, int keep_read)
     free_runs(st);
     free_rcv_list(w, &st->rcv_buf, &st->nrcv_buf);
     if (keep_read && st->mode == ANL_SEMI) drop_tail_incomplete(w, st);
-    if (!keep_read) free_rcv_list(w, &st->rcv_queue, &st->nrcv_que);
+    if (!keep_read) { free_rcv_list(w, &st->rcv_queue, &st->nrcv_que); st->rcv_off = 0; }
     free_seg_list(w, &st->snd_queue);
     free_seg_list(w, &st->snd_buf);
     QINIT(&st->snd_time);
@@ -2423,7 +2441,7 @@ static void fec_cache_add(anl_stream *st, uint32_t sn, uint32_t frg, uint8_t fla
                           uint16_t frame16, const char *data, uint32_t len)
 {
     fec_centry *e;
-    if (len > st->mss || fec_rx_alloc(st) < 0) return;
+    if (len > rx_payload_max(st->w) || fec_rx_alloc(st) < 0) return;
     e = &st->fc->cache[sn % st->fc->cache_n];
     if (fbuf_reserve(st->w, e, len + CANON_HDR_MAX) < 0) { e->len = 0; return; }
     e->sn = sn;
@@ -2586,7 +2604,7 @@ static void handle_parity(anl_t *w, anl_stream *st, const char *body, uint32_t b
     jj = dec8(&p);
     lmax = blen - PARITY_HDR;
     if (k < 1 || k > FEC_K_MAX || m < 1 || m > FEC_M_MAX || jj >= m) return;
-    if (lmax == 0 || lmax > st->mss + CANON_HDR_MAX) return;
+    if (lmax == 0 || lmax > rx_payload_max(w) + CANON_HDR_MAX) return;
     if (tdiff(base + k, st->rcv_nxt) <= 0) return;  /* the whole block is behind us */
     for (i = 0; i < st->fc->pcache_n; i++) {
         fec_pentry *q = &st->fc->pcache[i];
@@ -4327,7 +4345,7 @@ static void handle_report(anl_t *w, anl_stream *st, const char *p, uint32_t ts)
        leaves out those whose original came after all. One reordered packet
        in the first second, taken as 2% while the estimate warms up, held a
        reordering path without loss above the gate's threshold for 30 s
-       (test.c, test_fec_spurious_repair). The report itself is the
+       (testcases/, test_fec_spurious_repair). The report itself is the
        baseline: nothing is added from it */
     if (ST_ON(st->cfg, STC_FEC) && !had_report) {
         if (st->fc->fl_prov_win == w->fl_win) {
@@ -4453,7 +4471,7 @@ static void pn_take(anl_t *w, uint32_t pn)
 /*--------------------------------------------------------------------
  * datagram parsing (DESIGN 3.3 step 5 onwards)
  *-------------------------------------------------------------------*/
-/* plaintext P that siv_open verified (test.c feeds crafted ones) */
+/* plaintext P that siv_open verified (testcases/ feeds crafted ones) */
 /* what a datagram's segments add up to, for the actions after the last one */
 typedef struct rx_ctx {
     uint32_t ts;            /* the datagram's extended send time */
@@ -4464,7 +4482,7 @@ typedef struct rx_ctx {
 
 /* the datagram header: conv, version, replay and time window checks, the
    padding off the end. p and end are left on the segments. */
-static int rx_header(anl_t *w, const char *plain, long size, const char **pp, const char **endp, uint32_t *tsp)
+static int rx_header(anl_t *w, const char *plain, int size, const char **pp, const char **endp, uint32_t *tsp)
 {
     const char *p = plain, *end = plain + size;
     uint32_t conv, ts, ref, pn;
@@ -4701,14 +4719,14 @@ static int rx_ctrl_seg(anl_t *w, rx_ctx *c, const char **pp, const char *end, in
     return ANL_OK;
 }
 
-static int anl_input_plain(anl_t *w, const char *plain, long size)
+static int anl_input_plain(anl_t *w, const char *plain, int size)
 {
     const char *p, *end;
     rx_ctx c;
     int r;
 
     if (w == NULL || plain == NULL) return ANL_EINVAL;
-    if (size < ANL_HDR_SIZE || size > (long)w->mtu_max) return ANL_EFORMAT;
+    if (size < ANL_HDR_SIZE || size > (int)w->mtu_max) return ANL_EFORMAT;
     memset(&c, 0, sizeof(c));
     r = rx_header(w, plain, size, &p, &end, &c.ts);
     if (r) return r;
@@ -4752,7 +4770,7 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
     return ANL_OK;
 }
 
-int anl_peek_conv(const char *data, long size, uint32_t *conv)
+int anl_peek_conv(const char *data, int size, uint32_t *conv)
 {
     uint8_t c[4];
     if (data == NULL || conv == NULL) return ANL_EINVAL;
@@ -4763,11 +4781,11 @@ int anl_peek_conv(const char *data, long size, uint32_t *conv)
     return ANL_OK;
 }
 
-int anl_input(anl_t *w, const char *data, long size)
+int anl_input(anl_t *w, const char *data, int size)
 {
     int r;
     if (w == NULL || data == NULL) return ANL_EINVAL;
-    if (size < ANL_OVERHEAD || size > (long)w->mtu_max) return ANL_EFORMAT;
+    if (size < ANL_OVERHEAD || size > (int)w->mtu_max) return ANL_EFORMAT;
     /* decrypted into the datagram builder: it is empty outside a flush, and
        parsing writes nothing to it - only the flushes after the parse do,
        when the plaintext has been read */
@@ -4793,17 +4811,18 @@ int anl_input(anl_t *w, const char *data, long size)
  * took the stream's next first transmission - of a later block. */
 static void fec_write_parity(anl_t *w, anl_stream *st, int alone)
 {
-    uint8_t *body = (uint8_t *)w->scratch;
     const fec_buf *b = &st->fc->fec_out[st->fc->fec_out_i];
-    uint32_t wire = PARITY_HDR + b->len + SEG_WIRE_OVH;
-    char *p = (char *)body;
+    uint32_t blen = PARITY_HDR + b->len;
+    uint32_t wire = blen + SEG_WIRE_OVH;
+    char *p;
     if (alone) dg_seal(w);
+    p = ctrl_seg_begin(w, st->sid, CTRL_PARITY, blen);      /* built in the datagram: no copy through scratch */
     p = enc24(p, st->fc->fec_out_base & SN_MASK);
     p = enc8(p, (uint8_t)st->fc->fec_out_k);
     p = enc8(p, (uint8_t)st->fc->fec_out_m);
     p = enc8(p, (uint8_t)st->fc->fec_out_i);
     memcpy(p, b->p, b->len);
-    write_ctrl_seg(w, st->sid, CTRL_PARITY, body, PARITY_HDR + b->len);
+    ctrl_seg_end(w, st->sid, CTRL_PARITY, blen);
     if (alone) dg_seal(w);
     w->sent_wire += wire;
     vq_add(w, wire);
@@ -6629,7 +6648,7 @@ static int set_mtu(anl_t *w, int value)
     mss = mtu - ANL_OVERHEAD - DATA_HDR_MAX;
     /* an FEC stream's buffers are sized by its mss: it keeps it */
     FOR_EACH_STREAM(w, st, n, nx) {
-        if (ST_ON(st->cfg, STC_FEC) && stream_mss_for(mss, st->sid) - ANL_FEC_OVERHEAD < st->mss) return ANL_EBUSY;
+        if (st->state != ANL_STREAM_CLOSED && ST_ON(st->cfg, STC_FEC) && stream_mss_for(mss, st->sid) - ANL_FEC_OVERHEAD < st->mss) return ANL_EBUSY;
     }
     if (w->ptr > (uint32_t)ANL_OVERHEAD) dg_seal(w);    /* the datagram in progress goes out at the old size */
     w->mtu = mtu;
@@ -6997,6 +7016,12 @@ static int reliable_peeksize(const anl_stream *st)
     anl_node *pos;
     uint32_t length = 0;
     if (QEMPTY(&st->rcv_queue)) return -1;
+    if (ST_ON(st->cfg, STC_STREAM)) {       /* no message boundaries: everything in order is readable */
+        uint64_t total = 0;
+        for (pos = st->rcv_queue.next; pos != &st->rcv_queue; pos = pos->next) total += QENTRY(pos, anl_seg, node)->len;
+        total -= st->rcv_off;
+        return total > 0x7fffffffu ? 0x7fffffff : (int)total;
+    }
     seg = QENTRY(st->rcv_queue.next, anl_seg, node);
     if (seg->frg == 0) return (int)seg->len;
     if (st->nrcv_que < seg->frg + 1) return -1;
@@ -7068,9 +7093,8 @@ int anl_readable(anl_t *w, anl_stream_t **out, int max)
     return cnt;
 }
 
-int anl_stream_peeksize(const anl_stream_t *s)
+int anl_stream_peeksize(anl_stream_t *st)
 {
-    anl_stream *st = (anl_stream *)s;
     int n;
     if (st == NULL) return ANL_EINVAL;
     n = stream_peeksize(st->w, st);
@@ -7125,12 +7149,16 @@ int anl_stream_tag(const anl_stream_t *st) { return st ? st->tag : ANL_EINVAL; }
 anl_t *anl_stream_conn(const anl_stream_t *st) { return st ? st->w : NULL; }
 void anl_stream_set_user(anl_stream_t *st, void *user) { if (st) st->user = user; }
 void *anl_stream_get_user(const anl_stream_t *st) { return st ? st->user : NULL; }
+int anl_stream_mode(const anl_stream_t *st) { return st ? st->mode : ANL_EINVAL; }
+uint32_t anl_conv(const anl_t *w) { return w ? w->conv : 0; }
+void anl_set_user(anl_t *w, void *user) { if (w) w->user = user; }
+void *anl_get_user(const anl_t *w) { return w ? w->user : NULL; }
 
 /* default stream (sid 0) */
 anl_stream_t *anl_default_stream(anl_t *w) { return w ? w->dflt : NULL; }
 int anl_send(anl_t *w, const char *buf, int len) { return w ? anl_stream_send(w->dflt, buf, len) : ANL_EINVAL; }
 int anl_recv(anl_t *w, char *buf, int len) { return w ? anl_stream_recv(w->dflt, buf, len) : ANL_EINVAL; }
-int anl_peeksize(const anl_t *w) { return w ? anl_stream_peeksize(w->dflt) : ANL_EINVAL; }
+int anl_peeksize(anl_t *w) { return w ? anl_stream_peeksize(w->dflt) : ANL_EINVAL; }
 int anl_waitsnd(const anl_t *w) { return w ? anl_stream_waitsnd(w->dflt) : ANL_EINVAL; }
 
 /* common checks for send APIs; returns 0 or an error code */
@@ -7161,6 +7189,26 @@ static int rcv_take_message(anl_t *w, anl_stream *st, char *buf)
         total += (int)seg->len;
         rcv_queue_drop(w, st, seg);
         if (frg == 0) break;
+    }
+    return total;
+}
+
+/* byte stream: up to len bytes in order, across segments. A segment the
+   application has read part of stays first in the queue (rcv_off) and holds
+   its place in the window until it is read to the end */
+static int rcv_take_bytes(anl_t *w, anl_stream *st, char *buf, int len)
+{
+    int total = 0;
+    while (total < len && !QEMPTY(&st->rcv_queue)) {
+        anl_seg *seg = qfirst_seg(&st->rcv_queue);
+        uint32_t n = umin32(seg->len - st->rcv_off, (uint32_t)(len - total));
+        memcpy(buf + total, seg->data + st->rcv_off, n);
+        total += (int)n;
+        st->rcv_off = (uint16_t)(st->rcv_off + n);
+        if (st->rcv_off == seg->len) {
+            st->rcv_off = 0;
+            rcv_queue_drop(w, st, seg);
+        }
     }
     return total;
 }
@@ -7222,6 +7270,9 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
     uint32_t bytes = (uint32_t)len;
     anl_node pending;
     anl_seg *old = NULL, *replacement = NULL;
+    uint32_t ext = 0;                       /* bytes going into the existing tail segment */
+    const char *rest;                       /* the bytes after those, cut into new segments */
+    int rest_len;
     int r;
     if (st == NULL || buf == NULL || len <= 0) return ANL_EINVAL;
     w = st->w;
@@ -7230,30 +7281,35 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
     if (bytes > 0xffffffffu - st->backlog_bytes) return ANL_ETOOBIG;
     mss = seg_limit(st);
 
-    /* byte-stream mode: append to the last queued segment (ikcp) */
+    /* byte-stream mode: append to the last queued segment (ikcp). It grows in
+       place while it has room; when it has none it is replaced by one twice
+       as long (up to mss), so k small writes cost log k allocations */
     if (ST_ON(st->cfg, STC_STREAM)) {
         old = qlast_seg(&st->snd_queue);
         if (old && old->len < mss) {
-            uint32_t ext = umin32((uint32_t)len, mss - old->len);
-            anl_seg *seg = seg_new(w, old->len + ext);
-            if (seg == NULL) return ANL_ENOMEM;
-            memcpy(seg->data, old->data, old->len);
-            memcpy(seg->data + old->len, buf, ext);
-            seg->frg = 0;
-            seg->ts_enq = w->current;
-            replacement = seg;
-            buf += ext;
-            len -= (int)ext;
+            ext = umin32((uint32_t)len, mss - old->len);
+            if (ext > old->room) {
+                uint32_t cap = umin32(mss, umax32(old->len + ext, 2 * old->len));
+                replacement = seg_new(w, cap);
+                if (replacement == NULL) return ANL_ENOMEM;
+                replacement->len = old->len + ext;
+                replacement->room = (uint16_t)(cap - replacement->len);
+                memcpy(replacement->data, old->data, old->len);
+                memcpy(replacement->data + old->len, buf, ext);
+                replacement->ts_enq = w->current;
+            }
         }
     }
+    rest = buf + ext;
+    rest_len = len - (int)ext;
 
-    count = ((uint32_t)len + mss - 1) / mss;
+    count = ((uint32_t)rest_len + mss - 1) / mss;
     if ((!ST_ON(st->cfg, STC_STREAM) && count > st->rcv_wnd) || count > VARINT_MAX) {
         seg_free(w, replacement);
         return ANL_ETOOBIG;
     }
 
-    r = cut_segments(w, &pending, buf, (uint32_t)len, mss, count, !ST_ON(st->cfg, STC_STREAM));
+    r = cut_segments(w, &pending, rest, (uint32_t)rest_len, mss, count, !ST_ON(st->cfg, STC_STREAM));
     if (r) {
         seg_free(w, replacement);
         return r;
@@ -7262,6 +7318,10 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
         qadd_after(&replacement->node, &old->node);
         qdel(&old->node);
         seg_free(w, old);
+    } else if (ext) {
+        memcpy(old->data + old->len, buf, ext);
+        old->len += ext;
+        old->room = (uint16_t)(old->room - ext);
     }
     snd_commit(st, &pending, count, bytes);
     if (ST_ON(st->cfg, STC_FLUSH)) anl_flush_internal(w);
@@ -7275,11 +7335,12 @@ int anl_stream_recv(anl_stream_t *st, char *buf, int len)
     if (st == NULL || buf == NULL || len < 0) return ANL_EINVAL;
     w = st->w;
     if (st->mode != ANL_RELIABLE) return ANL_EMODE;
-    peek = reliable_peeksize(st);
+    /* a byte stream reads whatever is there; a message stream waits for the whole message */
+    peek = ST_ON(st->cfg, STC_STREAM) ? (QEMPTY(&st->rcv_queue) ? -1 : 0) : reliable_peeksize(st);
     if (peek < 0) return st->state == ANL_STREAM_CLOSED ? ANL_ECLOSED : ANL_EAGAIN;
     if (peek > len) return ANL_EBUFSIZE;
     recover = wnd_unused(st) == 0;
-    total = rcv_take_message(w, st, buf);
+    total = ST_ON(st->cfg, STC_STREAM) ? rcv_take_bytes(w, st, buf, len) : rcv_take_message(w, st, buf);
     after_recv(w, st, recover);
     return total;
 }

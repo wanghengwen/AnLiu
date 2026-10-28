@@ -20,7 +20,7 @@
 
 | 文件 | 编号 | 内容 | 执行 |
 |---|---|---|---|
-| [testcases/01-unit.md](testcases/01-unit.md) | UT、AT、DG、FZ、SAN | `test.c`、攻击测试、诊断核算、模糊测试、Sanitizer 构建 | `ctest`；FZ 由代理执行 |
+| [testcases/01-unit.md](testcases/01-unit.md) | UT、AT、DG、FZ、SAN | `testcases/`、攻击测试、诊断核算、模糊测试、Sanitizer 构建 | `ctest`；FZ 由代理执行 |
 | [testcases/02-sim.md](testcases/02-sim.md) | SM | 媒体仿真门槛、新旧版本成对仿真、多种子单元测试 | 脚本，按本文件判定 |
 | [testcases/03-realnet.md](testcases/03-realnet.md) | RN | 实网用例的环境与参数：主机与路径、出口容量、变体部署、有效轮次、批次脚本 | |
 | [testcases/RN-*.md](testcases/) | RN | 实网测试，每个用例一个文件 | 代理 |

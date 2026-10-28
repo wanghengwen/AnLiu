@@ -288,7 +288,8 @@ typedef struct anl_stream anl_stream_t;
  * not used after the call: the callback may rewrite it in place - typically
  * the clear tag + conv (the first 16 bytes), e.g. to encrypt them - but not
  * its length. The receiver undoes that in its own buffer before
- * anl_peek_conv / anl_input. Must not call anl_* functions. */
+ * anl_peek_conv / anl_input. Must not call anl_* functions. The return value
+ * is ignored (kept for the ikcp signature). */
 typedef int (*anl_output_fn)(char *buf, int len, anl_t *w, void *user);
 
 /* Called from anl_input when the peer opens a new stream. s is the new
@@ -348,13 +349,16 @@ void anl_stream_opt_default(anl_stream_opt *opt, int mode);
  * in the clear after the tag, only masked (DESIGN 3.4, 4). Unauthenticated -
  * use it to find the connection, then anl_input verifies the datagram.
  * Returns ANL_OK, or ANL_EFORMAT / ANL_EINVAL. */
-int anl_peek_conv(const char *data, long size, uint32_t *conv);
+int anl_peek_conv(const char *data, int size, uint32_t *conv);
 
 /*---------------------------------------------------------------------
  * connection
  *---------------------------------------------------------------------*/
 /* create a connection; conv must be equal on both sides and non-zero */
 anl_t   *anl_create(uint32_t conv, const anl_config *cfg, void *user);
+uint32_t anl_conv(const anl_t *w);
+void     anl_set_user(anl_t *w, void *user);            /* the user given to anl_create, passed to the callbacks */
+void    *anl_get_user(const anl_t *w);
 void     anl_release(anl_t *w);
 void     anl_setoutput(anl_t *w, anl_output_fn output);
 /* NULL (default) accepts every peer-opened stream with default options */
@@ -374,7 +378,7 @@ void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
  * and application work also run. An update/output callback can itself take time;
  * avoid blocking it. Up to one interval of staleness is tolerated (DESIGN 6.8),
  * but larger gaps can underestimate RTT and corrupt the path model. */
-int      anl_input(anl_t *w, const char *data, long size);
+int      anl_input(anl_t *w, const char *data, int size);
 
 /* Drive timers; current is a monotonic millisecond clock. anl_check also
  * accounts for pacing, keepalive (when output is set), and idle timeout:
@@ -396,8 +400,13 @@ int      anl_get_stats(const anl_t *w, anl_stats *out);
  * parameters) is dropped there (DESIGN 6.1). Windows: cfg.default_snd_wnd / default_rcv_wnd.
  *---------------------------------------------------------------------*/
 int      anl_send(anl_t *w, const char *buf, int len);
+/* A byte stream (the default stream, and streams opened with opt.stream) is read
+ * like TCP: anl_recv copies up to len bytes in order, across the sender's
+ * writes, and returns how many (0 for len 0); a partly read segment stays for
+ * the next call. anl_peeksize is the number of bytes readable now. Other
+ * streams deliver one message per call (ANL_EBUFSIZE if it does not fit). */
 int      anl_recv(anl_t *w, char *buf, int len);
-int      anl_peeksize(const anl_t *w);
+int      anl_peeksize(anl_t *w);               /* not const: see anl_stream_peeksize */
 int      anl_waitsnd(const anl_t *w);
 anl_stream_t *anl_default_stream(anl_t *w);
 
@@ -441,8 +450,12 @@ int      anl_stream_send_frame(anl_stream_t *s, int flags, const char *buf, int 
                                uint32_t *frame_no);
 int      anl_stream_recv_frame(anl_stream_t *s, char *buf, int len, anl_frame_info *info);
 
-/* size of the next message / frame; ANL_EAGAIN if none, ANL_ECLOSED once over and read */
-int      anl_stream_peeksize(const anl_stream_t *s);
+/* size of the next message / frame (a byte stream: the bytes readable now);
+ * ANL_EAGAIN if none, ANL_ECLOSED once over and read.
+ * Not const: on a semi-reliable stream it discards what can no longer be
+ * delivered at the head of the queue (incomplete or undecodable frames; they
+ * count in frames_discarded / frames_skipped). */
+int      anl_stream_peeksize(anl_stream_t *s);
 /* segments waiting to be sent or acknowledged */
 int      anl_stream_waitsnd(const anl_stream_t *s);
 /* Stops (1) or resumes (0) the sending of parity on a stream opened with FEC,
@@ -458,6 +471,7 @@ int      anl_stream_tag(const anl_stream_t *s);         /* tag given by the open
 anl_t   *anl_stream_conn(const anl_stream_t *s);
 void     anl_stream_set_user(anl_stream_t *s, void *user);
 void    *anl_stream_get_user(const anl_stream_t *s);
+int      anl_stream_mode(const anl_stream_t *s);        /* ANL_RELIABLE or ANL_SEMI */
 
 /* Streams that can be read now (data, or over). Writes up to max handles,
  * returns the total count. */

@@ -43,7 +43,7 @@ AnLiu 是一个基于 UDP 的轻量传输协议，参考 [ikcp](https://github.c
 
 ```
  应用层   anl_send / anl_recv                         （默认流，可靠字节流）
-          anl_stream_send / anl_stream_recv           （可靠流句柄，语义同 ikcp）
+          anl_stream_send / anl_stream_recv           （可靠流句柄；消息模式一次一条消息，字节流模式像 TCP 按字节读）
           anl_stream_send_frame / anl_stream_recv_frame（半可靠流句柄）
    │
  流层     每个流独立：sn 空间、snd/rcv 队列、可靠模式、FEC 编解码
@@ -108,7 +108,7 @@ wire  = tag || convx || C
 ```c
 /* 不用密钥、不解密，从数据报读出 conv（去掉混淆）。未经认证，只用于找连接。
  * 返回 ANL_OK，或 ANL_EFORMAT / ANL_EINVAL。 */
-int anl_peek_conv(const char *data, long size, uint32_t *conv);
+int anl_peek_conv(const char *data, int size, uint32_t *conv);
 ```
 
 服务端流程：每个数据报 `anl_peek_conv` → 用 conv 找到连接 → `anl_input`（用该连接的密钥认证并解密）。conv 未知时，用应用为该 conv 准备的 PSK 新建连接后再 `anl_input`；认证失败（`ANL_EAUTH`）即丢弃，不回应。
@@ -742,7 +742,7 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 语义与 ikcp 相同：
 
 - `anl_send` / `anl_recv` / `anl_peeksize` / `anl_waitsnd`；
-- 通过 `opt.stream` 在字节流模式和消息模式之间切换；
+- 通过 `opt.stream` 在字节流模式和消息模式之间切换；字节流模式下 `anl_recv` 像 TCP：最多读 `len` 字节，可跨多次写入，读了一半的分片留到下次（`rcv_off`），整个分片读完才释放窗口位置，`anl_peeksize` 返回当前可读的总字节数，不再返回 `ANL_EBUFSIZE`；
 - **消息模式下的分片数检查**：一条消息的分片数不能超过 `rcv_wnd`（两端相同），否则 `anl_stream_send` 返回 `ANL_ETOOBIG`。接收方必须凑齐整条消息才能交付，分片数超过它的接收窗口时永远凑不齐，rcv_buf 也无法排出，双方死锁。ikcp 有类似的检查（那里是 `count >= rcv_wnd`，这里允许 `count == rcv_wnd`），接收端必须能在窗口内凑齐整条消息；
 - 丢包判定用 RACK（始终启用，6.3），没有 ikcp 的 `nodelay` / `resend`；
 - 在可靠流上调用帧接口，或在半可靠流上调用 `anl_stream_send` / `anl_stream_recv`，都返回 `ANL_EMODE`。

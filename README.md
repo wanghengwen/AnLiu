@@ -178,12 +178,12 @@ AnLiu 的做法：
 
 测试分三层：单元测试（功能与健壮性，可复现）、模拟对照测试（与 kcp 在同一个模拟网络上比性能，可复现）、真实网络测试（在真实 UDP 路径上比性能）。每一轮修改都按 6.4 的流程判断。
 
-### 6.1 单元测试：`test.c`
+### 6.1 单元测试：`testcases/`
 
-`test.c` 直接 `#include "anliu.c"`（可以检查内部状态），内置一个可复现的模拟网络：丢包、指定丢某个数据报、时延、抖动乱序、重复、带宽瓶颈与队列。整个运行由种子决定。
+`testcases/harness.h` 直接 `#include "anliu.c"`（可以检查内部状态），内置一个可复现的模拟网络：丢包、指定丢某个数据报、时延、抖动乱序、重复、带宽瓶颈与队列。整个运行由种子决定。
 
 ```sh
-gcc -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined test.c -o anl_test -lm
+gcc -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined testcases/main.c -o anl_test -lm
 ./anl_test                          # 默认种子
 ANL_TEST_SEED=1234 ./anl_test       # 指定种子，结果可完整复现
 ANL_TEST_ONLY=priority ./anl_test   # 只运行名字包含 priority 的测试

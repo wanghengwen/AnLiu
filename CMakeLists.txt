@@ -51,7 +51,7 @@ target_include_directories(anliu PUBLIC
 if(BUILD_TESTING)
     # The existing tests include anliu.c to inspect internal state. Do not link
     # a second copy of the implementation through the library target.
-    add_executable(anl_test test.c)
+    add_executable(anl_test testcases/main.c)
     anliu_configure_test(anl_test)
     set_target_properties(anl_test PROPERTIES C_EXTENSIONS OFF)
     if(UNIX)
@@ -61,8 +61,8 @@ if(BUILD_TESTING)
 
     # Adversarial harness: an on-path attacker without the PSK trying replay,
     # reflection, forgery, tampering, malleability and injection. Includes
-    # anliu.c for the same reason test.c does.
-    add_executable(anl_attack test_attack.c)
+    # anliu.c for the same reason testcases/main.c does.
+    add_executable(anl_attack testcases/attack_main.c)
     anliu_configure_test(anl_attack)
     set_target_properties(anl_attack PROPERTIES C_EXTENSIONS OFF)
     if(UNIX)
@@ -171,7 +171,7 @@ endif()
 if(ANLIU_BUILD_FUZZERS)
     # Receive path when the peer holds the PSK (docs/SECURITY_AUDIT.md 4): the
     # target feeds plaintext datagrams to the parser, so it includes anliu.c
-    # like test.c does. anl_fuzz_seeds writes seeds from a real exchange.
+    # like testcases/main.c does. anl_fuzz_seeds writes seeds from a real exchange.
     set(ANLIU_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
     add_executable(anl_fuzz_peer tools/fuzz/fuzz_peer.c)
     target_compile_features(anl_fuzz_peer PRIVATE c_std_99)

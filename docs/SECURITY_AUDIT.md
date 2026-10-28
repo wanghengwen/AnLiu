@@ -2,7 +2,7 @@
 
 - 审计对象：`anliu.h` / `anliu.c`，线上版本 `ANL_VERSION = 1`
 - 审计日期：2026-10-08
-- 审计方法：源码审查 + 对抗性测试（`test_attack.c`，已纳入 CTest 目标 `anliu.attack`）；持 PSK 对端模型另用覆盖率引导模糊测试（`tools/fuzz/`，§4.1）
+- 审计方法：源码审查 + 对抗性测试（`testcases/attack_main.c`，已纳入 CTest 目标 `anliu.attack`）；持 PSK 对端模型另用覆盖率引导模糊测试（`tools/fuzz/`，§4.1）
 - 设计参考：[DESIGN.md](DESIGN.md) 第 3、4 节（加密层、数据报格式）
 
 ---
@@ -47,7 +47,7 @@
 
 ## 3. 攻击面与测试结果
 
-下列每一项均由 `test_attack.c` 对真实连接端到端执行，并在 AddressSanitizer + UndefinedBehaviorSanitizer 下运行无误。
+下列每一项均由 `testcases/attack_main.c` 对真实连接端到端执行，并在 AddressSanitizer + UndefinedBehaviorSanitizer 下运行无误。
 
 | # | 攻击 | 预期防线 | 结果 |
 |---|---|---|---|
@@ -115,7 +115,7 @@
 
 协议没有握手。服务端对"**认证通过但 conv 未知**"的数据报的处理方式，就是事实上的隐式建连：按 `anl_peek_conv` 读出的 conv 查不到连接时，应用会用该 conv 新建一个 `anl_t` 再调用 `anl_input`。
 
-由此产生的攻击（`test_attack.c` 攻击 [7] 已复现）：
+由此产生的攻击（`testcases/attack_main.c` 攻击 [7] 已复现）：
 
 1. 攻击者抓到一个历史的、合法的客户端→服务端数据报（标签合法，conv 合法）；
 2. 服务端重启、或该 conv 在服务端尚不存在时，攻击者把这个抓包原样重放过去；
@@ -196,4 +196,4 @@
 
 ---
 
-*本报告对应的对抗性测试见 `test_attack.c`（CTest 目标 `anliu.attack`），可用 `-fsanitize=address,undefined` 构建复现；持 PSK 对端的模糊测试见 `tools/fuzz/README.md`。*
+*本报告对应的对抗性测试见 `testcases/attack_*`（CTest 目标 `anliu.attack`），可用 `-fsanitize=address,undefined` 构建复现；持 PSK 对端的模糊测试见 `tools/fuzz/README.md`。*

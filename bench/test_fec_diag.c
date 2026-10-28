@@ -14,7 +14,7 @@ static void trace_diag_output(const anl_t *, uint32_t, int);
 #define ANL_TRACE_tx_output trace_diag_output
 #include "anl_trace.h"
 #define main original_test_main
-#include "../test.c"
+#include "../testcases/main.c"
 #undef main
 #include "fec_diag.h"
 
