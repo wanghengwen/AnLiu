@@ -7078,6 +7078,13 @@ static int stream_peeksize(anl_t *w, anl_stream *st)
     return st->mode == ANL_SEMI ? frame_peeksize(w, st) : reliable_peeksize(st);
 }
 
+/* anything to read: a byte stream need not add up its whole queue for that */
+static int stream_readable(anl_t *w, anl_stream *st)
+{
+    if (st->mode == ANL_RELIABLE && ST_ON(st->cfg, STC_STREAM)) return !QEMPTY(&st->rcv_queue);
+    return stream_peeksize(w, st) >= 0;
+}
+
 
 int anl_readable(anl_t *w, anl_stream_t **out, int max)
 {
@@ -7086,7 +7093,7 @@ int anl_readable(anl_t *w, anl_stream_t **out, int max)
     int cnt = 0;
     if (w == NULL || max < 0 || (out == NULL && max > 0)) return ANL_EINVAL;
     FOR_EACH_STREAM(w, st, n, nx) {
-        if (stream_peeksize(w, st) < 0 && st->state != ANL_STREAM_CLOSED) continue;
+        if (!stream_readable(w, st) && st->state != ANL_STREAM_CLOSED) continue;
         if (cnt < max) out[cnt] = st;
         cnt++;
     }
@@ -7322,6 +7329,7 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
         memcpy(old->data + old->len, buf, ext);
         old->len += ext;
         old->room = (uint16_t)(old->room - ext);
+        old->ts_enq = w->current;           /* as a replacement would have it */
     }
     snd_commit(st, &pending, count, bytes);
     if (ST_ON(st->cfg, STC_FLUSH)) anl_flush_internal(w);

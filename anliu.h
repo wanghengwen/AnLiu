@@ -394,7 +394,7 @@ int      anl_get_stats(const anl_t *w, anl_stats *out);
 
 /*---------------------------------------------------------------------
  * default stream (sid 0): created with the connection on both sides, usable
- * at once, reliable byte stream (ikcp semantics), strict priority over every
+ * at once, reliable byte stream (read like TCP, see anl_recv), strict priority over every
  * other stream, cannot be closed by either side: a segment of the peer's
  * that would reset another stream (a frame number, FWD, other stream
  * parameters) is dropped there (DESIGN 6.1). Windows: cfg.default_snd_wnd / default_rcv_wnd.
@@ -440,7 +440,8 @@ anl_stream_t *anl_stream_open(anl_t *w, const anl_stream_opt *opt, int *err);
  * cannot be closed (ANL_EINVAL). */
 int      anl_stream_close(anl_stream_t *s);
 
-/* reliable stream: ikcp semantics; ANL_ECLOSED once over (closed by the peer, reset) */
+/* reliable stream: one message per anl_stream_recv, or bytes like TCP with
+ * opt.stream (see anl_recv); ANL_ECLOSED once over (closed by the peer, reset) */
 int      anl_stream_send(anl_stream_t *s, const char *buf, int len);
 int      anl_stream_recv(anl_stream_t *s, char *buf, int len);
 
