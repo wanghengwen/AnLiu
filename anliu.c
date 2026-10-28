@@ -501,6 +501,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define CFG_DEFAULT_WND 4096    /* the default stream's windows */
 
 #define RTO_MIN         30
+#define STREAM_RTO_MIN  1000    /* RTO floor on a stream carrier: its own timers and queues are the delay */
 #define RTO_DEF         200
 #define RTO_MAX         60000
 #define PROBE_LIMIT     60000
@@ -736,6 +737,7 @@ typedef struct stream_semi {
 #define FCT_GATE          0x04  /* RTT auto: parity for the stream's blocks (DESIGN 8.6) */
 #define FCT_GATE_WAS      0x08  /* ... ever opened on hard loss (the first opening skips the hold) */
 #define FCT_BLK_KEY       0x10  /* the open block has key-frame fragments */
+#define FCT_PAUSED        0x40  /* anl_stream_fec_pause: no parity is collected or sent */
 #define FCT_OUT_SMALL     0x20  /* the last block was small (k x Lmax <= FEC_SMALL_BLOCK): fec_ride */
 /* rx_f: the receiver's */
 #define FCR_IN_RETRY      0x01  /* fec_retry_pending runs (a rebuild it delivers comes back to it) */
@@ -910,6 +912,13 @@ struct anl_s {
     anl_output_fn output;
 
     uint32_t mtu, mss;
+    uint32_t mtu_max;                   /* buffer size, receive limit */
+    uint32_t dg_lim;                    /* the size limit of the datagram being built: mtu, raised by
+                                           write_data_seg for a segment cut under a larger one */
+    struct recovery { uint32_t rto_min; uint8_t fast_retrans, cc_ignore_loss; } rec, rec_dgram;
+                                        /* loss recovery policy now / on the datagram carrier (anl_create's) */
+    uint8_t pace_burst_auto;
+    uint8_t carrier;                    /* ANL_CARRIER_* */
     int pad_max;
     int interval;
     anl_rng_fn rng;
@@ -1314,7 +1323,8 @@ static uint32_t sid_bytes(int sid)
 }
 
 /* a stream's payload per segment: the connection's, less the sid extension */
-static uint32_t stream_mss(const anl_t *w, int sid) { return w->mss + 1 - sid_bytes(sid); }
+static uint32_t stream_mss_for(uint32_t mss, int sid) { return mss + 1 - sid_bytes(sid); }
+static uint32_t stream_mss(const anl_t *w, int sid) { return stream_mss_for(w->mss, sid); }
 
 /* wire size of a CTRL segment with a body of blen bytes */
 static uint32_t ctrl_seg_size(int sid, uint32_t blen)
@@ -1444,10 +1454,11 @@ static void prng_bytes(anl_t *w, uint8_t *out, size_t n)
 static void dg_begin(anl_t *w)
 {
     w->ptr = ANL_OVERHEAD;
+    w->dg_lim = w->mtu;
     ST_CLR(w->out_f, OUT_F_DG_DATA);
 }
 
-static uint32_t dg_room(const anl_t *w) { return w->mtu - w->ptr; }
+static uint32_t dg_room(const anl_t *w) { return w->dg_lim - w->ptr; }
 
 /* CTRL_ECHO (DESIGN 5.5): a peer that only receives - it sends ACKs, which
  * nobody acknowledges - has no RTT sample, and its receiver deadline cannot
@@ -1547,6 +1558,9 @@ static void write_data_seg(anl_t *w, const anl_stream *st, const anl_seg *seg)
     uint8_t frg5 = seg->frg >= 31 ? 31 : (uint8_t)seg->frg;
 
     dg_need(w, size);
+    /* cut under a larger mtu (anl_set_option): alone in the datagram, which
+       takes the size it needs (dg_begin ends it) */
+    if (dg_room(w) < size) w->dg_lim = w->ptr + size;
     p = dg_ptr(w);
     p = enc_sid(p, SEG_DATA, st->sid);
     p = enc8(p, (uint8_t)((st->state == ANL_STREAM_OPENING ? F_OPEN : 0) | (seg->flags & (F_HAS_FRAME | F_KEY)) | frg5));
@@ -2478,7 +2492,7 @@ static int fec_block_decode(anl_t *w, anl_stream *st, uint32_t base, uint32_t k,
         row[np++] = i;
     }
     if (np < t) return 1;                           /* too few parities so far */
-    if (lmax > w->mtu) return 0;
+    if (lmax > w->mtu_max) return 0;
 
     /* A[x][y] = C(j of parity x, missing y); missing_y = sum_x inv[y][x] * (P_x - known part) */
     for (x = 0; x < t; x++)
@@ -2622,7 +2636,7 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
            a receiver started 25 s after the sender, or an outage). Nothing
            can be stored, but the ACK tells the sender we are alive and where
            we stand, so that it repeats the FWD now instead of at the end of
-           its backoff (handle_ack; 20 s of silence on a live path before). */
+           its backoff (handle_ack; HISTORY 7). */
         if (st->mode == ANL_SEMI) ack_schedule(st);
         return;
     }
@@ -2738,7 +2752,7 @@ static int rack_detect(anl_t *w, anl_stream *st)
     anl_node *pos;
     uint32_t wait, newest;
     int marked = 0;
-    if (!ST_ON(w->in_f, IN_F_RACK)) return 0;
+    if (!w->rec.fast_retrans || !ST_ON(w->in_f, IN_F_RACK)) return 0;
     wait = w->rack_rtt + reo_wnd(w, st);
     newest = ST_ON(st->trk, STT_RACK) && tdiff(st->rack_ts, w->rack_ts) > 0 ? st->rack_ts : w->rack_ts;
     for (pos = st->snd_time.next; pos != &st->snd_time; pos = pos->next) {
@@ -2940,9 +2954,8 @@ static void lt_startup_trim(anl_t *w, uint64_t rd, uint64_t lost, int app_limite
    Require half an interval of receiver time, bounded span and a recent
    endpoint; a receive-only peer reports every RTO_DEF. ACKs miss what
    arrived of segments the sender had dropped meanwhile (purge_frame: a
-   frame expired, drop_until_key took the rest of its GOP in flight) -
-   a media stream behind a policer read 22% below what the path carried
-   and the test locked at two thirds of the policer's rate. ACK-based
+   frame expired, drop_until_key took the rest of its GOP in flight),
+   which reads the path too low (HISTORY 6). ACK-based
    without sufficient report coverage */
 static uint32_t lt_interval_rate(const anl_t *w, uint32_t dur)
 {
@@ -3052,10 +3065,8 @@ static void lt_test_verdict(anl_t *w, uint32_t dur, uint32_t rate, uint32_t loss
              (uint64_t)rate * 8 < (uint64_t)umin32(w->lt.rate, sat32(sent * 1000 / dur)) * 7) {
         /* Paced at the rate and fed, it delivered under 7/8 of both the
            rate and what it sent: the ceiling is lower. The detection
-           intervals had a draining bucket on top of it (STARTUP left a
-           1 MB bucket full: 2.0 MB/s tested on a 1.5 MB/s policer, and
-           the 48-interval hold put confirmation off by 27 s). Once more
-           at what this interval delivered; random loss over an eighth
+           intervals had a draining bucket on top of it (HISTORY 5). Once
+           more at what this interval delivered; random loss over an eighth
            fails again */
         ST_SET(w->lt.f, LT_F_RETEST);
         w->lt.rate = rate;
@@ -3115,10 +3126,7 @@ static void lt_probe_step(anl_t *w, uint32_t dur, uint32_t rate, uint32_t loss)
        signal: a stall (the path or the provider dropped out for a few
        hundred ms), not a bottleneck's queue - a FIFO queues while it
        delivers its capacity. No verdict, as for too little offered
-       load: on a 10 Mbit policer at 20 ms such stalls came every few
-       seconds until the policer was confirmed, and one in the first
-       probe step held the detector off for 48 intervals - confirmation
-       at 32..49 s instead of 7..23 (real network) */
+       load (HISTORY 4) */
     int stalled = (w->lt.bad & 2) && (uint64_t)rate * 4 < w->lt.rate;
     if ((w->lt.bad & 2) && !stalled) {
         /* A single queued round can taint a whole short-RTT interval.
@@ -3259,14 +3267,9 @@ static void lt_watch(anl_t *w, uint32_t rate, uint32_t counted)
        interval now and then, and the test's loss regresses to the mean */
     /* The test starts after STARTUP: a STARTUP interval is evidence, the
        second of the pair and the test are not. In STARTUP the encoder
-       is still ramping (tens of kB/s) and the losses are STARTUP's own
-       overshoot - real network, a 30 Mbit path at 100 ms: 53..72% lost
-       at 1.6..2.0 s, tested at 48 kB/s, which the encoder's ramp could
-       not exceed, so confirmed, and every probe after it underfed:
-       video at 0.3 Mbit for the whole round. A policer's pair spans
-       STARTUP's exit (a 1 MB bucket at 100 ms: 16.1 s in STARTUP, 16.5
-       s after it, simulation) or follows it (19 of 19 real ones were
-       tested after it) */
+       is still ramping and the losses are STARTUP's own overshoot, so a
+       test there confirms a false ceiling. A policer's pair spans
+       STARTUP's exit or follows it (HISTORY 3) */
     if (w->bbr_state != ANL_BBR_STARTUP && w->lt.prev_rate != 0 &&
         rate + w->lt.prev_rate / 4 >= w->lt.prev_rate && rate <= w->lt.prev_rate + w->lt.prev_rate / 4) {
         w->lt.state = LT_TESTING;
@@ -3538,7 +3541,8 @@ static void bbr_round_end(anl_t *w, int app_limited)
     uint32_t rsent = w->sent_wire - w->round_sent0;             /* wire bytes sent in the round (wraps) */
     w->prev_round_min_rtt = w->round_min_rtt;
     w->round_min_rtt = 0;
-    bbr_policer(w, rd, lost, app_limited);
+    if (w->rec.cc_ignore_loss) lost = 0;                    /* the carrier loses nothing: what the timers call loss is queueing */
+    else bbr_policer(w, rd, lost, app_limited);
     bbr_path_rtt(w, rd, lost, rrate, app_limited);
     w->last_round_rate = rrate;
     w->round_ts = w->current;
@@ -4037,7 +4041,7 @@ static void update_ack(anl_t *w, int32_t rtt)
        least: the peer's ACK waits up to one for its flush, and a lost ACK's
        repeat comes one later (write_ack_segs) - with one, the RTO raced both */
     rto = w->rx_srtt + (int32_t)umax32(umax32(2u * (uint32_t)w->interval, 4u * (uint32_t)w->rx_rttval), (uint32_t)w->rx_srtt / 4);
-    w->rx_rto = (int32_t)ubound32(RTO_MIN, (uint32_t)rto, RTO_MAX);
+    w->rx_rto = (int32_t)ubound32(w->rec.rto_min, (uint32_t)rto, RTO_MAX);
 }
 
 /* a loss counted from ACK order before the peer's first report: provisional
@@ -4066,31 +4070,108 @@ static void reo_grow(anl_t *w)
  * or stuck behind it */
 static void fwd_on_ack(anl_t *w, anl_stream *st, uint32_t una)
 {
-if (st->sm == NULL) return;                     /* a reliable stream sends no FWD */
-if (ST_ON(st->out, STO_FWD)) {
-    if (tdiff(una, st->sm->fwd_una) >= 0) ST_CLR(st->out, STO_FWD);
-    else if (tdiff(una, st->sm->fwd_peer_una) > 0) {
-        /* Progress clears backoff, including its scheduled deadline.
-           Keeping that old deadline after zeroing fwd_rto made the next
-           liveness check treat a future retry as the last send time. */
-        uint32_t retry = w->current + (uint32_t)w->rx_rto;
-        st->sm->fwd_xmit = 0; st->sm->fwd_rto = 0;
-        if (tdiff(st->sm->fwd_ts, retry) > 0) st->sm->fwd_ts = retry;
+    if (st->sm == NULL) return;                     /* a reliable stream sends no FWD */
+    if (ST_ON(st->out, STO_FWD)) {
+        if (tdiff(una, st->sm->fwd_una) >= 0) ST_CLR(st->out, STO_FWD);
+        else if (tdiff(una, st->sm->fwd_peer_una) > 0) {
+            /* Progress clears backoff, including its scheduled deadline.
+               Keeping that old deadline after zeroing fwd_rto made the next
+               liveness check treat a future retry as the last send time. */
+            uint32_t retry = w->current + (uint32_t)w->rx_rto;
+            st->sm->fwd_xmit = 0; st->sm->fwd_rto = 0;
+            if (tdiff(st->sm->fwd_ts, retry) > 0) st->sm->fwd_ts = retry;
+        }
+        else if (tdiff(w->current, st->sm->fwd_ts - st->sm->fwd_rto + (uint32_t)w->rx_rto) >= 0 &&
+                 tdiff(st->sm->fwd_ts, w->current) > 0) {
+            /* The peer answers but stays behind our new_una: the FWD was lost
+               (or the peer never heard from us for longer than a window of
+               frames and now drops everything as beyond its window - it ACKs
+               that, handle_data). The backoff is for dead-link detection while
+               nothing comes back; a live peer gets the FWD again one RTO after
+               the last one, at once, without the backoff (a 25 s absent
+               receiver waited 6..20 s more before the first frame). */
+            st->sm->fwd_ts = w->current;
+            st->sm->fwd_rto = 0;
+        }
     }
-    else if (tdiff(w->current, st->sm->fwd_ts - st->sm->fwd_rto + (uint32_t)w->rx_rto) >= 0 &&
-             tdiff(st->sm->fwd_ts, w->current) > 0) {
-        /* The peer answers but stays behind our new_una: the FWD was lost
-           (or the peer never heard from us for longer than a window of
-           frames and now drops everything as beyond its window - it ACKs
-           that, handle_data). The backoff is for dead-link detection while
-           nothing comes back; a live peer gets the FWD again one RTO after
-           the last one, at once, without the backoff (a 25 s absent
-           receiver waited 6..20 s more before the first frame). */
-        st->sm->fwd_ts = w->current;
-        st->sm->fwd_rto = 0;
-    }
+    st->sm->fwd_peer_una = una;
 }
-st->sm->fwd_peer_una = una;
+
+/* A segment the peer acknowledges: the loss accounting (what RACK and the
+ * RTO counted is undone or confirmed), the FEC loss estimate, and the rate
+ * sample. Returns 1 when it shows a spurious RACK retransmission (Eifel). */
+static int ack_account(anl_t *w, anl_stream *st, anl_seg *s, uint8_t b1, uint32_t ts_echo, bbr_sample *rs)
+{
+    int spurious;
+    /* Eifel (RFC 3522): acknowledged by a peer whose newest datagram
+       was sent before our RACK retransmission - the original made it,
+       the retransmission was spurious (only reordered) */
+    int orig = s->xmit > 1 && (b1 & ACK_F_FRESH) && tdiff(ts_echo, s->ts_sent) < 0;
+    spurious = orig && s->rack_rtx == 1;
+    if (orig || s->xmit <= 1) {
+        /* never lost (reordering, a late ACK under heavy jitter;
+           or RACK marked it and it arrived before the flush
+           resent it): take it out of the loss count */
+        if (s->lost_cnt) {
+            uint32_t wire = seg_wire(s);
+            w->lost_bytes -= (uint64_t)wire < w->lost_bytes ? wire : w->lost_bytes;
+            /* out of the FEC loss estimate too when the peer
+               reports: its report counts the repair (a peer
+               that does not report leaves the mark as the
+               only evidence of a repaired loss) */
+            if (ST_ON(st->cfg, STC_FEC) && peer_rp_valid(st) && w->fl_lost) w->fl_lost--;
+            /* before the first report the mark stays, until the
+               report says whether it was rebuilt (handle_report) */
+            else if (ST_ON(st->cfg, STC_FEC) && !peer_rp_valid(st)) {
+                fl_prov_add(w, st);
+            }
+        }
+        /* acknowledged after a higher sn was (the last ACK's high
+           mark): lost and rebuilt from parity - or reordered. The
+           estimate's only view of repaired losses from a peer
+           that does not report (the rebuilt packet's ACK beats
+           RACK's mark) */
+        else if (s->xmit == 1 && ST_ON(st->cfg, STC_FEC) && !peer_rp_valid(st) && ST_ON(st->trk, STT_RACK) &&
+                 tdiff(s->sn, st->rack_hi) < 0) {
+            /* until a first report says otherwise (handle_report) */
+            fl_prov_add(w, st);
+            fec_loss_add(w, 0, 1, 0);
+        }
+    }
+    /* an RTO retransmission's loss counts only now, when it is
+       known not to be a late ACK (RACK's is counted when it is
+       marked, rack_detect) */
+    else if (s->rack_rtx) {
+        if (!s->lost_cnt) {
+            w->lost_bytes += seg_wire(s);
+            /* an RTO loss: not marked. Not into the estimate for
+               a segment its block covered while the peer reports:
+               its rebuild is in that report, and the RTO usually
+               fires before the rebuild's ACK (counted twice);
+               still the gate's hard evidence */
+            if (ST_ON(st->cfg, STC_FEC) && !(peer_rp_valid(st) && s->fec_ts)) fec_loss_add(w, 0, 1, 1);
+            else if (ST_ON(st->cfg, STC_FEC)) w->fec_loss_ts = w->current | 1;
+        }
+        /* the retransmission, not the original, was acknowledged:
+           the loss is confirmed (a RACK mark alone can be
+           reordering, undone above) - the gate's hard evidence */
+        else if (ST_ON(st->cfg, STC_FEC)) w->fec_loss_ts = w->current | 1;
+        /* FEC did not repair it either - known only from a FRESH ACK;
+           late if it reached the peer (half an RTT before this ACK)
+           after the deadline (DESIGN 8.5) */
+        if (b1 & ACK_F_FRESH) {
+            int32_t at = tdiff(w->current - srtt_or_def(w) / 2, s->ts_enq);
+            fec_auto_count(w, st, st->fc && st->fc->fec_deadline && at <= (int32_t)st->fc->fec_deadline ? FEC_LOST : FEC_LATE);
+        }
+    }
+    /* the path delivers what was sent up to here (rto_queued_hold) */
+    if (w->ackprog_ts == 0 || tdiff(s->ts_sent, w->acked_sent_max) > 0) w->acked_sent_max = s->ts_sent;
+    w->ackprog_ts = w->current | 1;
+    /* the original was acknowledged: the send state recorded for
+       the retransmission would give a false rate sample and end
+       the round early */
+    bbr_on_acked(w, s, orig ? NULL : rs);
+    return spurious;
 }
 
 /* una + SACK ranges (DESIGN 5.3), then RACK loss detection (DESIGN 6.3).
@@ -4128,74 +4209,7 @@ static int handle_ack(anl_t *w, anl_stream *st, uint8_t b1, uint32_t una24, uint
             anl_node *next = pos->next;
             if (tdiff(s->sn, end) >= 0) break;
             if (tdiff(s->sn, start) >= 0) {
-                /* Eifel (RFC 3522): acknowledged by a peer whose newest datagram
-                   was sent before our RACK retransmission - the original made it,
-                   the retransmission was spurious (only reordered) */
-                int orig = s->xmit > 1 && (b1 & ACK_F_FRESH) && tdiff(ts_echo, s->ts_sent) < 0;
-                if (orig && s->rack_rtx == 1) spurious = 1;
-                if (orig || s->xmit <= 1) {
-                    /* never lost (reordering, a late ACK under heavy jitter;
-                       or RACK marked it and it arrived before the flush
-                       resent it): take it out of the loss count */
-                    if (s->lost_cnt) {
-                        uint32_t wire = seg_wire(s);
-                        w->lost_bytes -= (uint64_t)wire < w->lost_bytes ? wire : w->lost_bytes;
-                        /* out of the FEC loss estimate too when the peer
-                           reports: its report counts the repair (a peer
-                           that does not report leaves the mark as the
-                           only evidence of a repaired loss) */
-                        if (ST_ON(st->cfg, STC_FEC) && peer_rp_valid(st) && w->fl_lost) w->fl_lost--;
-                        /* before the first report the mark stays, until the
-                           report says whether it was rebuilt (handle_report) */
-                        else if (ST_ON(st->cfg, STC_FEC) && !peer_rp_valid(st)) {
-                            fl_prov_add(w, st);
-                        }
-                    }
-                    /* acknowledged after a higher sn was (the last ACK's high
-                       mark): lost and rebuilt from parity - or reordered. The
-                       estimate's only view of repaired losses from a peer
-                       that does not report (the rebuilt packet's ACK beats
-                       RACK's mark) */
-                    else if (s->xmit == 1 && ST_ON(st->cfg, STC_FEC) && !peer_rp_valid(st) && ST_ON(st->trk, STT_RACK) &&
-                             tdiff(s->sn, st->rack_hi) < 0) {
-                        /* until a first report says otherwise (handle_report) */
-                        fl_prov_add(w, st);
-                        fec_loss_add(w, 0, 1, 0);
-                    }
-                }
-                /* an RTO retransmission's loss counts only now, when it is
-                   known not to be a late ACK (RACK's is counted when it is
-                   marked, rack_detect) */
-                else if (s->rack_rtx) {
-                    if (!s->lost_cnt) {
-                        w->lost_bytes += seg_wire(s);
-                        /* an RTO loss: not marked. Not into the estimate for
-                           a segment its block covered while the peer reports:
-                           its rebuild is in that report, and the RTO usually
-                           fires before the rebuild's ACK (counted twice);
-                           still the gate's hard evidence */
-                        if (ST_ON(st->cfg, STC_FEC) && !(peer_rp_valid(st) && s->fec_ts)) fec_loss_add(w, 0, 1, 1);
-                        else if (ST_ON(st->cfg, STC_FEC)) w->fec_loss_ts = w->current | 1;
-                    }
-                    /* the retransmission, not the original, was acknowledged:
-                       the loss is confirmed (a RACK mark alone can be
-                       reordering, undone above) - the gate's hard evidence */
-                    else if (ST_ON(st->cfg, STC_FEC)) w->fec_loss_ts = w->current | 1;
-                    /* FEC did not repair it either - known only from a FRESH ACK;
-                       late if it reached the peer (half an RTT before this ACK)
-                       after the deadline (DESIGN 8.5) */
-                    if (b1 & ACK_F_FRESH) {
-                        int32_t at = tdiff(w->current - srtt_or_def(w) / 2, s->ts_enq);
-                        fec_auto_count(w, st, st->fc && st->fc->fec_deadline && at <= (int32_t)st->fc->fec_deadline ? FEC_LOST : FEC_LATE);
-                    }
-                }
-                /* the path delivers what was sent up to here (rto_queued_hold) */
-                if (w->ackprog_ts == 0 || tdiff(s->ts_sent, w->acked_sent_max) > 0) w->acked_sent_max = s->ts_sent;
-                w->ackprog_ts = w->current | 1;
-                /* the original was acknowledged: the send state recorded for
-                   the retransmission would give a false rate sample and end
-                   the round early */
-                bbr_on_acked(w, s, orig ? NULL : rs);
+                if (ack_account(w, st, s, b1, ts_echo, rs)) spurious = 1;
                 snd_unlink(st, s);
                 seg_free(w, s);
                 acked++;
@@ -4440,22 +4454,22 @@ static void pn_take(anl_t *w, uint32_t pn)
  * datagram parsing (DESIGN 3.3 step 5 onwards)
  *-------------------------------------------------------------------*/
 /* plaintext P that siv_open verified (test.c feeds crafted ones) */
-static int anl_input_plain(anl_t *w, const char *plain, long size)
+/* what a datagram's segments add up to, for the actions after the last one */
+typedef struct rx_ctx {
+    uint32_t ts;            /* the datagram's extended send time */
+    uint32_t max_echo;      /* the newest FRESH echo among its ACKs */
+    int had_data, urgent, have_echo, acked, lost;
+    bbr_sample rs;
+} rx_ctx;
+
+/* the datagram header: conv, version, replay and time window checks, the
+   padding off the end. p and end are left on the segments. */
+static int rx_header(anl_t *w, const char *plain, long size, const char **pp, const char **endp, uint32_t *tsp)
 {
-    const char *p, *end;
+    const char *p = plain, *end = plain + size;
     uint32_t conv, ts, ref, pn;
     uint16_t ts16;
     uint8_t flg;
-    int had_data = 0, urgent = 0, have_echo = 0, acked = 0, lost = 0;
-    bbr_sample rs;
-    uint32_t max_echo = 0;
-
-    if (w == NULL || plain == NULL) return ANL_EINVAL;
-    if (size < ANL_HDR_SIZE || size > (long)w->mtu) return ANL_EFORMAT;
-    memset(&rs, 0, sizeof(rs));
-
-    p = plain;
-    end = plain + size;
     conv = dec32(&p);
     flg = dec8(&p);
     ts16 = dec16(&p);
@@ -4481,15 +4495,11 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
         w->rx_stale++;
         return ANL_ESTALE;
     }
-    /* peer_ts passes ref by at most TS_AHEAD_MAX: a replayed datagram
-       33..65 s old extends to a ts in the future, and taken as is it moved
-       peer_ts that far ahead - every genuine datagram after it was stale
-       until the clock caught up (up to 32 s; one replay stalled the
-       connection). A genuine one is ahead of ref by a few ms: current is
-       the time of the last update, and the clocks' rates differ. Clamped to
-       ref, peer_ts fell behind the peer's clock for good, and CTRL_ECHO,
-       which echoes it, gave a receive-only peer RTTs 15..20 ms long - enough
-       for rcv_hole_hopeless to skip every hole on a 100 ms path */
+    /* peer_ts passes ref by at most TS_AHEAD_MAX: a replayed old datagram
+       extends to a ts in the future and must not pull peer_ts ahead. A
+       genuine one is ahead of ref by a few ms (current is the time of the
+       last update, and the clocks' rates differ), so ref is not a clamp
+       (HISTORY 1) */
     if (!ST_ON(w->in_f, IN_F_PEER_TS) || tdiff(ts, w->peer_ts) > 0) {
         w->peer_ts = ST_ON(w->in_f, IN_F_PEER_TS) && tdiff(ts, ref) > TS_AHEAD_MAX ? ref : ts;
         w->peer_ts_at = w->current;
@@ -4508,10 +4518,204 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
         end -= n;
     }
 
+    *pp = p;
+    *endp = end;
+    *tsp = ts;
+    return ANL_OK;
+}
+
+/* DATA: p is behind the sid */
+static int rx_data_seg(anl_t *w, rx_ctx *c, const char **pp, const char *end, int sid)
+{
+    const char *p = *pp;
+    anl_stream *st;
+    uint8_t b1, flags;
+    uint32_t frg, len;
+    uint32_t sn24;
+    uint16_t frame16 = 0;
+    open_info oi;
+    if (end - p < 4) return ANL_EFORMAT;
+    b1 = dec8(&p);
+    flags = (uint8_t)(b1 & (F_HAS_FRAME | F_KEY));
+    frg = b1 & F_FRG_MASK;
+    if (frg == 31) {
+        uint32_t ext;
+        if (dec_varint(&p, end, &ext) < 0) return ANL_EFORMAT;
+        frg = 31 + ext;
+        /* a frame has at most a window of fragments (ANL_ETOOBIG at
+           the sender); a larger index is garbage and its canonical FEC
+           encoding would overrun the receive cache slot (HISTORY 2) */
+        if (frg >= ANL_MAX_WND) return ANL_EFORMAT;
+    }
+    if (end - p < 3) return ANL_EFORMAT;
+    sn24 = dec24(&p);
+    if (flags & F_HAS_FRAME) {
+        if (end - p < 2) return ANL_EFORMAT;
+        frame16 = dec16(&p);
+    }
+    if (b1 & F_OPEN) {
+        if (end - p < OPEN_BODY) return ANL_EFORMAT;
+        dec_open_body(&p, &oi);
+    }
+    if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
+    if ((uint32_t)(end - p) < len) return ANL_EFORMAT;
+    c->had_data = 1;
+    w->rx_net += len + SEG_WIRE_OVH;    /* arrived, whatever becomes of it (as sent_wire counts it) */
+    if (b1 & F_OPEN) {
+        c->urgent = 1;                 /* let the opener learn quickly that we have the stream */
+        st = stream_for_open(w, sid, &oi);
+    } else if ((st = stream_for_input(w, sid)) == NULL) {
+        /* data for a stream that is not here (any more): the sender
+           still waits for an ACK, tell it to give up */
+        rstq_push(w, sid);
+        c->urgent = 1;
+    }
+    if (st) handle_data(w, st, extend24(sn24, st->rcv_nxt), frg, flags, frame16, p, len, c->ts, 0);
+    p += len;
+    *pp = p;
+    return ANL_OK;
+}
+
+/* ACK: the ranges are checked here and read in place by handle_ack */
+static int rx_ack_seg(anl_t *w, rx_ctx *c, const char **pp, const char *end, int sid)
+{
+    const char *p = *pp;
+    anl_stream *st;
+    uint8_t b1;
+    uint16_t wnd;
+    uint32_t una24, ts_echo, n, i, span = 0;
+    const char *rng;
+    uint16_t echo16;
+    if (end - p < ACK_FIX) return ANL_EFORMAT;
+    w->ack_rx_ts = w->current | 1;          /* the peer receives from us: echo_ride */
+    b1 = dec8(&p);
+    una24 = dec24(&p);
+    wnd = dec16(&p);
+    echo16 = dec16(&p);
+    /* our own clock, 16 bits back: the newest time with these low bits */
+    ts_echo = ts16_back(w->current, echo16);
+    if (dec_varint(&p, end, &n) < 0) return ANL_EFORMAT;
+    rng = p;                                /* the ranges: checked here, read in place by handle_ack */
+    for (i = 0; i < n; i++) {
+        uint32_t gap, len;
+        if (dec_varint(&p, end, &gap) < 0 || dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
+        span += gap + len;
+        if ((gap == 0 && i > 0) || len == 0 || span > ANL_MAX_WND) return ANL_EFORMAT;
+    }
+    if (b1 & ACK_F_WASK) c->urgent = 1;
+    st = stream_for_input(w, sid);
+    if (st) {
+        int fresh_acked = handle_ack(w, st, b1, una24, wnd, ts_echo, rng, p, n, &c->lost, &c->rs);
+        c->acked += fresh_acked;
+        /* After an input gap, an old buffered ACK with no new
+           confirmation cannot restart RTT from a retired flight.
+           Keep ordinary and in-window media echoes: retirement
+           alone does not make queue delay stale. A new confirmation
+           still learns a genuine RTT increase without a fixed cap. */
+        if ((b1 & ACK_F_FRESH) && (fresh_acked > 0 || !ST_ON(w->in_f, IN_F_RTT_RESUME) || tdiff(w->current, ts_echo) <= w->rx_rto) &&
+            (!c->have_echo || tdiff(ts_echo, c->max_echo) > 0)) {
+            c->max_echo = ts_echo;
+            c->have_echo = 1;
+        }
+    }
+    *pp = p;
+    return ANL_OK;
+}
+
+/* FWD */
+static int rx_fwd_seg(anl_t *w, rx_ctx *c, const char **pp, const char *end, int sid)
+{
+    const char *p = *pp;
+    anl_stream *st;
+    uint32_t una24;
+    if (end - p < 3) return ANL_EFORMAT;
+    una24 = dec24(&p);
+    c->urgent = 1;
+    st = stream_for_input(w, sid);
+    if (st) handle_fwd(w, st, una24);
+    *pp = p;
+    return ANL_OK;
+}
+
+/* CTRL: unknown subtypes are skipped */
+static int rx_ctrl_seg(anl_t *w, rx_ctx *c, const char **pp, const char *end, int sid)
+{
+    const char *p = *pp;
+    anl_stream *st;
+    uint8_t sub;
+    uint32_t blen;
+    if (end - p < 1) return ANL_EFORMAT;
+    sub = dec8(&p);
+    if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
+    if ((uint32_t)(end - p) < blen) return ANL_EFORMAT;
+    if (sub == CTRL_PARITY) {
+        w->rx_net += blen + SEG_WIRE_OVH;
+        st = stream_for_input(w, sid);
+        if (st) handle_parity(w, st, p, blen, c->ts);
+    } else if (sub == CTRL_RCV_SKIP && blen >= SKIP_BODY) {
+        const char *q = p;
+        uint32_t retired = dec32(&q);
+        st = stream_for_input(w, sid);
+        if (st && st->mode == ANL_SEMI && tdiff(retired, st->snd_una) > 0 &&
+            tdiff(retired, st->snd_nxt) <= 0) {
+            int freed = parse_una(st, retired);
+            shrink_buf(st);
+            w->inflight_segs -= umin32(w->inflight_segs, (uint32_t)freed);
+            c->acked += freed; /* opens the window, without a delivery sample */
+            /* the peer is past the point a pending FWD asks it to skip to:
+               as for an ACK's una, the FWD is answered */
+            if (ST_ON(st->out, STO_FWD) && tdiff(retired, st->sm->fwd_una) >= 0) ST_CLR(st->out, STO_FWD);
+        }
+    } else if (sub == CTRL_OPEN && blen >= OPEN_BODY) {
+        open_info oi;
+        const char *q = p;
+        dec_open_body(&q, &oi);
+        c->urgent = 1;
+        st = stream_for_open(w, sid, &oi);
+        if (st) probe_tell_schedule(st);        /* a window ACK tells the opener we have it */
+    } else if (sub == CTRL_RST && sid != ANL_SID_DEFAULT) {
+        /* the peer has no stream for the sid (any more): nor do we,
+           a CLOSE of ours is answered, and a sid of the peer's rests
+           a while */
+        if ((st = sget(w, sid)) != NULL) stream_free(w, st);
+        sid_close_done(w, sid);
+        sid_hold(w, sid);
+    } else if (sub == CTRL_CLOSE && sid != ANL_SID_DEFAULT) {
+        /* the peer closed the stream and dropped its end: we drop
+           ours (what arrived in order stays readable) and answer RST,
+           every time - an answer may be lost. Both closed: ours is
+           answered too. Not heard of yet: the sid rests all the same */
+        if ((st = sget(w, sid)) != NULL) stream_free_ex(w, st, 1);
+        sid_close_done(w, sid);
+        sid_hold(w, sid);
+        rstq_push(w, sid);
+        c->urgent = 1;
+    } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
+        st = stream_for_input(w, sid);
+        if (st) handle_report(w, st, p, c->ts);
+    } else if (sub == CTRL_ECHO && blen >= ECHO_BODY && (w->life != ANL_LIFE_NEW)) {
+        handle_echo(w, p);
+    }
+    p += blen;                      /* unknown subtypes are skipped */
+    *pp = p;
+    return ANL_OK;
+}
+
+static int anl_input_plain(anl_t *w, const char *plain, long size)
+{
+    const char *p, *end;
+    rx_ctx c;
+    int r;
+
+    if (w == NULL || plain == NULL) return ANL_EINVAL;
+    if (size < ANL_HDR_SIZE || size > (long)w->mtu_max) return ANL_EFORMAT;
+    memset(&c, 0, sizeof(c));
+    r = rx_header(w, plain, size, &p, &end, &c.ts);
+    if (r) return r;
+
     while (p < end) {
         uint8_t b0;
         int type, sid;
-        anl_stream *st;
         b0 = dec8(&p);
         if (b0 & SEG_RSV) return ANL_EFORMAT;
         type = b0 >> 6;
@@ -4523,169 +4727,27 @@ static int anl_input_plain(anl_t *w, const char *plain, long size)
             if (dec_varint(&p, end, &hi) < 0 || hi == 0 || varint_size(hi) != (int)(p - q)) return ANL_EFORMAT;
             sid |= (int)(hi << SID_LO_BITS);
         }
-        if (type == SEG_DATA) {
-            uint8_t b1, flags;
-            uint32_t frg, len;
-            uint32_t sn24;
-            uint16_t frame16 = 0;
-            open_info oi;
-            if (end - p < 4) return ANL_EFORMAT;
-            b1 = dec8(&p);
-            flags = (uint8_t)(b1 & (F_HAS_FRAME | F_KEY));
-            frg = b1 & F_FRG_MASK;
-            if (frg == 31) {
-                uint32_t ext;
-                if (dec_varint(&p, end, &ext) < 0) return ANL_EFORMAT;
-                frg = 31 + ext;
-                /* a frame has at most a window of fragments (ANL_ETOOBIG at
-                   the sender); a larger index is garbage - and its canonical
-                   encoding for FEC (a 3..5 byte extension) overran the
-                   receive cache slot by up to 3 bytes (fuzz, ASan) */
-                if (frg >= ANL_MAX_WND) return ANL_EFORMAT;
-            }
-            if (end - p < 3) return ANL_EFORMAT;
-            sn24 = dec24(&p);
-            if (flags & F_HAS_FRAME) {
-                if (end - p < 2) return ANL_EFORMAT;
-                frame16 = dec16(&p);
-            }
-            if (b1 & F_OPEN) {
-                if (end - p < OPEN_BODY) return ANL_EFORMAT;
-                dec_open_body(&p, &oi);
-            }
-            if (dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
-            if ((uint32_t)(end - p) < len) return ANL_EFORMAT;
-            had_data = 1;
-            w->rx_net += len + SEG_WIRE_OVH;    /* arrived, whatever becomes of it (as sent_wire counts it) */
-            if (b1 & F_OPEN) {
-                urgent = 1;                 /* let the opener learn quickly that we have the stream */
-                st = stream_for_open(w, sid, &oi);
-            } else if ((st = stream_for_input(w, sid)) == NULL) {
-                /* data for a stream that is not here (any more): the sender
-                   still waits for an ACK, tell it to give up */
-                rstq_push(w, sid);
-                urgent = 1;
-            }
-            if (st) handle_data(w, st, extend24(sn24, st->rcv_nxt), frg, flags, frame16, p, len, ts, 0);
-            p += len;
-        } else if (type == SEG_ACK) {
-            uint8_t b1;
-            uint16_t wnd;
-            uint32_t una24, ts_echo, n, i, span = 0;
-            const char *rng;
-            uint16_t echo16;
-            if (end - p < ACK_FIX) return ANL_EFORMAT;
-            w->ack_rx_ts = w->current | 1;          /* the peer receives from us: echo_ride */
-            b1 = dec8(&p);
-            una24 = dec24(&p);
-            wnd = dec16(&p);
-            echo16 = dec16(&p);
-            /* our own clock, 16 bits back: the newest time with these low bits */
-            ts_echo = ts16_back(w->current, echo16);
-            if (dec_varint(&p, end, &n) < 0) return ANL_EFORMAT;
-            rng = p;                                /* the ranges: checked here, read in place by handle_ack */
-            for (i = 0; i < n; i++) {
-                uint32_t gap, len;
-                if (dec_varint(&p, end, &gap) < 0 || dec_varint(&p, end, &len) < 0) return ANL_EFORMAT;
-                span += gap + len;
-                if ((gap == 0 && i > 0) || len == 0 || span > ANL_MAX_WND) return ANL_EFORMAT;
-            }
-            if (b1 & ACK_F_WASK) urgent = 1;
-            st = stream_for_input(w, sid);
-            if (st) {
-                int fresh_acked = handle_ack(w, st, b1, una24, wnd, ts_echo, rng, p, n, &lost, &rs);
-                acked += fresh_acked;
-                /* After an input gap, an old buffered ACK with no new
-                   confirmation cannot restart RTT from a retired flight.
-                   Keep ordinary and in-window media echoes: retirement
-                   alone does not make queue delay stale. A new confirmation
-                   still learns a genuine RTT increase without a fixed cap. */
-                if ((b1 & ACK_F_FRESH) && (fresh_acked > 0 || !ST_ON(w->in_f, IN_F_RTT_RESUME) || tdiff(w->current, ts_echo) <= w->rx_rto) &&
-                    (!have_echo || tdiff(ts_echo, max_echo) > 0)) {
-                    max_echo = ts_echo;
-                    have_echo = 1;
-                }
-            }
-        } else if (type == SEG_FWD) {
-            uint32_t una24;
-            if (end - p < 3) return ANL_EFORMAT;
-            una24 = dec24(&p);
-            urgent = 1;
-            st = stream_for_input(w, sid);
-            if (st) handle_fwd(w, st, una24);
-        } else {
-            uint8_t sub;
-            uint32_t blen;
-            if (end - p < 1) return ANL_EFORMAT;
-            sub = dec8(&p);
-            if (dec_varint(&p, end, &blen) < 0) return ANL_EFORMAT;
-            if ((uint32_t)(end - p) < blen) return ANL_EFORMAT;
-            if (sub == CTRL_PARITY) {
-                w->rx_net += blen + SEG_WIRE_OVH;
-                st = stream_for_input(w, sid);
-                if (st) handle_parity(w, st, p, blen, ts);
-            } else if (sub == CTRL_RCV_SKIP && blen >= SKIP_BODY) {
-                const char *q = p;
-                uint32_t retired = dec32(&q);
-                st = stream_for_input(w, sid);
-                if (st && st->mode == ANL_SEMI && tdiff(retired, st->snd_una) > 0 &&
-                    tdiff(retired, st->snd_nxt) <= 0) {
-                    int freed = parse_una(st, retired);
-                    shrink_buf(st);
-                    w->inflight_segs -= umin32(w->inflight_segs, (uint32_t)freed);
-                    acked += freed; /* opens the window, without a delivery sample */
-                    /* the peer is past the point a pending FWD asks it to skip to:
-                       as for an ACK's una, the FWD is answered */
-                    if (ST_ON(st->out, STO_FWD) && tdiff(retired, st->sm->fwd_una) >= 0) ST_CLR(st->out, STO_FWD);
-                }
-            } else if (sub == CTRL_OPEN && blen >= OPEN_BODY) {
-                open_info oi;
-                const char *q = p;
-                dec_open_body(&q, &oi);
-                urgent = 1;
-                st = stream_for_open(w, sid, &oi);
-                if (st) probe_tell_schedule(st);        /* a window ACK tells the opener we have it */
-            } else if (sub == CTRL_RST && sid != ANL_SID_DEFAULT) {
-                /* the peer has no stream for the sid (any more): nor do we,
-                   a CLOSE of ours is answered, and a sid of the peer's rests
-                   a while */
-                if ((st = sget(w, sid)) != NULL) stream_free(w, st);
-                sid_close_done(w, sid);
-                sid_hold(w, sid);
-            } else if (sub == CTRL_CLOSE && sid != ANL_SID_DEFAULT) {
-                /* the peer closed the stream and dropped its end: we drop
-                   ours (what arrived in order stays readable) and answer RST,
-                   every time - an answer may be lost. Both closed: ours is
-                   answered too. Not heard of yet: the sid rests all the same */
-                if ((st = sget(w, sid)) != NULL) stream_free_ex(w, st, 1);
-                sid_close_done(w, sid);
-                sid_hold(w, sid);
-                rstq_push(w, sid);
-                urgent = 1;
-            } else if (sub == CTRL_REPORT && blen >= REPORT_BODY) {
-                st = stream_for_input(w, sid);
-                if (st) handle_report(w, st, p, ts);
-            } else if (sub == CTRL_ECHO && blen >= ECHO_BODY && (w->life != ANL_LIFE_NEW)) {
-                handle_echo(w, p);
-            }
-            p += blen;                      /* unknown subtypes are skipped */
-        }
+        if (type == SEG_DATA) r = rx_data_seg(w, &c, &p, end, sid);
+        else if (type == SEG_ACK) r = rx_ack_seg(w, &c, &p, end, sid);
+        else if (type == SEG_FWD) r = rx_fwd_seg(w, &c, &p, end, sid);
+        else r = rx_ctrl_seg(w, &c, &p, end, sid);
+        if (r) return r;
     }
 
-    if (have_echo && (w->life != ANL_LIFE_NEW)) {
-        int32_t rtt = tdiff(w->current, max_echo);
+    if (c.have_echo && (w->life != ANL_LIFE_NEW)) {
+        int32_t rtt = tdiff(w->current, c.max_echo);
         if (rtt >= 0 && rtt <= w->rx_rto) ST_CLR(w->in_f, IN_F_RTT_RESUME);
         if (rtt >= 0 && rtt <= (int32_t)RTO_MAX) update_ack(w, rtt);   /* ignore garbage echoes */
     }
-    if (rs.valid && (w->life != ANL_LIFE_NEW)) bbr_on_ack(w, &rs);
+    if (c.rs.valid && (w->life != ANL_LIFE_NEW)) bbr_on_ack(w, &c.rs);
 
     /* ACK clocking (DESIGN 6.4): the window just opened or RACK found a loss -
        send now instead of at the next interval (still within cwnd and pacing) */
-    if (w->life == ANL_LIFE_LIVE && (lost > 0 || (acked > 0 && has_new_data(w)))) anl_flush_internal(w);
+    if (w->life == ANL_LIFE_LIVE && (c.lost > 0 || (c.acked > 0 && has_new_data(w)))) anl_flush_internal(w);
 
     if (w->life != ANL_LIFE_NEW) {
-        if (had_data) w->rx_data_since_ack++;
-        if (w->rx_data_since_ack >= 2 || urgent) flush_control(w);
+        if (c.had_data) w->rx_data_since_ack++;
+        if (w->rx_data_since_ack >= 2 || c.urgent) flush_control(w);
     }
     return ANL_OK;
 }
@@ -4705,7 +4767,7 @@ int anl_input(anl_t *w, const char *data, long size)
 {
     int r;
     if (w == NULL || data == NULL) return ANL_EINVAL;
-    if (size < ANL_OVERHEAD || size > (long)w->mtu) return ANL_EFORMAT;
+    if (size < ANL_OVERHEAD || size > (long)w->mtu_max) return ANL_EFORMAT;
     /* decrypted into the datagram builder: it is empty outside a flush, and
        parsing writes nothing to it - only the flushes after the parse do,
        when the plaintext has been read */
@@ -4791,9 +4853,25 @@ static void fec_pump(anl_t *w, anl_stream *st, int flush_all)
     }
 }
 
+/* paused by the application, or the connection is on a stream carrier */
+static int fec_paused(const anl_stream *st)
+{
+    return ST_ON(st->fc->tx_f, FCT_PAUSED) || st->w->carrier == ANL_CARRIER_STREAM;
+}
+
+/* the open block and the parities still to go are dropped; segments already
+   sent stay as they are, without repair */
+static void fec_pause_drop(anl_stream *st)
+{
+    st->fc->fec_n = 0;
+    ST_CLR(st->fc->tx_f, FCT_BLK_KEY);
+    st->fc->fec_out_i = st->fc->fec_out_m;
+    fec_release_tx(st);
+}
+
 static int fec_active(const anl_stream *st)
 {
-    return ST_ON(st->cfg, STC_FEC) && (!ST_ON(st->fc->tx_f, FCT_RTT_AUTO) || ST_ON(st->fc->tx_f, FCT_GATE));
+    return ST_ON(st->cfg, STC_FEC) && !fec_paused(st) && (!ST_ON(st->fc->tx_f, FCT_RTT_AUTO) || ST_ON(st->fc->tx_f, FCT_GATE));
 }
 
 /* a typical frame of a small-block stream (audio): FEC_SMALL_BLOCK holds 8 of them */
@@ -5073,8 +5151,7 @@ static void fec_close_block(anl_t *w, anl_stream *st)
        high ratio the rate of the data alone would pace the stream down step
        by step. Only the parities beyond FEC_CREDIT_FREE %: up to that the
        samples of the data alone reach the link already (the max filter picks
-       the bursts) - crediting all unused parities, from the measured loss,
-       overestimated by 7..14%. */
+       the bursts) - crediting all unused parities overestimates (HISTORY 8). */
     j = (k * FEC_CREDIT_FREE + 50) / 100;
     share = m > j ? (m - j) * pwire / k : 0;
     /* parities are lost like data: credit what is expected to arrive, not
@@ -5215,6 +5292,7 @@ static uint32_t fec_block_ms(const anl_t *w, const anl_stream *st)
 static void fec_add(anl_t *w, anl_stream *st, const anl_seg *seg)
 {
     fec_buf *b;
+    if (fec_paused(st)) return;                     /* nothing collected while paused (anl_stream_fec_pause) */
     if (ST_ON(st->fc->tx_f, FCT_RTT_AUTO) && st->fc->fec_start_state == FEC_START_NONE) {
         st->fc->fec_start_ts = w->current;
         st->fc->fec_start_state = FEC_START_ALLOW;
@@ -6169,55 +6247,15 @@ static void flush_retransmit(anl_t *w, anl_stream *st, int64_t retrans_limit, in
     if (pos == &st->snd_buf || ST_ON(w->out_f, OUT_F_PACE_BLOCKED) || *rtx_capped) st->rto_next = next_rto;
 }
 
-static void anl_flush_internal(anl_t *w)
+/* flush phase 3 (anl_flush_internal) */
+static void flush_new_data(anl_t *w)
 {
-    uint32_t current = w->current;
-    uint32_t inflight = 0;
-    int lost = 0;
-    int64_t retrans_limit, retrans_spent = 0;
-    int rtx_capped = 0, new_data = 0, queued;
     anl_node *n, *nx;
     anl_stream *st;
 
-    if (w->life != ANL_LIFE_LIVE) return;
-    pace_refill(w);
-    ST_CLR(w->out_f, OUT_F_PACE_BLOCKED);
-    dg_begin(w);
-
-    /* 1: control */
-    flush_control_segs(w, 0);
-    w->rx_data_since_ack = 0;
-
-    /* One walk of the list: sender-side dropping before computing budgets,
-       then what is in flight - sent and not acknowledged, minus what RACK
-       declared lost and is not resent yet (BBR's pipe): with the lost
-       segments counted, a policer that dropped half of a STARTUP overshoot
-       kept DRAIN from ever ending (DESIGN 6.8). Each stream's
-       drop check and count concern that stream only. */
-    FOR_EACH_STREAM(w, st, n, nx) {
-        if (st->fc && st->fc->latency_rtt) fec_deadline_follow(w, st);
-        if (stream_sendable(st) && (st->nsnd_que || st->nsnd_buf)) semi_drop_check(w, st);   /* nothing to drop otherwise */
-        if (stream_has_data(st)) new_data = 1;
-        inflight += st->nsnd_buf - umin32(st->nlost, st->nsnd_buf);
-    }
-    w->inflight_segs = inflight;
-    w->flush_budget = (int64_t)w->cwnd - (int64_t)inflight;
-
-    /* 2: retransmissions, not gated by cwnd, gated by pacing (3/4 if new data waits);
-       streams are visited in priority order */
-    retrans_limit = new_data ? (w->pace_tokens > 0 ? w->pace_tokens * 3 / 4 : 0)
-                             : INT64_MAX;
-    FOR_EACH_STREAM(w, st, n, nx) {
-        if (stream_sendable(st)) (void)rack_detect(w, st);           /* RACK timer */
-    }
-    FOR_EACH_STREAM(w, st, n, nx) {
-        if (ST_ON(w->out_f, OUT_F_PACE_BLOCKED) || rtx_capped) break;
-        flush_retransmit(w, st, retrans_limit, &retrans_spent, &lost, &rtx_capped);
-    }
-
-    /* 3: new data, a stream's due parity first. The default stream has strict priority, the
-       others share by weighted round robin; a stream's due parity goes first
-       in its turn: it repairs data already sent. */
+    /* The default stream has strict priority, the others share by weighted
+       round robin; a stream's due parity goes first in its turn: it repairs
+       data already sent. */
     if (w->app_limited != 0 && w->burst_left == 0) burst_begin(w);
     st = w->dflt;
     if (ST_ON(st->cfg, STC_FEC) && !ST_ON(w->out_f, OUT_F_PACE_BLOCKED)) fec_pump(w, st, 0);
@@ -6257,6 +6295,14 @@ static void anl_flush_internal(anl_t *w)
             }
         }
     }
+}
+
+/* flush, after phase 3 */
+static void flush_mark_app_limited(anl_t *w)
+{
+    anl_node *n, *nx;
+    anl_stream *st;
+    int queued = 0;
 
     /* the budget is not used up and nothing waits: the application is the
        limit, not the network - rate samples until the data now in flight is
@@ -6270,7 +6316,6 @@ static void anl_flush_internal(anl_t *w)
        the limit. With the path delivering everything the app-limited samples
        are what lets the model climb back; held network-limited it fell
        further */
-    queued = 0;
     FOR_EACH_STREAM(w, st, n, nx) {
         if (stream_sendable(st) && st->nsnd_que > 0) { queued = 1; break; }
     }
@@ -6278,9 +6323,17 @@ static void anl_flush_internal(anl_t *w)
         w->app_limited = (w->delivered + bbr_inflight_bytes(w)) | 1;
         w->burst_left = 0;                  /* the burst is over */
     }
+}
 
-    /* 4: FEC: blocks that collected fec_blk_ms, parities still due (streams
-       without new data), in priority order; stale parities */
+/* flush phase 4 */
+static void flush_fec(anl_t *w)
+{
+    uint32_t current = w->current;
+    anl_node *n, *nx;
+    anl_stream *st;
+
+    /* blocks that collected fec_blk_ms, parities still due (streams without
+       new data), in priority order; stale parities */
     FOR_EACH_STREAM(w, st, n, nx) {
         if (!ST_ON(st->cfg, STC_FEC) || !flush_busy(st)) continue;
         if (st->fc->fec_n > 0 && tdiff(current, st->fc->fec_first_ts) >= (int32_t)st->fc->fec_blk_ms) fec_close_block(w, st);
@@ -6289,6 +6342,59 @@ static void anl_flush_internal(anl_t *w)
     FOR_EACH_STREAM(w, st, n, nx) {
         if (ST_ON(st->cfg, STC_FEC)) fec_pcache_expire(w, st);
     }
+}
+
+static void anl_flush_internal(anl_t *w)
+{
+    uint32_t inflight = 0;
+    int lost = 0;
+    int64_t retrans_limit, retrans_spent = 0;
+    int rtx_capped = 0, new_data = 0;
+    anl_node *n, *nx;
+    anl_stream *st;
+
+    if (w->life != ANL_LIFE_LIVE) return;
+    pace_refill(w);
+    ST_CLR(w->out_f, OUT_F_PACE_BLOCKED);
+    dg_begin(w);
+
+    /* 1: control */
+    flush_control_segs(w, 0);
+    w->rx_data_since_ack = 0;
+
+    /* One walk of the list: sender-side dropping before computing budgets,
+       then what is in flight - sent and not acknowledged, minus what RACK
+       declared lost and is not resent yet (BBR's pipe): with the lost
+       segments counted, a policer that dropped half of a STARTUP overshoot
+       kept DRAIN from ever ending (DESIGN 6.8). Each stream's
+       drop check and count concern that stream only. */
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (st->fc && st->fc->latency_rtt) fec_deadline_follow(w, st);
+        if (stream_sendable(st) && (st->nsnd_que || st->nsnd_buf)) semi_drop_check(w, st);   /* nothing to drop otherwise */
+        if (stream_has_data(st)) new_data = 1;
+        inflight += st->nsnd_buf - umin32(st->nlost, st->nsnd_buf);
+    }
+    w->inflight_segs = inflight;
+    w->flush_budget = (int64_t)w->cwnd - (int64_t)inflight;
+
+    /* 2: retransmissions, not gated by cwnd, gated by pacing (3/4 if new data waits);
+       streams are visited in priority order */
+    retrans_limit = new_data ? (w->pace_tokens > 0 ? w->pace_tokens * 3 / 4 : 0)
+                             : INT64_MAX;
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (stream_sendable(st)) (void)rack_detect(w, st);           /* RACK timer */
+    }
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (ST_ON(w->out_f, OUT_F_PACE_BLOCKED) || rtx_capped) break;
+        flush_retransmit(w, st, retrans_limit, &retrans_spent, &lost, &rtx_capped);
+    }
+
+    /* 3: new data, a stream's due parity first */
+    flush_new_data(w);
+    flush_mark_app_limited(w);
+
+    /* 4: FEC */
+    flush_fec(w);
 
     dg_seal(w);
     ANL_TRACE(flush, w, (int64_t)w->cwnd - (int64_t)inflight, retrans_spent, rtx_capped);
@@ -6299,7 +6405,7 @@ static void anl_flush_internal(anl_t *w)
        fills the bottleneck queue first) or with a policer's heavy loss:
        without a queue the RTOs are tail losses of a burst or reordering on
        a jittery link, and each would stall a round. */
-    if (lost && (bbr_queue_signal(w) || w->loss_rate * 100 > BBR_LOSS_BLIND * 256u)) {
+    if (lost && !w->rec.cc_ignore_loss && (bbr_queue_signal(w) || w->loss_rate * 100 > BBR_LOSS_BLIND * 256u)) {
         w->rto_round = w->round_count + 1;
         w->rto_inflight = inflight;
         bbr_set_cwnd(w);
@@ -6315,6 +6421,8 @@ void anl_config_default(anl_config *cfg, int role)
     memset(cfg, 0, sizeof(*cfg));
     cfg->role = role ? ANL_ROLE_SERVER : ANL_ROLE_CLIENT;
     cfg->mtu = 1400;
+    cfg->rto_min_ms = RTO_MIN;
+    cfg->fast_retrans = 1;
     cfg->pad_max = 32;
     cfg->interval = CFG_INTERVAL;
     cfg->init_cwnd = CFG_INIT_CWND;
@@ -6348,12 +6456,46 @@ void anl_stream_opt_default(anl_stream_opt *opt, int mode)
     opt->report = 1;
 }
 
+/* What is known of the path - RTT, RTO, reordering, the bandwidth model, the
+ * policer detection, RACK's evidence - as on a new connection (anl_create, a
+ * carrier switch). Before the first sample the RTO is what a first sample of
+ * RTO_DEF gives (srtt + 4 x srtt / 2): RTO_DEF alone is the RTT of many mobile
+ * paths, and the whole first flight - the first key frame - was resent
+ * spuriously. */
+static void path_model_reset(anl_t *w)
+{
+    anl_stream *st;
+    anl_node *n, *nx;
+    w->rx_srtt = w->rx_rttval = w->last_rtt = 0;
+    w->rx_rto = (int32_t)umax32(3 * RTO_DEF, w->rec.rto_min);
+    w->reo_mult = 1;
+    w->round_min_rtt = w->prev_round_min_rtt = 0;
+    w->min_rtt = w->min_rtt_ts = 0;
+    memset(w->bw_round, 0, sizeof(w->bw_round));
+    w->btl_bw = w->bw_lo = w->round_bw = 0;
+    w->inflight_hi = 0;
+    w->loss_rate = 0;
+    w->full_bw = w->full_bw_cnt = 0;
+    ST_CLR(w->bbr_f, BBR_F_FULL_BW | BBR_F_QFLAT_PROBE | BBR_F_RTT_PROBED);
+    ST_CLR(w->in_f, IN_F_RACK);
+    memset(&w->path, 0, sizeof(w->path));
+    memset(&w->lt, 0, sizeof(w->lt));
+    w->bbr_state = ANL_BBR_STARTUP;
+    w->pacing_gain = BBR_STARTUP_GAIN;
+    w->cwnd_gain = BBR_CWND_GAIN;
+    w->cwnd = w->init_cwnd;
+    w->rto_round = 0;
+    FOR_EACH_STREAM(w, st, n, nx) ST_CLR(st->trk, STT_RACK);
+}
+
 anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
 {
     anl_t *w;
     if (conv == 0 || cfg == NULL) return NULL;
     if (cfg->role != ANL_ROLE_CLIENT && cfg->role != ANL_ROLE_SERVER) return NULL;
     if (cfg->mtu < ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN_BODY + 64 || cfg->mtu > 65535) return NULL;
+    if (cfg->mtu_max != 0 && cfg->mtu_max < cfg->mtu) return NULL;
+    if (cfg->mtu_max > 65535) return NULL;
     if (cfg->pad_max < 0 || cfg->pad_max > ANL_MAX_PAD) return NULL;
     if (cfg->ts_window_ms > 30000) return NULL;     /* a 16-bit ts: well inside half its range */
     if (cfg->default_snd_wnd < 0 || cfg->default_snd_wnd > ANL_MAX_WND) return NULL;
@@ -6371,7 +6513,13 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
     w->user = user;
     anl_keys_derive(&w->keys, cfg->psk);
     w->mtu = (uint32_t)cfg->mtu;
+    w->mtu_max = cfg->mtu_max > 0 ? (uint32_t)cfg->mtu_max : (uint32_t)cfg->mtu;
     w->mss = w->mtu - ANL_OVERHEAD - DATA_HDR_MAX;
+    w->rec.rto_min = cfg->rto_min_ms > 0 ? ubound32(1, (uint32_t)cfg->rto_min_ms, RTO_MAX) : RTO_MIN;
+    w->rec.fast_retrans = cfg->fast_retrans != 0;
+    w->rec.cc_ignore_loss = cfg->cc_ignore_loss != 0;
+    w->rec_dgram = w->rec;
+    w->pace_burst_auto = cfg->pace_burst <= 0;
     w->pad_max = cfg->pad_max;
     w->rng = cfg->rng;
     w->interval = cfg->interval > 0 ? ubound32(1, (uint32_t)cfg->interval, 5000) : CFG_INTERVAL;
@@ -6393,21 +6541,13 @@ anl_t *anl_create(uint32_t conv, const anl_config *cfg, void *user)
     w->sid_next = sid_first(w->role);
     QINIT(&w->slist);
 
-    /* before the first sample: the RTO a first sample of RTO_DEF gives
-       (srtt + 4 x srtt / 2). RTO_DEF alone is the RTT of many mobile paths:
-       the whole first flight - the first key frame - was resent spuriously */
-    w->rx_rto = 3 * RTO_DEF;
-    w->reo_mult = 1;
-    w->cwnd = w->init_cwnd;
+    path_model_reset(w);
     w->avg_seg = w->mss + SEG_WIRE_OVH;
-    w->bbr_state = ANL_BBR_STARTUP;
-    w->pacing_gain = BBR_STARTUP_GAIN;
-    w->cwnd_gain = BBR_CWND_GAIN;
     w->pace_tokens = (int64_t)w->pace_burst;
     w->par_rate = PAR_RATE_NONE;
 
-    w->buf = (char *)anl_malloc(w, w->mtu);
-    w->scratch = (char *)anl_malloc(w, w->mtu);
+    w->buf = (char *)anl_malloc(w, w->mtu_max);
+    w->scratch = (char *)anl_malloc(w, w->mtu_max);
     if (w->buf == NULL || w->scratch == NULL) {
         anl_free(w, w->buf); anl_free(w, w->scratch); anl_free(w, w);
         return NULL;
@@ -6449,6 +6589,97 @@ void anl_release(anl_t *w)
 void anl_setoutput(anl_t *w, anl_output_fn output)
 {
     if (w) w->output = output;
+}
+
+/* A carrier switch (DESIGN 10.1): the path is another one, so nothing measured
+ * on the old applies - RTT, RTO, the bandwidth model, the policer detection and
+ * RACK's evidence start again as on a new connection. What is in flight may
+ * have been lost on the old path (or still sit in a queue of the new one):
+ * everything unacknowledged is retransmitted once, at the new RTO's size */
+static void carrier_switch(anl_t *w, int carrier)
+{
+    anl_stream *st;
+    anl_node *n, *nx;
+    w->carrier = (uint8_t)carrier;
+    w->rec = w->rec_dgram;
+    if (carrier == ANL_CARRIER_STREAM) {
+        w->rec.fast_retrans = 0;
+        w->rec.cc_ignore_loss = 1;
+        w->rec.rto_min = umax32(w->rec.rto_min, STREAM_RTO_MIN);
+    }
+    path_model_reset(w);
+    FOR_EACH_STREAM(w, st, n, nx) {
+        anl_node *pos;
+        for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next) {
+            anl_seg *seg = QENTRY(pos, anl_seg, node);
+            seg->rto = (uint32_t)w->rx_rto;
+            seg->resendts = w->current;
+        }
+        st->rto_next = w->current;
+        if (carrier == ANL_CARRIER_STREAM && ST_ON(st->cfg, STC_FEC)) fec_pause_drop(st);
+    }
+}
+
+static int set_mtu(anl_t *w, int value)
+{
+    uint32_t mtu = (uint32_t)value, mss;
+    anl_stream *st;
+    anl_node *n, *nx;
+    if (value < ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN_BODY + 64 || mtu > w->mtu_max) return ANL_EINVAL;
+    mss = mtu - ANL_OVERHEAD - DATA_HDR_MAX;
+    /* an FEC stream's buffers are sized by its mss: it keeps it */
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (ST_ON(st->cfg, STC_FEC) && stream_mss_for(mss, st->sid) - ANL_FEC_OVERHEAD < st->mss) return ANL_EBUSY;
+    }
+    if (w->ptr > (uint32_t)ANL_OVERHEAD) dg_seal(w);    /* the datagram in progress goes out at the old size */
+    w->mtu = mtu;
+    w->mss = mss;
+    w->avg_seg = w->mss + SEG_WIRE_OVH;
+    if (w->pace_burst_auto) w->pace_burst = (w->start_cap != 0 ? START_BURST_MTU : 4) * mtu;
+    FOR_EACH_STREAM(w, st, n, nx) {
+        if (!ST_ON(st->cfg, STC_FEC)) st->mss = stream_mss_for(mss, st->sid);
+    }
+    dg_begin(w);
+    return 0;
+}
+
+int anl_set_option(anl_t *w, int opt, int value)
+{
+    if (w == NULL) return ANL_EINVAL;
+    switch (opt) {
+    case ANL_OPT_MTU: return set_mtu(w, value);
+    case ANL_OPT_CARRIER:
+        if (value != ANL_CARRIER_DGRAM && value != ANL_CARRIER_STREAM) return ANL_EINVAL;
+        if (value != w->carrier) carrier_switch(w, value);
+        return 0;
+    case ANL_OPT_RTO_MIN:
+        if (value < 1 || value > (int)RTO_MAX) return ANL_EINVAL;
+        w->rec.rto_min = (uint32_t)value;
+        if ((uint32_t)w->rx_rto < w->rec.rto_min) w->rx_rto = (int32_t)w->rec.rto_min;
+        return 0;
+    case ANL_OPT_FAST_RETRANS:
+        if (value != 0 && value != 1) return ANL_EINVAL;
+        w->rec.fast_retrans = (uint8_t)value;
+        return 0;
+    case ANL_OPT_CC_IGNORE_LOSS:
+        if (value != 0 && value != 1) return ANL_EINVAL;
+        w->rec.cc_ignore_loss = (uint8_t)value;
+        return 0;
+    }
+    return ANL_EINVAL;
+}
+
+int anl_get_option(const anl_t *w, int opt, int *value)
+{
+    if (w == NULL || value == NULL) return ANL_EINVAL;
+    switch (opt) {
+    case ANL_OPT_MTU: *value = (int)w->mtu; return 0;
+    case ANL_OPT_CARRIER: *value = w->carrier; return 0;
+    case ANL_OPT_RTO_MIN: *value = (int)w->rec.rto_min; return 0;
+    case ANL_OPT_FAST_RETRANS: *value = w->rec.fast_retrans; return 0;
+    case ANL_OPT_CC_IGNORE_LOSS: *value = w->rec.cc_ignore_loss; return 0;
+    }
+    return ANL_EINVAL;
 }
 
 void anl_set_rate_callback(anl_t *w, anl_rate_fn fn) { if (w) { w->rate_cb = fn; w->rate.told = 0; } }
@@ -6853,6 +7084,17 @@ int anl_stream_waitsnd(const anl_stream_t *st)
     return (int)(st->nsnd_buf + st->nsnd_que);
 }
 
+int anl_stream_fec_pause(anl_stream_t *st, int paused)
+{
+    if (st == NULL) return ANL_EINVAL;
+    if (!ST_ON(st->cfg, STC_FEC)) return ANL_EMODE;
+    if (paused && !ST_ON(st->fc->tx_f, FCT_PAUSED)) {
+        fec_pause_drop(st);
+    }
+    ST_PUT(st->fc->tx_f, FCT_PAUSED, paused != 0);
+    return 0;
+}
+
 int anl_stream_get_stats(const anl_stream_t *st, anl_stream_stats *out)
 {
     if (st == NULL || out == NULL) return ANL_EINVAL;
@@ -6949,10 +7191,34 @@ static void snd_commit(anl_stream *st, anl_node *pending, uint32_t count, uint32
 /*--------------------------------------------------------------------
  * reliable stream
  *-------------------------------------------------------------------*/
+/* len bytes cut into count segments of at most mss, in a private list: frg
+   counts the fragments left (0 on every one when the stream has no message
+   boundaries). On ANL_ENOMEM nothing is left allocated. */
+static int cut_segments(anl_t *w, anl_node *pending, const char *buf, uint32_t len, uint32_t mss, uint32_t count, int fragments)
+{
+    uint32_t i;
+    QINIT(pending);
+    for (i = 0; i < count; i++) {
+        uint32_t size = umin32(len, mss);
+        anl_seg *seg = seg_new(w, size);
+        if (seg == NULL) {
+            free_seg_list(w, pending);
+            return ANL_ENOMEM;
+        }
+        memcpy(seg->data, buf, size);
+        seg->frg = fragments ? count - i - 1 : 0;
+        seg->ts_enq = w->current;
+        qadd_tail(&seg->node, pending);
+        buf += size;
+        len -= size;
+    }
+    return ANL_OK;
+}
+
 int anl_stream_send(anl_stream_t *st, const char *buf, int len)
 {
     anl_t *w;
-    uint32_t count, i, mss;
+    uint32_t count, mss;
     uint32_t bytes = (uint32_t)len;
     anl_node pending;
     anl_seg *old = NULL, *replacement = NULL;
@@ -6963,7 +7229,6 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
     if (r) return r;
     if (bytes > 0xffffffffu - st->backlog_bytes) return ANL_ETOOBIG;
     mss = seg_limit(st);
-    QINIT(&pending);
 
     /* byte-stream mode: append to the last queued segment (ikcp) */
     if (ST_ON(st->cfg, STC_STREAM)) {
@@ -6988,20 +7253,10 @@ int anl_stream_send(anl_stream_t *st, const char *buf, int len)
         return ANL_ETOOBIG;
     }
 
-    for (i = 0; i < count; i++) {
-        uint32_t size = umin32((uint32_t)len, mss);
-        anl_seg *seg = seg_new(w, size);
-        if (seg == NULL) {
-            free_seg_list(w, &pending);
-            seg_free(w, replacement);
-            return ANL_ENOMEM;
-        }
-        memcpy(seg->data, buf, size);
-        seg->frg = ST_ON(st->cfg, STC_STREAM) ? 0 : (count - i - 1);
-        seg->ts_enq = w->current;
-        qadd_tail(&seg->node, &pending);
-        buf += size;
-        len -= (int)size;
+    r = cut_segments(w, &pending, buf, (uint32_t)len, mss, count, !ST_ON(st->cfg, STC_STREAM));
+    if (r) {
+        seg_free(w, replacement);
+        return r;
     }
     if (replacement) {
         qadd_after(&replacement->node, &old->node);
@@ -7035,9 +7290,10 @@ int anl_stream_recv(anl_stream_t *st, char *buf, int len)
 int anl_stream_send_frame(anl_stream_t *st, int flags, const char *buf, int len, uint32_t *frame_no)
 {
     anl_t *w;
-    uint32_t count, i, fno, mss;
+    uint32_t count, fno, mss;
     uint32_t bytes = (uint32_t)len;
     anl_node pending;
+    anl_node *pos;
     int r, key = (flags & ANL_FRAME_KEY) != 0;
     if (st == NULL || buf == NULL || len <= 0) return ANL_EINVAL;
     w = st->w;
@@ -7056,23 +7312,13 @@ int anl_stream_send_frame(anl_stream_t *st, int flags, const char *buf, int len,
         st->frames_dropped++;
         return ANL_EDROPPED;
     }
-    QINIT(&pending);
-    for (i = 0; i < count; i++) {
-        uint32_t size = umin32((uint32_t)len, mss);
-        anl_seg *seg = seg_new(w, size);
-        if (seg == NULL) {
-            free_seg_list(w, &pending);
-            return ANL_ENOMEM;
-        }
-        memcpy(seg->data, buf, size);
-        seg->frg = count - i - 1;
+    r = cut_segments(w, &pending, buf, (uint32_t)len, mss, count, 1);
+    if (r) return r;
+    for (pos = pending.next; pos != &pending; pos = pos->next) {
+        anl_seg *seg = QENTRY(pos, anl_seg, node);
         seg->frame_no = fno;
-        seg->flags = i == 0 ? (uint8_t)(F_HAS_FRAME | (key ? F_KEY : 0)) : 0;
+        seg->flags = pos == pending.next ? (uint8_t)(F_HAS_FRAME | (key ? F_KEY : 0)) : 0;
         seg->fkey = (uint8_t)key;
-        seg->ts_enq = w->current;
-        qadd_tail(&seg->node, &pending);
-        buf += size;
-        len -= (int)size;
     }
     /* The list is still private here; publish metadata with the full frame. */
     st->sm->frame_next++;

@@ -36,7 +36,7 @@ typedef struct pkt {
     uint32_t deliver_at;
     int to;
     int len;
-    char data[2048];
+    char data[9000];
 } pkt;
 
 typedef struct net {
@@ -1460,6 +1460,198 @@ static void test_sid_hold(void)
  * the segment lost from the peer's other ACKs. Its retransmissions back off,
  * so dead_link takes minutes - at a fixed spacing of an RTO it took 20 round
  * trips, and the connection died with the peer alive (real path, 2.7 s) */
+/* anl_set_option (ANL_OPT_*): one connection moving between a datagram
+ * carrier and a stream carrier */
+static uint64_t tx_dg_of(anl_t *w) { anl_stats st; anl_get_stats(w, &st); return st.tx_datagrams; }
+static int xfer(net *n, anl_stream_t *a, anl_stream_t *b, int total, uint32_t seed)
+{
+    static char buf[70000];
+    int sent = 0, got = 0, iter, r;
+    for (iter = 0; iter < 200000 && got < total; iter++) {
+        if (sent < total && anl_stream_waitsnd(a) < 64) {
+            int len = total - sent < 5000 ? total - sent : 5000;
+            { int i; for (i = 0; i < len; i++) buf[i] = (char)(uint8_t)((seed + (uint32_t)(sent + i)) * 31u + 7u); }
+            if (anl_stream_send(a, buf, len) == 0) sent += len;
+        }
+        net_tick(n);
+        while ((r = anl_stream_recv(b, buf, sizeof(buf))) > 0) {
+            { int i, bad = 0; for (i = 0; i < r; i++) if (buf[i] != (char)(uint8_t)((seed + (uint32_t)(got + i)) * 31u + 7u)) bad = 1; CHECK(!bad, "content at %d", got); }
+            got += r;
+        }
+    }
+    return got == total;
+}
+
+static void test_set_option_mtu(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    uint64_t tx;
+    printf("[ANL_OPT_MTU: 1200 -> 8000 -> 1200 on a running connection]\n");
+    net_init(&n, &ca, &cb);
+    ca.mtu = cb.mtu = 1200; ca.mtu_max = cb.mtu_max = 9000;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.stream = 1; o.snd_wnd = 256; o.rcv_wnd = 512;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_MTU, 9001) == ANL_EINVAL, "above mtu_max refused");
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_MTU, 100) == ANL_EINVAL, "too small refused");
+    n.max_len[0] = 1200;
+    CHECK(xfer(&n, a, b, 600000, 1), "1200: delivered");
+    tx = tx_dg_of(n.ep[0]);
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_MTU, 8000) == 0 && anl_set_option(n.ep[1], ANL_OPT_MTU, 8000) == 0, "grown");
+    n.max_len[0] = 0;
+    CHECK(xfer(&n, a, b, 600000, 2), "8000: delivered");
+    CHECK(tx_dg_of(n.ep[0]) - tx < 600000 / 4000, "large datagrams: few (%llu)", (unsigned long long)(tx_dg_of(n.ep[0]) - tx));
+    /* shrink with large segments still queued: they go out as they are cut, the rest at 1200 */
+    {
+        static char buf[70000];
+        int i; for (i = 0; i < 60000; i++) buf[i] = (char)(uint8_t)((3u + (uint32_t)i) * 31u + 7u);
+        CHECK(anl_stream_send(a, buf, 60000) == 0, "queue large");
+        CHECK(anl_set_option(n.ep[0], ANL_OPT_MTU, 1200) == 0, "shrunk with data queued");
+    }
+    {
+        static char buf[70000];
+        int got = 0, r, i;
+        for (i = 0; i < 100000 && got < 60000; i++) {
+            net_tick(&n);
+            while ((r = anl_stream_recv(b, buf + got, (int)sizeof(buf) - got)) > 0) got += r;
+        }
+        int bad = 0;
+        for (i = 0; i < got; i++) if (buf[i] != (char)(uint8_t)((3u + (uint32_t)i) * 31u + 7u)) bad = 1;
+        CHECK(got == 60000 && !bad, "old large segments delivered after the shrink (%d)", got);
+    }
+    n.max_len[0] = 1200;
+    CHECK(xfer(&n, a, b, 300000, 4), "1200 again: new segments fit");
+    CHECK(anl_state(n.ep[0]) == 0 && anl_state(n.ep[1]) == 0, "alive");
+    net_stop(&n);
+}
+
+static void test_set_option_loss(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    anl_stats st;
+    printf("[ANL_OPT_FAST_RETRANS / RTO_MIN / CC_IGNORE_LOSS: a carrier with deep queues and a timer that fires]\n");
+    net_init(&n, &ca, &cb);
+    ca.fast_retrans = 0; ca.rto_min_ms = 400; ca.cc_ignore_loss = 1;
+    n.min_delay = 20; n.max_delay = 40; n.loss_pct = 3;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.stream = 1; o.snd_wnd = 512; o.rcv_wnd = 1024;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    CHECK(xfer(&n, a, b, 1500000, 5), "delivered with only the timeout retransmitting");
+    anl_get_stats(n.ep[0], &st);
+    CHECK(st.rto >= 400, "rto %u >= rto_min", st.rto);
+    CHECK(n.ep[0]->lt.state == LT_WATCH, "no policer detection (%d)", n.ep[0]->lt.state);
+    CHECK(n.ep[0]->inflight_hi == 0, "no inflight bound");
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_RTO_MIN, 800) == 0 && anl_set_option(n.ep[0], ANL_OPT_FAST_RETRANS, 1) == 0 &&
+          anl_set_option(n.ep[0], ANL_OPT_CC_IGNORE_LOSS, 0) == 0, "switched back at run time");
+    anl_get_stats(n.ep[0], &st);
+    CHECK(st.rto >= 800, "rto raised at once (%u)", st.rto);
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_FAST_RETRANS, 2) == ANL_EINVAL && anl_set_option(n.ep[0], 99, 0) == ANL_EINVAL, "bad values refused");
+    CHECK(xfer(&n, a, b, 300000, 6), "delivered after the switch");
+    net_stop(&n);
+}
+
+/* anl_stream_fec_pause: no parity while paused, back on resume */
+static void test_fec_pause(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o; anl_stream_stats ss;
+    static char buf[20000];
+    anl_stream_t *a, *b, *plain;
+    anl_frame_info fi;
+    uint64_t tx[3];
+    int phase, i, f = 0, got = 0, r;
+    printf("[fec pause: parity stops and resumes on a running stream]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 20;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 1; o.fec_ratio = 50;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    plain = anl_default_stream(n.ep[0]);
+    CHECK(anl_stream_fec_pause(plain, 1) == ANL_EMODE, "a stream without FEC: EMODE");
+    for (phase = 0; phase < 3; phase++) {
+        uint64_t t0 = tx_dg_of(n.ep[0]);
+        CHECK(anl_stream_fec_pause(a, phase == 1) == 0, "pause call");
+        for (i = 0; i < 3000; i++) {
+            net_tick(&n);
+            if (i % 30 == 0 && i < 2700) {
+                fill_pattern(buf, 6000, (uint32_t)f);
+                CHECK(anl_stream_send_frame(a, 0, buf, 6000, NULL) == 0, "send frame");
+                f++;
+            }
+            while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) got++;
+        }
+        tx[phase] = tx_dg_of(n.ep[0]) - t0;
+        anl_stream_get_stats(a, &ss);
+        printf("  phase %d: %llu datagrams, fec_ratio %u\n", phase, (unsigned long long)tx[phase], ss.fec_ratio);
+        if (phase == 1) CHECK(ss.fec_ratio == 0, "no ratio reported while paused");
+    }
+    CHECK(tx[1] * 10 < tx[0] * 8, "paused sends fewer datagrams (%llu vs %llu)", (unsigned long long)tx[1], (unsigned long long)tx[0]);
+    CHECK(tx[2] * 10 > tx[0] * 9, "resumed sends parity again (%llu vs %llu)", (unsigned long long)tx[2], (unsigned long long)tx[0]);
+    CHECK(got == f, "all frames delivered (%d of %d)", got, f);
+    net_stop(&n);
+}
+
+/* ANL_OPT_CARRIER: UDP -> TCP -> UDP on one connection */
+static void test_carrier_switch(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    anl_stream_t *a, *b;
+    anl_stats st;
+    int v = 0, i, start;
+    printf("[carrier switch: datagram -> stream -> datagram, the old path's flight lost]\n");
+    net_init(&n, &ca, &cb);
+    ca.mtu = cb.mtu = 1200; ca.mtu_max = cb.mtu_max = 9000;
+    n.min_delay = n.max_delay = 20;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_RELIABLE);
+    o.stream = 1; o.snd_wnd = 512; o.rcv_wnd = 1024;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    CHECK(anl_set_option(n.ep[0], 77, 0) == ANL_EINVAL, "unknown option");
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_CARRIER, 2) == ANL_EINVAL, "unknown carrier");
+    CHECK(xfer(&n, a, b, 300000, 7), "datagram carrier");
+    CHECK(anl_set_option(n.ep[0], ANL_OPT_CARRIER, ANL_CARRIER_STREAM) == 0 && anl_set_option(n.ep[0], ANL_OPT_MTU, 8000) == 0, "to stream");
+    anl_get_option(n.ep[0], ANL_OPT_RTO_MIN, &v);
+    CHECK(v >= 1000, "stream rto floor (%d)", v);
+    anl_get_option(n.ep[0], ANL_OPT_FAST_RETRANS, &v);
+    CHECK(v == 0, "no fast retransmission");
+    /* a stream carrier: nothing is lost, queues come and go */
+    n.min_delay = 20; n.max_delay = 600;
+    CHECK(xfer(&n, a, b, 600000, 8), "stream carrier with queueing delay");
+    anl_get_stats(n.ep[0], &st);
+    CHECK(n.ep[0]->lt.state == LT_WATCH && n.ep[0]->inflight_hi == 0, "bandwidth model untouched by the delay");
+    /* back to datagrams while a flight is in the old path's queue and lost */
+    {
+        static char buf[70000];
+        int got = 0, r, sent = 0;
+        for (i = 0; i < 40000; i++) buf[i] = (char)(uint8_t)((9u + (uint32_t)i) * 31u + 7u);
+        n.min_delay = n.max_delay = 20;
+        n.block[0] = 1;                                 /* the flight dies with the old path */
+        while (sent < 40000) { r = anl_stream_send(a, buf + sent, 40000 - sent < 5000 ? 40000 - sent : 5000); if (r != 0) break; sent += 5000; }
+        for (i = 0; i < 100; i++) net_tick(&n);
+        n.block[0] = 0;
+        CHECK(anl_set_option(n.ep[0], ANL_OPT_CARRIER, ANL_CARRIER_DGRAM) == 0 && anl_set_option(n.ep[0], ANL_OPT_MTU, 1200) == 0, "back to datagrams");
+        anl_get_option(n.ep[0], ANL_OPT_RTO_MIN, &v);
+        CHECK(v == 30, "rto floor restored (%d)", v);
+        start = (int)n.now;
+        for (i = 0; i < 20000 && got < 40000; i++) {
+            net_tick(&n);
+            while ((r = anl_stream_recv(b, buf + got, (int)sizeof(buf) - got)) > 0) got += r;
+        }
+        printf("  recovered %d ms after the switch\n", (int)n.now - start);
+        CHECK(got == 40000, "all data delivered (%d)", got);
+        CHECK((int)n.now - start < 1500, "lost flight recovered at the datagram RTO, not the stream one (%d ms)", (int)n.now - start);
+    }
+    net_stop(&n);
+}
+
 static void test_rack_repeat_backoff(void)
 {
     net n; anl_config ca, cb; anl_stream_opt o;
@@ -5247,6 +5439,10 @@ int main(void)
     RUN(test_sid_lifecycle());
     RUN(test_sid_hold());
     RUN(test_rack_repeat_backoff());
+    RUN(test_set_option_mtu());
+    RUN(test_set_option_loss());
+    RUN(test_fec_pause());
+    RUN(test_carrier_switch());
     RUN(test_handle_lifetime());
     RUN(test_wire_v1_wrap(0));
     RUN(test_wire_v1_wrap(1));

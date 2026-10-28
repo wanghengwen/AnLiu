@@ -764,13 +764,15 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 | 可靠消息/字节流 | anl_stream_send、anl_stream_recv |
 | 半可靠帧 | anl_stream_send_frame、anl_stream_recv_frame |
 | 流查询 | anl_stream_peeksize、anl_stream_waitsnd、anl_stream_id、anl_stream_tag、anl_stream_conn |
+| 运行时选项 | anl_set_option、anl_get_option、anl_stream_fec_pause |
 | 用户数据与统计 | anl_stream_set_user、anl_stream_get_user、anl_state、anl_get_stats、anl_stream_get_stats |
 
 同一连接的所有调用由应用串行化。GF 表为只读常量，不需要首次初始化同步。内存分配器随 anl_config 传入（`malloc_fn` / `free_fn`，调用时带 `alloc_user`），每个连接各用各的，只在该连接的调用中使用；连接本身、流、分片和 FEC 缓冲都从它分配，anl_release 全部归还。两个都为 NULL 时用 malloc / free，只设一个时 anl_create 失败。不同连接的运行状态独立。output 回调不得调用 anl_*；accept 回调只允许 anl_stream_set_user 和只读元数据查询（id、tag、conn、get_user）；rate/report 回调只允许只读统计查询。回调同步执行，应避免阻塞。
 
 | 连接配置 | 默认值 |
 |---|---|
-| mtu / pad_max | 1400 / 32 |
+| mtu / mtu_max / pad_max | 1400 / 0（等于 mtu）/ 32 |
+| rto_min_ms / fast_retrans / cc_ignore_loss | 30 / 1 / 0 |
 | interval / init_cwnd | 20 ms / 16 分片 |
 | dead_link / ts_window_ms | 20 / 1000 ms |
 | keepalive_ms / idle_timeout_ms | 0 / 服务端 30000 ms，客户端 0 |
@@ -793,6 +795,29 @@ FEC 的内存几乎全在两处：发送端当前块的规范编码副本（最�
 配置先调用 default，再覆盖需要的字段。PSK、非零 conv 及不同端的 role 由应用提供。接收端本地期限与 FEC 设置通过 accept 配置，不随 OPEN 自动交换。
 
 接收无数据返回 ANL_EAGAIN、缓冲不足返回 ANL_EBUFSIZE；消息/帧分片超窗返回 ANL_ETOOBIG；关键帧依赖丢弃返回 ANL_EDROPPED（仍占帧号）；流被重置返回 ANL_ECLOSED，连接判死后发送返回 ANL_EDEAD。认证失败 ANL_EAUTH 必须静默丢弃。
+
+### 10.1 运行时选项与可靠载体
+
+同一个连接可以在不可靠载体（UDP）和可靠载体（TCP、WebSocket，由应用给数据报加长度前缀后承载，封包格式不变）之间切换。后者不丢包，所以丢包恢复和拥塞控制里"丢包"的判断不再成立：载体自己的重传和排队只表现为时延，RACK 与 RTO 会把它读成丢失，重复发送，并让策略检测把带宽估计锁在低值。下列选项用 `anl_set_option` 在连接运行中修改：
+
+| 选项 | 作用 |
+|---|---|
+| `ANL_OPT_CARRIER` | `ANL_CARRIER_DGRAM` / `ANL_CARRIER_STREAM`：一次设好下面三个选项和 FEC，见下 |
+| `ANL_OPT_FAST_RETRANS` | 0 时 `rack_detect` 不标记丢失，只有 RTO 重传（6.3） |
+| `ANL_OPT_RTO_MIN` | RTO 下限（默认 30 ms），立即抬高当前 RTO |
+| `ANL_OPT_CC_IGNORE_LOSS` | 1 时每轮结束丢失字节按 0 计：不设 inflight_hi、不运行 policer 检测（停在 LT_WATCH）、不触发 STARTUP 的高丢包退出、RTO 后不做包守恒（6.8） |
+| `ANL_OPT_MTU` | 数据报大小，上限 `mtu_max`（缓冲和接收上限按它分配） |
+
+**载体切换**：`anl_set_option(w, ANL_OPT_CARRIER, ...)` 告诉连接 output 回调现在走哪种载体。STREAM（不丢包的载体）= 关快速重传、RTO 下限 max(配置值, 1 s)、丢失不作拥塞信号、所有 FEC 流不发校验包（连接上的 `carrier`，包括之后打开的流）；DGRAM 恢复 `anl_create` 时给定的值。之后单独设的选项在下一次切换前有效。切换时（任一方向）：
+
+- RTT、RTO、BBR 模型、policer 检测和 RACK 证据按新连接重新开始——旧路径上测得的值对新路径无意义。TCP 上的排队若留下较大的 srtt 和 1 s 以上的 RTO，切到 UDP 后丢包要等很久才重传。
+- 所有未确认分片的 RTO 重置为新 RTO，并立即到期，各重传一次：旧路径上的在途数据可能已经丢了（UDP → TCP 时也一样，TCP 上多出的重复由接收端丢弃）。
+
+`anl_get_option` 读取当前值。MTU 不在预设里，由应用在切换时一并设置。
+
+**停校验包**：`anl_stream_fec_pause(s, 1)` 停止某条 FEC 流的校验包发送，`0` 恢复。暂停时丢弃正在收集的块和尚未发出的校验包，之后切出的分片不再收集；流的缓冲与分片大小不变，所以可随时恢复，接收端无需配合。已发出的分片不再有修复，`anl_stream_get_stats` 的 `fec_ratio` 为 0。没有 FEC 的流返回 `ANL_EMODE`。
+
+**MTU**：改动后新切的分片按新的 mss；已经切好的分片大小不变，发送时若放不进新 mtu，就独占一个数据报，数据报长度取它所需（不超过 `mtu_max`），下一个数据报恢复为新 mtu。所以缩小后，旧的在途分片仍会以较大的数据报重传，要在 UDP 上发出需要路径能放下，或在切换前等它们确认。接收上限始终是 `mtu_max`，两端的 `mtu_max` 由应用保证不小于对端会发的长度。开着 FEC 的流缓冲按创建时的 mss 分配，保持原大小；缩小到低于它时返回 `ANL_EBUSY`。`pace_burst` 为默认（0）时随 mtu 改变。
 
 ## 11. 实现边界
 

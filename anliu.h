@@ -100,7 +100,18 @@ typedef void (*anl_free_fn)(void *user, void *ptr);
 typedef struct anl_config {
     uint8_t psk[ANL_PSK_SIZE];  /* pre-shared key */
     int role;                   /* ANL_ROLE_CLIENT / ANL_ROLE_SERVER */
-    int mtu;                    /* 1400 */
+    int mtu;                    /* 1400: the datagram size sent; anl_set_option(ANL_OPT_MTU) changes it later */
+    int mtu_max;                /* 0 = mtu. The largest datagram this connection builds or accepts
+                                   (buffers are this size); ANL_OPT_MTU may go up to it. Set it to the
+                                   largest transport you may switch to (e.g. a TCP / WebSocket
+                                   carrier), mtu to the one you start on */
+    int rto_min_ms;             /* 30: the retransmission timeout never goes below it (ANL_OPT_RTO_MIN) */
+    int fast_retrans;           /* 1: RACK retransmits a segment once later datagrams were
+                                   acknowledged; 0 = only the timeout retransmits (ANL_OPT_FAST_RETRANS) */
+    int cc_ignore_loss;         /* 0; 1 = congestion control and the bandwidth estimate take no loss
+                                   as a signal: no inflight bound, no policer detection, no packet
+                                   conservation after a timeout. For a carrier that never loses (TCP)
+                                   whose queueing the timers read as loss (ANL_OPT_CC_IGNORE_LOSS) */
     int pad_max;                /* 32: datagrams without data (ACK, control) get 1..pad_max
                                    random bytes; data datagrams none. 0 = no padding; <= ANL_MAX_PAD */
     anl_rng_fn rng;             /* NULL = built-in ChaCha20 PRNG; called with the anl_create user */
@@ -304,6 +315,29 @@ typedef void (*anl_rate_fn)(anl_t *w, uint32_t target_rate, void *user);
  * (DESIGN 6.9). Same restrictions as the rate callback. */
 typedef void (*anl_report_fn)(anl_t *w, anl_stream_t *s, const anl_delay_report *r, void *user);
 
+/* Options that can change while the connection runs (anl_set_option), for a
+ * connection that moves between carriers - UDP and a reliable stream such as
+ * TCP / WebSocket. The first three are the whole of the difference between them. */
+#define ANL_OPT_MTU             1   /* datagram size, ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN_BODY + 64 .. mtu_max.
+                                       Segments cut afterwards use it; ones already cut keep their size and
+                                       go out in a datagram as large as they need (at most mtu_max), so
+                                       after a shrink the old flight is still larger than the new mtu.
+                                       Streams with FEC keep the segment size they were opened with:
+                                       a shrink below it fails with ANL_EBUSY */
+#define ANL_OPT_CARRIER         5   /* ANL_CARRIER_DGRAM (default) / ANL_CARRIER_STREAM: what the output
+                                       callback sends over. STREAM is a carrier that does not lose (TCP,
+                                       WebSocket): no fast retransmission, RTO at least 1 s, loss is no
+                                       congestion signal, no FEC parity. A switch starts the RTT, RTO and
+                                       bandwidth model over and retransmits what is unacknowledged once
+                                       (the old path may have lost it). DGRAM restores the values given to
+                                       anl_create. Options set afterwards override until the next switch;
+                                       ANL_OPT_MTU is not part of it - set it with the switch */
+#define ANL_CARRIER_DGRAM       0
+#define ANL_CARRIER_STREAM      1
+#define ANL_OPT_RTO_MIN         2   /* ms, 1 .. 60000 */
+#define ANL_OPT_FAST_RETRANS    3   /* 0 / 1 */
+#define ANL_OPT_CC_IGNORE_LOSS  4   /* 0 / 1 */
+
 void anl_config_default(anl_config *cfg, int role);
 void anl_stream_opt_default(anl_stream_opt *opt, int mode);
 
@@ -324,6 +358,8 @@ anl_t   *anl_create(uint32_t conv, const anl_config *cfg, void *user);
 void     anl_release(anl_t *w);
 void     anl_setoutput(anl_t *w, anl_output_fn output);
 /* NULL (default) accepts every peer-opened stream with default options */
+int      anl_set_option(anl_t *w, int opt, int value);
+int      anl_get_option(const anl_t *w, int opt, int *value);   /* 0, ANL_EINVAL or ANL_EBUSY (ANL_OPT_MTU) */
 void     anl_set_accept(anl_t *w, anl_accept_fn accept);
 void     anl_set_rate_callback(anl_t *w, anl_rate_fn fn);
 void     anl_set_report_callback(anl_t *w, anl_report_fn fn);
@@ -409,6 +445,12 @@ int      anl_stream_recv_frame(anl_stream_t *s, char *buf, int len, anl_frame_in
 int      anl_stream_peeksize(const anl_stream_t *s);
 /* segments waiting to be sent or acknowledged */
 int      anl_stream_waitsnd(const anl_stream_t *s);
+/* Stops (1) or resumes (0) the sending of parity on a stream opened with FEC,
+ * e.g. while the connection runs on a carrier that does not lose. Nothing is
+ * collected or sent while paused; the stream keeps its buffers and its
+ * segment size, so it can resume at any time. The receiver needs no change.
+ * ANL_EMODE for a stream without FEC. */
+int      anl_stream_fec_pause(anl_stream_t *s, int paused);
 int      anl_stream_get_stats(const anl_stream_t *s, anl_stream_stats *out);
 
 int      anl_stream_id(const anl_stream_t *s);          /* sid on the wire, same on both sides */

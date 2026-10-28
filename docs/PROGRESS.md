@@ -1,6 +1,6 @@
 # AnLiu 开发与测试进展
 
-本文件记录本仓库的开发进度、测试结果和待解决的问题，按时间倒序追加。设计与修订理由见 [DESIGN.md](DESIGN.md)，性能数据见 [PERFORMANCE.md](PERFORMANCE.md)。
+本文件记录本仓库的开发进度、测试结果和待解决的问题，按时间倒序追加。设计与修订理由见 [DESIGN.md](DESIGN.md)，代码注释里引用的事故与实测经过见 [HISTORY.md](HISTORY.md)，性能数据见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ## 记录规则
 
@@ -9,6 +9,16 @@
 - 结论区分"已验证"和"观察到、待确认"；同一问题至少复现 3 次再修复，修复先做针对性测试再全面回归。
 
 ---
+
+## 2026-10-28
+
+- 上游应用 npf 的需求：一个连接在 UDP 与 WebSocket（TCP）之间切换。新增 `anl_set_option`（DESIGN 10.1）：`ANL_OPT_FAST_RETRANS` 关快速重传（只剩 RTO）、`ANL_OPT_RTO_MIN` 调大 RTO 下限、`ANL_OPT_CC_IGNORE_LOSS` 让拥塞控制与带宽估计不再把丢失当信号（不设 inflight_hi、不进 policer 检测）、`ANL_OPT_MTU` 在 `mtu_max` 以内运行中改数据报大小；配置里对应 `mtu_max` / `rto_min_ms` / `fast_retrans` / `cc_ignore_loss`，默认行为不变。
+- 已验证：新增 `test_set_option_mtu`（1200 → 8000 → 1200，缩小时有大分片在队列中）和 `test_set_option_loss`（3% 丢包、只靠 RTO 重传、策略检测不启动、运行时切回）；单元测试全部通过。实网和性能回归未做。
+- 新增 `anl_stream_fec_pause(s, paused)`：只停某条 FEC 流的校验包发送（缓冲和分片大小不变，可随时恢复）；测试 `test_fec_pause`（固定 50% 冗余，暂停时数据报 450 对 675，恢复后回到 675，帧全部送达）。
+- 载体切换 `ANL_OPT_CARRIER`（DGRAM / STREAM，DESIGN 10.1）：一次设好快速重传、RTO 下限、丢失不作拥塞信号、FEC 暂停，切换时 RTT / RTO / BBR 模型重新开始、在途分片补发一次；`anl_get_option` 读取当前值。测试 `test_carrier_switch`（UDP → TCP 带 20..600 ms 排队 → UDP，旧路径的在途数据全部丢失，切回后 395 ms 内恢复；去掉补发一次则测试失败）。
+- 代码整理（`anliu.c`，行为不变）：`anl_input_plain` 拆成头部检查和 DATA / ACK / FWD / CTRL 各一个处理函数；`anl_flush_internal` 的新数据、应用受限标记、FEC 三段各成函数；`handle_ack` 里逐个分片的丢失核算抽成 `ack_account`；两个发送函数的切分循环合并为 `cut_segments`。验证：整理前后单元测试、攻击测试、`anl_bench s1 s2`、`media_loss`、`media_startup`、`test_media_workload`、`test_tx_diag` 的输出逐字节相同，ASan/UBSan 下单元测试通过。
+- 注释整理：`anliu.c` 注释中的事故经过和实测数字（重放包拉动 peer_ts、FEC 接收缓存越界、策略检测的几次误判等 8 处）移到新文件 [HISTORY.md](HISTORY.md)，注释只留规则并以 `HISTORY n` 指向。代码不变，输出与整理前逐字节相同。
+- 待确认：缩小 MTU 后，缩小前切好的大分片仍以大数据报重传，UDP 路径放不下时需要应用等它们确认后再切回。
 
 ## 2026-10-24
 
