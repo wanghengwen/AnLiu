@@ -353,5 +353,5 @@ static void policer_interval(anl_t *w, uint32_t dur, uint32_t sent,
     w->lt.infl0 = infl0;
     w->avg_seg = 1;
     w->inflight_segs = infl1;
-    bbr_policer(w, delivered, lost, 0);
+    lt_policer(w, delivered, lost, 0);
 }

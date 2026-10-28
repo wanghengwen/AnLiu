@@ -18,7 +18,7 @@
  *   fec_loss(w, sent, lost)                               first transmissions and losses counted
  *   fec_count(w, st, lost)                                adaptive ratio evidence (FEC_SENT / FEC_LOST / FEC_LATE)
  *   capacity(w, enter, leave)                             capacity_short entered / left
- *   rtx(w, st, seg, why)                                  a retransmission (why: 2 RTO, 3 RACK)
+ *   rtx(w, st, seg, why)                                  a retransmission (why: RTX_RTO 2, RTX_RACK 3)
  *   flush(w, budget, retrans_bytes, capped)               a flush ended
  */
 #ifndef ANL_TRACE_H

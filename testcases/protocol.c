@@ -21,6 +21,74 @@ static void test_reflect(void)
     net_stop(&n);
 }
 
+/* a peer holding the PSK: datagrams built here and given to anl_input_plain */
+static int hostile_output(char *buf, int len, anl_t *w, void *user)
+{
+    (void)buf; (void)len; (void)w; (void)user;
+    return 0;
+}
+
+static anl_t *hostile_victim(void)
+{
+    anl_config cfg;
+    anl_t *w;
+    anl_config_default(&cfg, ANL_ROLE_SERVER);
+    cfg.idle_timeout_ms = 0;
+    w = anl_create(7, &cfg, NULL);
+    CHECK(w != NULL, "create the victim");
+    if (w == NULL) return NULL;
+    anl_setoutput(w, hostile_output);
+    anl_update(w, 1000);
+    return w;
+}
+
+/* a 1-byte reliable DATA segment; open: with the stream parameters (rcv_wnd wnd) */
+static char *hostile_data(char *p, int sid, uint32_t sn, int open, uint16_t wnd)
+{
+    p = enc_sid(p, SEG_DATA, sid);
+    p = enc8(p, open ? F_OPEN : 0);
+    p = enc24(p, sn & SN_MASK);
+    if (open) { p = enc8(p, 0); p = enc16(p, wnd); p = enc16(p, 0); }
+    p = enc_varint(p, 1);
+    return enc8(p, 'x');
+}
+
+/* receive runs (DESIGN 5.3): a peer that leaves a hole after every segment
+ * gets at most RUN_MAX runs on a stream - the segment at rcv_nxt still goes
+ * in - and a datagram of small duplicates spends at most RUN_WALK_MAX lookup
+ * steps, not a walk over every run for each of them */
+static void test_run_flood(void)
+{
+    anl_t *w = hostile_victim();
+    anl_stream *st;
+    char pl[1400], *p;
+    uint32_t sn = 1, mid = 2 * (RUN_MAX / 2) + 1;
+    int dups = 0;
+    printf("[receive runs: a window of holes stays bounded]\n");
+    if (w == NULL) return;
+    p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+    p = hostile_data(p, 2, sn, 1, ANL_MAX_WND);         /* sn 0 stays a hole */
+    CHECK(anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK && (st = sget(w, 2)) != NULL, "stream opened");
+    if (st == NULL) { anl_release(w); return; }
+    while (sn < 2 * (RUN_MAX + 100)) {
+        p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+        while (p - pl < (int)sizeof(pl) - 16) p = hostile_data(p, 2, sn += 2, 0, 0);
+        CHECK(anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK, "holes");
+    }
+    CHECK(st->nruns == RUN_MAX && st->nrcv_buf == RUN_MAX, "runs capped (%u runs, %u segments)", st->nruns, st->nrcv_buf);
+
+    p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+    while (p - pl < (int)sizeof(pl) - 16) { p = hostile_data(p, 2, mid, 0, 0); dups++; }
+    CHECK(anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK && w->rx_walk == 0 && st->nrcv_buf == RUN_MAX,
+          "%d duplicates of a middle segment: the lookup budget is spent, nothing changed", dups);
+
+    p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+    p = hostile_data(p, 2, 0, 0, 0);
+    CHECK(anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK && st->rcv_nxt == 2 && st->nruns == RUN_MAX - 1,
+          "the hole at rcv_nxt is still filled (rcv_nxt %u, %u runs)", st->rcv_nxt, st->nruns);
+    anl_release(w);
+}
+
 /* datagram pn (DESIGN 4.3): a datagram taken once is not taken again, nor
  * one more than PN_WIN behind the largest; one reordered inside the window
  * is; the ts window still drops a datagram sent long ago */

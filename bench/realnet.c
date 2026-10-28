@@ -349,7 +349,7 @@ static void trace_lt_interval(const anl_t *w, uint32_t dur, uint32_t rate,
             (unsigned long long)w->lt.rd, (unsigned long long)w->lt.lost, loss, counted,
             rate, w->lt.ref_loss, w->lt.prev_rate, w->lt.prev_loss, w->lt.res,
             sat32((uint64_t)rate * 1000 / (1000 - w->lt.res)), w->lt.rate, w->lt.rate / 8 * 7,
-            bbr_lt_probe_rate(w), sat32((uint64_t)sent * 1000 / dur), compute_pace_rate(w), w->pace_rate,
+            lt_probe_rate(w), sat32((uint64_t)sent * 1000 / dur), compute_pace_rate(w), w->pace_rate,
             w->cwnd, w->inflight_segs, has_queued_data(w), has_new_data(w), bulk ? bulk->rmt_wnd : 0,
             bulk ? bulk->snd_nxt - bulk->snd_una : 0, bulk ? bulk->nsnd_que : 0, bulk ? bulk->nsnd_buf : 0,
             w->min_rtt, ST_ON(w->bbr_f, BBR_F_QFLAT_PROBE), tdiff(now_ms(), w->current));

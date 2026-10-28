@@ -54,11 +54,11 @@ static void test_bbr_policer_reports(void)
     w.lt.state = LT_TESTING; w.lt.from = LT_FROM_INITIAL; w.lt.rate = 1500000; w.lt.ref_loss = 300;
     w.lt.ts = 1; w.current = 301; w.lt.rounds = BBR_LT_ROUNDS - 1;
     w.sent_wire = 120000;
-    bbr_policer(&w, 80000, 40000, 1);
+    lt_policer(&w, 80000, 40000, 1);
     CHECK(w.lt.state == LT_TESTING && ST_ON(w.lt.f, LT_F_FEED_WAIT) && !ST_ON(w.lt.f, LT_F_SKIP) && w.lt.rate == 1500000,
           "underfed media test waits once at the same pace");
     w.current = 601; w.lt.rounds = BBR_LT_ROUNDS - 1; w.sent_wire += 120000;
-    bbr_policer(&w, 80000, 40000, 1);
+    lt_policer(&w, 80000, 40000, 1);
     CHECK(w.lt.state == LT_WATCH && w.lt.hold == BBR_LT_SPAN, "a second underfed interval ends the test");
 }
 
@@ -81,15 +81,15 @@ static void test_bbr_report_intervals(void)
     CHECK(s != NULL, "open");
     if (!s) { anl_release(w); return; }
     CHECK(input_test_report_rx(w, s, 100, 100000) == 0, "old snapshot");
-    w->current = 1001; bbr_lt_begin(w, 1);
+    w->current = 1001; lt_begin(w, 1);
     w->current = 1301;
     CHECK(input_test_report_rx(w, s, 1300, 2050000) == 0, "report after the gap");
     w->lt.rounds = BBR_LT_ROUNDS - 1;
     w->sent_wire += 250000;
-    bbr_policer(w, 150000, 100000, 0);
+    lt_policer(w, 150000, 100000, 0);
     CHECK(w->lt.prev_rate == 500000, "one snapshot cannot turn old traffic into this interval's rate (%u)", w->lt.prev_rate);
 
-    w->current = 2001; w->lt.prev_rate = 0; bbr_lt_begin(w, 1);
+    w->current = 2001; w->lt.prev_rate = 0; lt_begin(w, 1);
     w->current = 2051;
     CHECK(input_test_report_rx_echo(w, s, 2000, 2900000, 1900) == 0,
           "delayed snapshot from before the new pace");
@@ -102,24 +102,24 @@ static void test_bbr_report_intervals(void)
     w->current = 2401;
     w->lt.rounds = BBR_LT_ROUNDS - 1;
     w->sent_wire += 250000;
-    bbr_policer(w, 150000, 100000, 0);
+    lt_policer(w, 150000, 100000, 0);
     CHECK(w->lt.prev_rate == 500000, "two new snapshots recover network delivery despite missing ACK credit (%u)", w->lt.prev_rate);
 
     w->current = 3001; w->lt.prev_rate = 0; ST_SET(w->lt.f, LT_F_SKIP); w->lt.pace_ts = 3000;
-    bbr_policer(w, 100000, 10000, 0);
+    lt_policer(w, 100000, 10000, 0);
     CHECK(!ST_ON(w->lt.f, LT_F_PRX), "pace transition discards the report baseline");
     w->current = 3301;
     CHECK(input_test_report_rx(w, s, 3300, 9000000) == 0, "first snapshot after transition");
     w->lt.rounds = BBR_LT_ROUNDS - 1; w->sent_wire += 250000;
-    bbr_policer(w, 150000, 100000, 0);
+    lt_policer(w, 150000, 100000, 0);
     CHECK(w->lt.prev_rate == 500000, "transition also excludes the old report interval (%u)", w->lt.prev_rate);
 
-    w->current = 20001; bbr_lt_begin(w, 1);
+    w->current = 20001; lt_begin(w, 1);
     w->current = 20301;
     w->last_rx = w->current;       /* keepalives continued while reports were idle */
     CHECK(input_test_report_rx(w, s, 20300, 16000000) == 0, "first report after idling");
     w->lt.prev_rate = 0; w->lt.rounds = BBR_LT_ROUNDS - 1; w->sent_wire += 250000;
-    bbr_policer(w, 150000, 100000, 0);
+    lt_policer(w, 150000, 100000, 0);
     CHECK(w->lt.prev_rate == 500000, "idle time is not a measurement of the resumed path (%u)", w->lt.prev_rate);
 
     /* a short REPORT is skipped like any short control segment: the rest
@@ -153,7 +153,7 @@ static void test_report_epoch_wrap(void)
     CHECK(s != NULL, "open");
     if (!s) { anl_release(w); return; }
     CHECK(input_test_report_rx(w, s, 1000, 0) == 0, "initial snapshot");
-    w->current = 0xfffffff0u; bbr_lt_begin(w, 1);
+    w->current = 0xfffffff0u; lt_begin(w, 1);
     w->current = 0x10;
     CHECK(input_test_report_rx_echo(w, s, 1200, 200000, 0xffffffd0u) == 0, "delayed pre-wrap snapshot");
     CHECK(!ST_ON(w->lt.f, LT_F_PRX), "old phase stays old across wrap");
@@ -163,7 +163,7 @@ static void test_report_epoch_wrap(void)
     w->current = 0x130;
     CHECK(input_test_report_rx_echo(w, s, 1476, 348000, 0x120) == 0, "second eligible snapshot");
     w->current = 0x1f1; w->sent_wire += 250000; w->lt.rounds = BBR_LT_ROUNDS - 1;
-    bbr_policer(w, 128000, 50000, 0);
+    lt_policer(w, 128000, 50000, 0);
     CHECK(w->lt.prev_rate == 500000, "wrapped interval uses the two new snapshots (%u)", w->lt.prev_rate);
     anl_release(w);
 }
@@ -300,13 +300,13 @@ static void test_bbr_policer_plateau(void)
     memset(&w, 0, sizeof(w));
     w.lt.state = LT_PROBING; w.lt.from = LT_FROM_RETEST; w.lt.k = 1; w.lt.rate = 948600; w.lt.span = 8;
     for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt.state == LT_PROBING && !ST_ON(w.lt.f, LT_F_TAIL); k++) {
-        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        uint32_t sent = lt_probe_rate(&w) * 3 / 10;
         uint32_t delivered = umin32(sent, 900000);  /* 3 MB/s, no bucket overshoot */
         policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
     }
     CHECK(w.lt.state == LT_PROBING && ST_ON(w.lt.f, LT_F_TAIL), "a flat ceiling is measured without a delivery dip");
     if (w.lt.state == LT_PROBING && ST_ON(w.lt.f, LT_F_TAIL)) {
-        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        uint32_t sent = lt_probe_rate(&w) * 3 / 10;
         policer_interval(&w, 300, sent, 0, 0, 900000, sent - 900000);
         CHECK(w.lt.state == LT_POLICED && w.lt.rate == 3000000, "tail confirms the newly available capacity");
     }
@@ -325,7 +325,7 @@ static void test_bbr_policer_plateau(void)
     memset(&w, 0, sizeof(w));
     w.lt.state = LT_PROBING; w.lt.from = LT_FROM_RETEST; w.lt.k = 1; w.lt.rate = 948600; w.lt.res = 200;
     for (k = 1; k <= BBR_LT_PROBE_MAX && w.lt.state == LT_PROBING; k++) {
-        uint32_t sent = bbr_lt_probe_rate(&w) * 3 / 10;
+        uint32_t sent = lt_probe_rate(&w) * 3 / 10;
         uint32_t delivered = sent * 4 / 5;
         policer_interval(&w, 300, sent, 0, 0, delivered, sent - delivered);
         CHECK(!ST_ON(w.lt.f, LT_F_TAIL), "unchanged residual random loss does not set a ceiling (step %d)", k);

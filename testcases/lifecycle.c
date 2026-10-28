@@ -623,6 +623,44 @@ static void test_accept_limits(void)
     net_stop(&n);
 }
 
+/* a peer that opens a stream and closes it in the same datagram, over and
+ * over, while the application only uses the default stream: the closed
+ * handles count against ANL_MAX_STREAMS (DESIGN 6.1), so their structs and
+ * what arrived on them stay bounded; once the application releases them,
+ * the peer's opens are accepted again */
+static void test_closed_handles_bounded(void)
+{
+    anl_t *w = hostile_victim();
+    anl_stats st;
+    anl_stream_t *list[ANL_MAX_STREAMS];
+    char pl[64], buf[16], *p;
+    int i, k, cnt, ok = 1;
+    printf("[closed handles: a peer's open + close flood stays bounded]\n");
+    if (w == NULL) return;
+    for (i = 0; i < 500; i++) {
+        p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+        p = hostile_data(p, 2 + 2 * i, 0, 1, 64);
+        p = enc_sid(p, SEG_CTRL, 2 + 2 * i); p = enc8(p, CTRL_CLOSE); p = enc_varint(p, 0);
+        ok &= anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK;
+    }
+    anl_get_stats(w, &st);
+    CHECK(ok, "500 open + close datagrams taken");
+    CHECK(stream_count(w, NULL) == ANL_MAX_STREAMS - 1 && st.streams == 1 && st.streams_held == ANL_MAX_STREAMS - 1,
+          "the closed handles fill the table (%d structs, %u + %u held)", stream_count(w, NULL), st.streams, st.streams_held);
+
+    cnt = anl_readable(w, list, ANL_MAX_STREAMS);
+    CHECK(cnt == ANL_MAX_STREAMS - 1, "all readable (%d)", cnt);
+    for (k = 0; k < cnt && k < ANL_MAX_STREAMS; k++) {
+        CHECK(anl_stream_recv(list[k], buf, sizeof(buf)) == 1 && anl_stream_recv(list[k], buf, sizeof(buf)) == ANL_ECLOSED,
+              "the byte that came before the close, then ECLOSED");
+        anl_stream_close(list[k]);
+    }
+    p = plain_hdr(pl, NULL, w->conv, ANL_VERSION << 6, (uint16_t)w->current);
+    p = hostile_data(p, 2000, 0, 1, 64);
+    CHECK(anl_input_plain(w, pl, (int)(p - pl)) == ANL_OK && sget(w, 2000) != NULL, "released: the next open is accepted");
+    anl_release(w);
+}
+
 /* ANL_MAX_STREAMS streams, both sides' and the default one, hold a sid at once
  * (DESIGN 6.1): an open beyond that is ANL_EBUSY, a peer's open beyond it gets
  * RST, and a stream that is over gives its place back */

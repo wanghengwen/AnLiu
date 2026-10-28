@@ -278,10 +278,12 @@ static void test_receiver_skip_ack_fragments(void)
     ST_SET(st->trk, STT_SKIP); st->sm->rcv_skip_una = 50;
     for (i = 0; i < 200; i++) {
         anl_seg *s = seg_new(w, 0);
+        rcv_run *r;
         CHECK(s != NULL, "allocate received segment");
         if (!s) break;
         s->sn = 101u + (uint32_t)i * 2;
-        CHECK(rcv_link(st, s, run_find(st, s->sn)), "link received segment");
+        w->rx_walk = RUN_WALK_MAX;
+        CHECK(run_find(st, s->sn, &w->rx_walk, &r) == 0 && rcv_link(st, s, r), "link received segment");
     }
     g_skip_packets = g_skip_acks = 0; g_skip_want = 1; g_skip_watermark = 50;
     anl_setoutput(w, skip_ack_output);

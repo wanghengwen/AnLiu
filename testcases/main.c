@@ -58,6 +58,7 @@ int main(void)
     RUN(test_semi(2, 0, 1000));
     RUN(test_reflect());
     RUN(test_replay());
+    RUN(test_run_flood());
     RUN(test_violation());
     RUN(test_default_violation());
     RUN(test_seg_size());
@@ -83,6 +84,7 @@ int main(void)
     RUN(test_wire_v1_wrap(1));
     RUN(test_accept_limits());
     RUN(test_max_streams());
+    RUN(test_closed_handles_bounded());
     RUN(test_sid_churn(0, 9000));
     RUN(test_sid_churn(10, 9000));
     RUN(test_priority());

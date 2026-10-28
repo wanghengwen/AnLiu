@@ -133,8 +133,9 @@ static void loss_rtx(const anl_t *w, const anl_stream_t *st, const void *p, int 
 static void loss_dup(const anl_t *w, const anl_stream_t *st, uint32_t sn, int recovered)
 {
     int id = st->tag;
-    const rcv_run *r;
-    if (recovered || !(tdiff(sn, st->rcv_nxt) < 0 || ((r = run_find(st, sn)) && tdiff(sn, r->end) < 0))) return;
+    rcv_run *r;
+    uint32_t budget = RUN_WALK_MAX;     /* its own: the trace must not spend the datagram's */
+    if (recovered || !(tdiff(sn, st->rcv_nxt) < 0 || (run_find(st, sn, &budget, &r) == 0 && r && tdiff(sn, r->end) < 0))) return;
     if (w == owner || id < 0 || id > 1) return;
     dup_rx[id]++;
     dup_why[id][last_why[id][sn & 65535] & 3]++;
