@@ -81,13 +81,28 @@ def fetch(h, path, timeout=300):
             time.sleep(20)
 
 
+def deadman_log(read, tries=10):
+    """the deadman's log once it says CLEARED (read() returns it), or the last read"""
+    out = read()
+    for _ in range(tries):
+        if 'CLEARED' in out:
+            break
+        time.sleep(1)
+        out = read()
+    return out
+
+
 def tc_finish(h, tcbase, tcargs, dlog):
     """the clear output of a round's band: the deadman's (it clears when the sender exits, on the
-    host) or, when it has not cleared yet, a clear run now"""
-    out = ssh(h, 'cat ' + q(dlog) + ' 2>/dev/null', check=False).stdout.decode(errors='replace')
+    host) or, when it has not cleared yet, a clear run now. A clear that prints nothing found the
+    band gone: the deadman cleared it while this clear waited for the lock, and its log holds the
+    counters (2026-10-28: two churn rounds finishing together lost them three times)"""
+    read = lambda: ssh(h, 'cat ' + q(dlog) + ' 2>/dev/null', check=False).stdout.decode(errors='replace')
+    out = read()
     if 'CLEARED' in out:
         return out
-    return ssh(h, tcbase + ' clear' + tcargs).stdout.decode()
+    out = ssh(h, tcbase + ' clear' + tcargs).stdout.decode()
+    return out if 'CLEARED' in out else deadman_log(read)
 
 
 def save_meta(path, meta):
