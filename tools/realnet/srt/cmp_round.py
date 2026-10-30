@@ -129,7 +129,7 @@ def tc_finish(name):
     if 'CLEARED' not in o:
         o = ssh(S, f"python3 {CMP(S)}/multi_tc.py clear --dev {S['dev']} --peer {C['ip']} --port {port} --rate {rate} --loss {loss} --state {state}").stdout.decode()
         if 'CLEARED' not in o:
-            o = R.deadman_log(read)     # the deadman cleared the band while this clear waited (rnlib.tc_finish)
+            o = read()     # the deadman cleared the band while this clear waited (rnlib.tc_finish)
     finished.add(name)
     m = re.search(r'LOSS_STATS fwd_pkts (\d+) fwd_drop (\d+) rev_pkts (\d+) rev_drop (\d+)', o)
     if m: meta['protocols'][name]['loss_stats'] = dict(zip(('fwd_pkts', 'fwd_drop', 'rev_pkts', 'rev_drop'), map(int, m.groups())))

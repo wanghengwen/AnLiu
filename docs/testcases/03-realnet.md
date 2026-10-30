@@ -241,4 +241,4 @@ pgrep -fa 'realnet_trace|srtnet|bench/churn'   # 没有本批次留下的进程
 - **残留的 tc 频段会干扰后续轮次**：例如一轮在 setup 之后、deadman 启动之前中断，就会留下一个频段，它的过滤器优先于后来同一端口、同一对端的轮次。中断一批之后，在每个发送端查看 `~/.anliu-multi-tc.json`。每个残留频段都用它自己 deadman 的参数执行一次 `multi_tc.py clear`，再停掉 deadman。
 - **广域网路径在晚间可能自身丢包**（端到端丢包高于 tc 设定）。超出设定 2 个点以上的轮次由 `cmp_pair.py` 自动跳过；两个版本同时运行，受到的影响相同。
 - **`cmp_round.py` 需要两端之间至少一个方向能 ping 通**，用来量 RTT；都不通时报 `no ping`。
-- **"tc band matched no packets" 而 deadman 日志里有计数**：2026-10-28 之前的工具在两个轮次同时收尾时会误判。轮次结束时 deadman 正持锁清除频段，控制端读它的日志还没有 `CLEARED`，自己再跑的 `clear` 等到锁时频段已经不在，什么也不输出，计数就丢了。现在 `rnlib.tc_finish` 与 `cmp_round.py` 在这种情况下回头再读 deadman 的日志。旧批次中这样判为无效的轮次，可以从发送端 `logs/<tag>.deadman` 的 `LOSS_STATS` 补回计数（reg-20261028 的 3 次流开关尝试就是这样补的）。
+- **"tc band matched no packets" / "tc loss matched no packets" / "missing tc byte counter" 而 deadman 日志里有计数**：2026-10-28 之前的工具在两个轮次同时收尾时会误判。轮次结束时 deadman 正持锁清除频段，控制端读它的日志还没有 `CLEARED`，自己再跑的 `clear` 等到锁时频段已经不在，什么也不输出，计数就丢了。现在 `rnlib.tc_finish` 与 `cmp_round.py` 在这种情况下回头再读 deadman 的日志。旧批次中这样判为无效的轮次，可以从发送端的 deadman 日志（流开关与多流轮次为 `logs/<tag>.deadman`，`cmp_round.py` 为 `logs/<tag>.<name>.deadman`）的 `LOSS_STATS` 补回计数（reg-20261028 的 3 次流开关尝试就是这样补的）。

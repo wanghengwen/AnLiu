@@ -81,17 +81,6 @@ def fetch(h, path, timeout=300):
             time.sleep(20)
 
 
-def deadman_log(read, tries=10):
-    """the deadman's log once it says CLEARED (read() returns it), or the last read"""
-    out = read()
-    for _ in range(tries):
-        if 'CLEARED' in out:
-            break
-        time.sleep(1)
-        out = read()
-    return out
-
-
 def tc_finish(h, tcbase, tcargs, dlog):
     """the clear output of a round's band: the deadman's (it clears when the sender exits, on the
     host) or, when it has not cleared yet, a clear run now. A clear that prints nothing found the
@@ -102,7 +91,7 @@ def tc_finish(h, tcbase, tcargs, dlog):
     if 'CLEARED' in out:
         return out
     out = ssh(h, tcbase + ' clear' + tcargs).stdout.decode()
-    return out if 'CLEARED' in out else deadman_log(read)
+    return out if 'CLEARED' in out else read()
 
 
 def save_meta(path, meta):
