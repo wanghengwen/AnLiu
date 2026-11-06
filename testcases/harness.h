@@ -42,6 +42,7 @@ typedef struct net {
     int reflect;                    /* send packets back to the sender */
     uint32_t drop_at[4];            /* != 0: drop the datagrams with these n->sent numbers */
     int block[2];                   /* drop everything this side sends (a one-way outage) */
+    int loss_from[2];               /* != 0: also lose this % of what this side sends (a lossy uplink) */
     int max_len[2];                 /* != 0: drop what this side sends longer than this (a size blackhole) */
     int reorder;                    /* 1 = jitter may reorder datagrams; 0 = FIFO path */
     uint32_t last_at[2];            /* last scheduled delivery per direction (FIFO) */
@@ -100,6 +101,7 @@ static int net_output(char *buf, int len, anl_t *w, void *user)
 
     if (n->cap_len == 0 && len > 60 && from == 0) { memcpy(n->cap, buf, (size_t)len); n->cap_len = len; n->cap_from = from; }
     if (rnd_pct() < n->loss_pct) { n->lost++; return 0; }
+    if (n->loss_from[from] && rnd_pct() < n->loss_from[from]) { n->lost++; return 0; }
     delay = (uint32_t)n->min_delay + (n->max_delay > n->min_delay ? rnd() % (uint32_t)(n->max_delay - n->min_delay) : 0);
     if (!n->reorder && (int32_t)(n->now + delay - n->last_at[from]) < 0) delay = n->last_at[from] - n->now;
     n->last_at[from] = n->now + delay;

@@ -578,7 +578,10 @@ static void test_pacing_unmeasured(void)
         while (anl_stream_peeksize(b) > 0) { char r[200]; anl_frame_info fi; if (anl_stream_recv_frame(b, r, sizeof(r), &fi) < 0) break; }
     }
     n.loss_pct = 0;
-    n.min_delay = 20; n.max_delay = 30;              /* the key frame on a calmer path: what follows is STARTUP's */
+    /* the key frame on a calmer path: what follows is STARTUP's. The same
+       propagation time: on a longer one the minimum kept from the login's
+       samples reads the new path's own RTT as queueing (ends STARTUP) */
+    n.min_delay = 15; n.max_delay = 25;
     for (t = 0; t < 600; t++) net_tick(&n);          /* the losses repaired */
     while (anl_stream_peeksize(b) > 0) { char r[200]; anl_frame_info fi; if (anl_stream_recv_frame(b, r, sizeof(r), &fi) < 0) break; }
     anl_get_stats(n.ep[0], &st);
@@ -598,6 +601,122 @@ static void test_pacing_unmeasured(void)
        login's samples, 25%/s left it at 4 kB/s on a 200 kB/s estimate */
     CHECK(st.target_rate >= st.bw_estimate / 4, "target %u after the key frame, estimate %u", st.target_rate, st.bw_estimate);
     printf("  key frame arrived after %d ms, target %u of an estimate %u B/s\n", arrived, st.target_rate, st.bw_estimate);
+    net_stop(&n);
+}
+
+/* a radio link (4G): most round trips a multiple of the smallest one (FIFO
+ * jitter, RTT 40..180 ms) and a quarter of the uplink's datagrams - the
+ * ACKs - lost. A window of 2 x bw x min_rtt delivered about half the model's
+ * rate and pulled the model down round by round: cwnd 4..7 segments, the
+ * video's frames expired. The ACK aggregation allowance (extra_acked) holds
+ * the window at what the bursts of ACKs bring back (DESIGN 6.8) */
+static void test_cc_radio_jitter(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[40000];
+    int i, r, frames = 0, got = 0;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    anl_stats st;
+    printf("[cc: radio jitter (RTT 40..180 ms, in order) and 26%% of the ACKs lost]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = 20; n.max_delay = 90;
+    n.bandwidth_bps = 4000000; n.queue_limit = 400;
+    n.loss_from[1] = 26;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 30000; i++) {
+        net_tick(&n);
+        if (i % 33 == 0) {                                  /* 30 fps: 4 KB, a 30 KB key frame a second (~1.2 Mbit/s) */
+            int len = frames % 30 == 0 ? 30000 : 4000;
+            fill_pattern(buf, len, (uint32_t)frames);
+            r = anl_stream_send_frame(a, frames % 30 == 0 ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            if (r >= 0) frames++;
+        }
+        while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) {
+            CHECK(check_pattern(buf, r, fi.frame_no), "frame %u intact", fi.frame_no);
+            got++;
+        }
+    }
+    anl_get_stats(n.ep[0], &st);
+    /* without the allowance 523 of 910 frames came, cwnd 8 */
+    CHECK(got * 100 >= frames * 97, "%d of %d frames delivered", got, frames);
+    printf("  %d of %d frames, cwnd %u, min_rtt %u, srtt %u, estimate %u B/s, %u retransmissions (%u spurious RTOs)\n",
+           got, frames, st.cwnd, st.min_rtt, st.srtt, st.bw_estimate, st.retrans, st.rto_spurious);
+    net_stop(&n);
+}
+
+/* ACKs lost, data not: a frame's segments time out and are resent though the
+ * peer has them. The peer says so (ACK_F_DUP): the resends are not counted
+ * as lost, the model is not cut (DESIGN 6.3) */
+static void test_rto_spurious(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[2000];
+    int i, r, got = 0;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    anl_stats st;
+    printf("[rto: resends the peer had already (its ACKs lost) are not losses]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 30;
+    n.loss_from[1] = 50;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.fec = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 20000; i++) {
+        net_tick(&n);
+        if (i % 200 == 0) { fill_pattern(buf, 500, (uint32_t)i); anl_stream_send_frame(a, 0, buf, 500, NULL); }
+        while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) got++;
+    }
+    anl_get_stats(n.ep[0], &st);
+    CHECK(got == 100, "%d of 100 frames", got);
+    CHECK(st.retrans >= 10, "the lost ACKs made RTOs (%u resends)", st.retrans);
+    /* a few DUP ACKs are lost too (SACK_REPEAT of them at 50%) */
+    CHECK(st.rto_spurious * 2 >= st.retrans, "%u of %u resends known spurious", st.rto_spurious, st.retrans);
+    CHECK(n.ep[0]->lost_bytes * 10 <= (uint64_t)st.retrans * 3 * 600, "lost bytes %llu", (unsigned long long)n.ep[0]->lost_bytes);
+    printf("  %u resends, %u spurious, %llu bytes counted lost\n", st.retrans, st.rto_spurious, (unsigned long long)n.ep[0]->lost_bytes);
+    net_stop(&n);
+}
+
+/* a still screen over 4G: one small frame a second, each round trip with the
+ * radio's wake-up in it (rising to 1 s as it dozes off). The expired min_rtt
+ * took it: 855..1106 ms over 41 on 4G, above srtt, a window of 1700 segments;
+ * here 1018 ms and 744 segments (DESIGN 6.8) */
+static void test_min_rtt_idle(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[4000];
+    int i, r;
+    uint32_t idle_min = 0, idle_cwnd = 0;
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    anl_stats st;
+    printf("[min_rtt: samples taken on waking an idle radio do not renew it]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 20;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 40000; i++) {
+        int idle = i >= 3000 && i < 25000;
+        if (idle && i % 1000 == 0) n.min_delay = n.max_delay = umin32(500, 50 + (uint32_t)(i - 3000) / 10);  /* the radio dozes off */
+        if (i == 25000) n.min_delay = n.max_delay = 20;
+        net_tick(&n);
+        if (idle ? i % 1000 == 0 : i % 33 == 0) { fill_pattern(buf, idle ? 100 : 2000, (uint32_t)i); anl_stream_send_frame(a, 0, buf, idle ? 100 : 2000, NULL); }
+        while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) > 0) ;
+        if (i == 24900) { anl_get_stats(n.ep[0], &st); idle_min = st.min_rtt; idle_cwnd = st.cwnd; }
+    }
+    anl_get_stats(n.ep[0], &st);
+    CHECK(idle_min <= 60, "min_rtt after 22 s of waking samples: %u", idle_min);
+    CHECK(st.min_rtt <= 60, "min_rtt after traffic resumed: %u", st.min_rtt);
+    printf("  min_rtt %u at the end of the still screen (cwnd %u), %u after\n", idle_min, idle_cwnd, st.min_rtt);
     net_stop(&n);
 }
 

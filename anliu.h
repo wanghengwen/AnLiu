@@ -245,6 +245,8 @@ typedef struct anl_stats {
     uint32_t min_rtt;                   /* ms */
     int cc_state;                       /* ANL_BBR_STARTUP .. ANL_BBR_PROBE_RTT */
     uint32_t retrans;                   /* total retransmitted segments */
+    uint32_t rto_spurious;              /* timeout retransmissions the peer already had: their ACKs were
+                                           lost or late, not the data (not counted as loss, DESIGN 6.3) */
     uint32_t pace_rate;                 /* effective pacing rate, bytes/s */
     uint32_t target_rate;               /* payload bytes/s the application may send over all streams:
                                            bw_estimate less headers, FEC parities, retransmissions and

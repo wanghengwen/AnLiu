@@ -34,10 +34,10 @@
 | 内存分配器 | `test_allocator` | anl_config 里的分配器按连接使用并带 alloc_user；anl_release 后全部归还；只设一个函数时拒绝创建；anl_create 中途分配失败不留残余 |
 | 安全与健壮性 | `test_reflect` `test_replay` `test_violation` `test_default_violation` `test_fuzz` | 反射、重放窗口（pn）、违规段导致流重置；默认流只丢弃违规段，不会被结束；随机段 |
 | 流的生命周期 | `test_close_notify` `test_close_confirm` `test_close_confirm_lost_replies` `test_semi_close` `test_stream_lifecycle` `test_sid_lifecycle` `test_sid_hold` `test_sid_churn` `test_accept_limits` `test_max_streams` | CLOSE 一直重发到收到 RST（含断网后连续四次确认丢失）；两端计数一致；sid 不复用、保留期；接受上限；64 个流 |
-| 调度与 pacing | `test_pacing` `test_priority` `test_review_scheduler` `test_review_timers` `test_review_backlog` | 加权轮询的额度、按优先级调度、时钟回绕时的定时器、积压计数 |
+| 调度与 pacing | `test_pacing` `test_pacing_unmeasured` `test_priority` `test_review_scheduler` `test_review_timers` `test_review_backlog` | 加权轮询的额度、按优先级调度、时钟回绕时的定时器、积压计数 |
 | 媒体语义 | `test_key_sender_purge` `test_key_receiver_discard` `test_receiver_deadline_default` `test_receiver_skip_ack_fragments` `test_rcv_skip_clears_fwd` `test_rcv_hole_echo` `test_echo_clock_rate` | drop_until_key、接收端缺口等待的默认值（max_age 的 3/5）、跳过补不回的缺口；对端时钟偏快时 echo RTT 不漂移（`clock_ppm`） |
 | FEC | `test_fec_*`、`test_capacity_clear_window`、`test_capacity_recovery_replay`、`test_latency_rtt`、`test_report_late_clock`、`test_review_gf_tables` | 自动 FEC 的门、预算、丢失估计、容量门、伪修复；容量退出窗口中的关键帧/ACK 相位差、丢失、过期、排队、限速器、时钟回绕和采样间隔；固定种子 1 / 10% 与 8 / 15% 的恢复；缓存释放（DESIGN 8.7）；GF 表 |
-| 拥塞控制 | `test_start_rate` `test_bbr_*` `test_tiny_rtt` `test_target_rate*` `test_delay_report` `test_rtt_stale_ack` `test_start_absent` | 起步、交付窗口、应用受限、限速器检测、目标码率 |
+| 拥塞控制 | `test_start_rate` `test_bbr_*` `test_tiny_rtt` `test_target_rate*` `test_delay_report` `test_rtt_stale_ack` `test_start_absent` `test_cc_radio_jitter` `test_rto_spurious` `test_min_rtt_idle` | 起步、交付窗口、应用受限、限速器检测、目标码率；无线抖动加 ACK 丢失时的窗口（ACK 聚合余量）、对端已有的超时重传不计丢失（DUP）、唤醒空闲无线时的 RTT 样本不刷新 min_rtt |
 | 断网与判死 | `test_outage` `test_rack_repeat_backoff` | 断网恢复；RACK 反复判丢的可靠重传要退避，不能在对端还在应答时判死 |
 | 报告与送达计量 | `test_report_rx_bytes` `test_report_rx_count` `test_bbr_policer_reports` `test_bbr_report_intervals` `test_report_epoch_wrap` `test_report_capacity_recovery` | REPORT 的 `rx_bytes`：只用对端时间更新的报告推进，乱序、重复、丢失与回绕；无丢包时接收计数等于 `sent_wire`；限速器检测用报告速率（覆盖不足时按 ACK）、一次重测；报告缺失、跨变速的迟到快照、短 REPORT 被跳过；浅 FIFO 的容量恢复（种子 9、10） |
 

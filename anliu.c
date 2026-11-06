@@ -537,6 +537,8 @@ typedef char mtu_min_check[ANL_MTU_MIN == ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN
                                    rates differ); a replay that extends into the future is 33..65 s ahead */
 #define ACK_F_WASK      0x80    /* window probe: please answer with an ACK */
 #define ACK_F_FRESH     0x40    /* data arrived since the last ACK: ts_echo is an RTT sample */
+#define ACK_F_DUP       0x20    /* a segment arrived that was here already (in the last SACK_REPEAT ACKs):
+                                   the sender's RTO resend of it was spurious - the ACKs were lost or late */
 #define RTX_RTO         2       /* why a segment is retransmitted (anl_seg.rack_rtx, the rtx trace) */
 #define RTX_RACK        3
 #define SACK_REPEAT     3       /* every received segment is reported in at least 3 ACKs */
@@ -576,6 +578,10 @@ typedef char mtu_min_check[ANL_MTU_MIN == ANL_OVERHEAD + DATA_HDR_MAX + 2 + OPEN
 #define BBR_BW_ROUNDS       10
 #define BBR_PROBE_RTT_MS    200
 #define BBR_MIN_RTT_WIN     10000
+#define BBR_AGG_ROUNDS      5       /* ACK aggregation (extra_acked): a max over 5..10 rounds (BBRv2) */
+#define BBR_AGG_MAX_MS      100     /* ... adds at most this long at the model's rate to cwnd */
+#define IDLE_GAP_MS         300     /* data sent after this long without any wakes the path (wake_ts): a
+                                       radio's RTT then includes its wake-up, for about as long again */
 #define BBR_LOSS_THRESH     2       /* % of a round's data lost: congestion, if a queue shows */
 #define BBR_LOSS_BLIND      50      /* % lost in PROBE_BW: congestion even without a queue (policer) */
 #define BBR_PATH_ROUNDS     3       /* rounds a queue outlives our cuts before it counts as the path RTT */
@@ -851,6 +857,7 @@ typedef struct anl_stream {
 
     uint32_t ack_ts;
     uint32_t ack_rep_ts;    /* receiver: repeat the last ACK then unless another goes out first (| 1; 0: none) */
+    uint8_t dup_rep;        /* receiver: ACKs still to carry ACK_F_DUP */
     /* RACK (DESIGN 6.3): the newest datagram with data of this stream the peer
        is known to have - orders segments sent in the same millisecond */
     uint32_t rack_ts;       /* its send time (ts_echo) */
@@ -962,6 +969,8 @@ struct anl_s {
     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
     uint32_t reo_spur_ts;               /* last spurious RACK retransmission */
     uint32_t min_rtt, min_rtt_ts;       /* windowed minimum RTT (BBR_MIN_RTT_WIN) */
+    uint32_t wake_ts;                   /* the last data sent after IDLE_GAP_MS without: the busy period's start (| 1; 0: none) */
+    uint32_t data_tx_ts;                /* the last datagram with data (| 1; 0: none) */
     uint32_t rack_ts, rack_rtt;         /* RACK: newest datagram the peer is known to have (any stream; IN_F_RACK) */
     uint32_t cwnd;                      /* segments */
     uint32_t rx_net;                    /* receiver: data and parity bytes (seg_wire) arrived from the network,
@@ -992,6 +1001,13 @@ struct anl_s {
     uint32_t net_round;                 /* round of the last network-limited or queued sample (| 1); 0 = none */
     uint32_t net_sample_ts;             /* ... its time (| 1); 0 = none (stats.bw_estimate_age_ms) */
     uint32_t bw_lo;                     /* BBRv2 lower bound after congestive loss, until the next probe; 0 = none */
+    struct {                            /* ACK aggregation (bbr_update_aggregation, DESIGN 6.8) */
+        uint64_t epoch_acked;           /* bytes acknowledged since epoch_ts */
+        uint64_t last;                  /* delivered + delivered_fec at the previous ACK */
+        uint32_t epoch_ts;              /* (| 1; 0: none) */
+        uint32_t extra[2];              /* the largest excess over the model's rate, this and the last window */
+        uint8_t idx, rounds;
+    } agg;
     uint32_t bw_idx;                    /* filter slot of the current round */
     /* token-bucket policer detection (DESIGN 6.8): intervals of >= BBR_LT_ROUNDS rounds and 300 ms.
        Its own state, kept by lt_policer; the rest reads state and rate: bbr_bw (the confirmed
@@ -1148,6 +1164,7 @@ struct anl_s {
 
     /* stats */
     uint32_t retrans_total;
+    uint32_t rto_spurious;              /* RTO resends the peer had already (ACK_F_DUP): stats */
     uint64_t tx_dg, rx_dg, rx_auth_fail, rx_stale, rx_replay;
     uint32_t tx_pn;                     /* the next datagram's pn (DESIGN 4.3) */
     uint32_t rx_pn_max;                 /* the largest pn authenticated and taken, and the PN_WIN below it (IN_F_PEER_TS) */
@@ -1599,6 +1616,12 @@ static void dg_output(anl_t *w, int force_pad)
 
     siv_seal(&w->keys, w->role, (uint8_t *)w->buf, w->ptr - ANL_TAG_SIZE);
     w->output(w->buf, (int)w->ptr, w, w->user);
+    if (ST_ON(w->out_f, OUT_F_DG_DATA)) {
+        /* ACKs and reports between still frames do not keep a radio awake
+           (a still screen: one data datagram a second, two others) */
+        if (w->data_tx_ts == 0 || tdiff(w->current, w->data_tx_ts) >= IDLE_GAP_MS) w->wake_ts = ts_mark(w);
+        w->data_tx_ts = ts_mark(w);
+    }
     w->tx_dg++;
     w->last_tx = w->current;
     ANL_TRACE(tx_output, w, w->ptr, ST_ON(w->out_f, OUT_F_DG_DATA));
@@ -1737,7 +1760,7 @@ static uint32_t wnd_unused(const anl_stream *st)
 static void write_ack_segs(anl_t *w, anl_stream *st, int ask)
 {
     uint32_t maxroom = w->mtu - ANL_OVERHEAD;
-    uint8_t b1 = (uint8_t)((ask ? ACK_F_WASK : 0) | (ST_ON(st->out, STO_FRESH) ? ACK_F_FRESH : 0));
+    uint8_t b1 = (uint8_t)((ask ? ACK_F_WASK : 0) | (ST_ON(st->out, STO_FRESH) ? ACK_F_FRESH : 0) | (st->dup_rep ? ACK_F_DUP : 0));
     anl_node *pos = st->rcv_runs.next;
     char *rb = w->scratch;                  /* range bytes, copied behind the segment header */
     int skip;
@@ -1793,6 +1816,9 @@ static void write_ack_segs(anl_t *w, anl_stream *st, int ask)
        repeat is not FRESH: no RTT sample, no RACK time. */
     st->ack_rep_ts = ST_ON(st->out, STO_FRESH) ? (w->current + (uint32_t)w->interval) | 1 : 0;
     ST_CLR(st->out, STO_ACK | STO_FRESH | STO_TELL);
+    /* in SACK_REPEAT ACKs, as a range: one of them gets through the loss
+       that took the ACKs before the resend */
+    if (st->dup_rep) st->dup_rep--;
 }
 
 static void ack_schedule(anl_stream *st)
@@ -2764,13 +2790,20 @@ static void handle_data(anl_t *w, anl_stream *st, uint32_t sn, uint32_t frg, uin
     }
     ack_schedule(st);
     ANL_TRACE(dup, w, st, sn, recovered);
-    if (tdiff(sn, st->rcv_nxt) < 0) return;
+    if (tdiff(sn, st->rcv_nxt) < 0) {
+        /* here already - the sender resent it without our ACKs (ACK_F_DUP).
+           Or skipped: a late resend of a hole a semi stream gave up on reads
+           the same, a loss the sender then does not count */
+        if (!recovered) st->dup_rep = SACK_REPEAT;
+        return;
+    }
     if (!recovered && tdiff(sn, st->rcv_nxt) > 0) w->rx_hole_ts = ts_mark(w);  /* behind a hole: loss (or reordering) */
 
     if (run_find(st, sn, &w->rx_walk, &r) < 0) return;    /* the datagram's lookup budget is spent: as if lost */
     if (r && tdiff(sn, r->end) < 0) {
         /* the sender retransmitted it: it may not have heard of it, report again */
         r->rep = 0;
+        if (!recovered) st->dup_rep = SACK_REPEAT;
         return;
     }
 
@@ -3516,6 +3549,55 @@ static uint32_t bbr_wnd_segs(const anl_t *w, uint64_t bytes)
     return umin32(sat32(bytes / w->avg_seg), ANL_MAX_WND);
 }
 
+/* ACK aggregation (BBRv2 extra_acked): the bytes the ACKs bring beyond the
+ * model's rate since an epoch began, the largest over the last
+ * BBR_AGG_ROUNDS..2x rounds; at most cwnd (one window cannot come back
+ * twice). On a radio uplink the ACKs come in bursts after stalls, most
+ * round trips a multiple of min_rtt (4G: 150 ms on a minimum of 41): a window
+ * of 2 x bw x min_rtt then delivered half the model's rate, each round's
+ * sample lowered the model and the window with it, down to 4..7 segments
+ * and 20 KB/s. Every datagram's ACKs (bbr_on_ack) */
+static void bbr_update_aggregation(anl_t *w, int round_start)
+{
+    uint64_t now = w->delivered + w->delivered_fec, acked = now - w->agg.last, expected = 0;
+    w->agg.last = now;
+    if (round_start && ++w->agg.rounds >= BBR_AGG_ROUNDS) {
+        w->agg.rounds = 0;
+        w->agg.idx ^= 1;
+        w->agg.extra[w->agg.idx] = 0;
+    }
+    if (acked == 0) return;
+    if (w->agg.epoch_ts != 0) {
+        int32_t el = tdiff(w->current, w->agg.epoch_ts);
+        expected = (uint64_t)bbr_bw(w) * (uint32_t)(el > 0 ? el : 0) / 1000;
+    }
+    /* the ACKs kept up with no more than the model's rate: a new epoch here */
+    if (w->agg.epoch_ts == 0 || w->agg.epoch_acked <= expected) {
+        w->agg.epoch_acked = 0;
+        w->agg.epoch_ts = ts_mark(w);
+        expected = 0;
+    }
+    w->agg.epoch_acked += acked;
+    if (w->agg.epoch_acked > expected) {
+        uint64_t extra = w->agg.epoch_acked - expected, cap = (uint64_t)w->cwnd * w->avg_seg;
+        if (extra > cap) extra = cap;
+        if (extra > w->agg.extra[w->agg.idx]) w->agg.extra[w->agg.idx] = sat32(extra);
+    }
+}
+
+/* the window's allowance for ACK aggregation, at most BBR_AGG_MAX_MS at the
+ * model's rate. Less two update intervals: sending and ACKs go in interval
+ * steps, which bbr_rtt's floor and the quanta already allow for. In full on
+ * a path of a few ms the window, the queue and the audio's delay grew by 20
+ * ms at 800 kbit (audio on time 97% -> 94%) */
+static uint64_t bbr_agg_bytes(const anl_t *w)
+{
+    uint64_t e = umax32(w->agg.extra[0], w->agg.extra[1]), cap = (uint64_t)bbr_bw(w) * BBR_AGG_MAX_MS / 1000;
+    uint64_t q = (uint64_t)bbr_bw(w) * w->interval * 2 / 1000;
+    e = e > q ? e - q : 0;
+    return e < cap ? e : cap;
+}
+
 static void bbr_set_cwnd(anl_t *w)
 {
     uint32_t segs;
@@ -3523,7 +3605,7 @@ static void bbr_set_cwnd(anl_t *w)
         segs = w->init_cwnd;
     } else {
         uint64_t bdp = bbr_bdp(w);
-        segs = bbr_wnd_segs(w, bdp * w->cwnd_gain / BBR_UNIT + 3u * w->avg_seg);    /* + send / ACK quanta */
+        segs = bbr_wnd_segs(w, bdp * w->cwnd_gain / BBR_UNIT + 3u * w->avg_seg + bbr_agg_bytes(w));  /* + send / ACK quanta */
         if (w->bbr_state == ANL_BBR_PROBE_RTT)          /* BBRv2: half the BDP, not 4 packets */
             segs = umin32(segs, (uint32_t)(bdp / 2 / w->avg_seg));
     }
@@ -3587,9 +3669,16 @@ static void bbr_enter_probe_rtt(anl_t *w)
 }
 
 /* min_rtt over BBR_MIN_RTT_WIN; when it expires, PROBE_RTT drains the queue */
-static void bbr_update_min_rtt(anl_t *w, int32_t rtt)
+static void bbr_update_min_rtt(anl_t *w, int32_t rtt, int wake)
 {
     int expired = w->min_rtt != 0 && tdiff(w->current, w->min_rtt_ts) > BBR_MIN_RTT_WIN;
+    /* a sample of what was sent on waking from silence does not replace an
+       expired minimum: a radio link's wake-up is in it (4G with a still
+       screen: min_rtt 855..1106 ms over 41, above srtt, cwnd 1700 and the
+       RTO 2.4 s). Idle time does not age the minimum either: kept expired,
+       the first sample of the traffic that follows took it and PROBE_RTT
+       halved the window under a key frame. A lower sample still counts */
+    if (expired && wake && (uint32_t)rtt > w->min_rtt) { w->min_rtt_ts = w->current; return; }
     if (w->min_rtt == 0 || (uint32_t)rtt <= w->min_rtt || expired) {
         /* a new value no PROBE_RTT has seen yet - below what the last one
            saw. Not merely below the current min_rtt: a flat-queue probe sets
@@ -4085,12 +4174,15 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
     uint64_t delivered;
     int32_t send_el, ack_el;
     uint32_t interval;
+    int round_start;
     if (w->app_limited != 0 && w->delivered > w->app_limited) w->app_limited = 0;
-    if (rs->prior_delivered >= w->next_round_delivered) {
+    round_start = rs->prior_delivered >= w->next_round_delivered;
+    if (round_start) {
         w->next_round_delivered = w->delivered;
         w->round_count++;
         bbr_round_end(w, rs->app_limited);
     }
+    bbr_update_aggregation(w, round_start);
     delivered = w->delivered - rs->prior_delivered + (w->delivered_fec - rs->prior_fec);
     send_el = tdiff(rs->send_ts, rs->first_sent);
     ack_el = tdiff(w->delivered_ts, rs->prior_ts);
@@ -4176,12 +4268,12 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
     bbr_set_cwnd(w);
 }
 
-static void update_ack(anl_t *w, int32_t rtt)
+static void update_ack(anl_t *w, int32_t rtt, int wake)
 {
     int32_t rto;
     w->last_rtt = rtt;
     if (w->round_min_rtt == 0 || (uint32_t)rtt < w->round_min_rtt) w->round_min_rtt = umax32((uint32_t)rtt, 1);
-    bbr_update_min_rtt(w, rtt);
+    bbr_update_min_rtt(w, rtt, wake);
     if (w->rx_srtt == 0) {
         w->rx_srtt = rtt;
         w->rx_rttval = rtt / 2;
@@ -4265,6 +4357,17 @@ static int ack_account(anl_t *w, anl_stream *st, anl_seg *s, uint8_t b1, uint32_
        the retransmission was spurious (only reordered) */
     int orig = s->xmit > 1 && (b1 & ACK_F_FRESH) && tdiff(ts_echo, s->ts_sent) < 0;
     spurious = orig && s->rack_rtx == RTX_RACK;
+    /* F-RTO by the peer's word: it had the segment when our one RTO resend
+       came (ACK_F_DUP) - its ACKs were lost or late (a 4G uplink lost a
+       quarter of them: 174 RTOs in 50 s for about 30 lost packets, each
+       counted as congestion). No loss, and the RTO's packet conservation
+       ends. The flag covers the ACKs around the duplicate, not one sn: a
+       real loss resent in the same few ACKs passes as spurious too */
+    if (!orig && s->xmit == 2 && s->rack_rtx == RTX_RTO && (b1 & ACK_F_DUP)) {
+        orig = 1;
+        w->rto_spurious++;
+        if (tdiff(w->round_count, w->rto_round) < 0) w->rto_round = w->round_count;
+    }
     if (orig || s->xmit <= 1) {
         /* never lost (reordering, a late ACK under heavy jitter;
            or RACK marked it and it arrived before the flush
@@ -4879,8 +4982,12 @@ static int anl_input_plain(anl_t *w, const char *plain, int size)
 
     if (c.have_echo && (w->life != ANL_LIFE_NEW)) {
         int32_t rtt = tdiff(w->current, c.max_echo);
+        /* the echoed datagram went out before the path had been busy for
+           IDLE_GAP_MS: on waking it, or earlier (a still screen's frames
+           a second apart, each RTT as long: the next wake comes first) */
+        int wake = w->wake_ts != 0 && tdiff(c.max_echo, w->wake_ts + IDLE_GAP_MS) < 0;
         if (rtt >= 0 && rtt <= w->rx_rto) ST_CLR(w->in_f, IN_F_RTT_RESUME);
-        if (rtt >= 0 && rtt <= (int32_t)RTO_MAX) update_ack(w, rtt);   /* ignore garbage echoes */
+        if (rtt >= 0 && rtt <= (int32_t)RTO_MAX) update_ack(w, rtt, wake);   /* ignore garbage echoes */
     }
     if (c.rs.valid && (w->life != ANL_LIFE_NEW)) bbr_on_ack(w, &c.rs);
 
@@ -6651,6 +6758,8 @@ static void path_model_reset(anl_t *w)
     w->btl_bw = w->bw_lo = w->round_bw = 0;
     w->net_round = w->net_sample_ts = 0;
     ST_CLR(w->rate.f, RATE_F_MEASURED);
+    memset(&w->agg, 0, sizeof(w->agg));
+    w->agg.last = w->delivered + w->delivered_fec;
     w->inflight_hi = 0;
     w->loss_rate = 0;
     w->full_bw = w->full_bw_cnt = 0;
@@ -7000,6 +7109,7 @@ int anl_get_stats(const anl_t *w, anl_stats *out)
     out->cc_state = w->bbr_state;
     FOR_EACH_STREAM(w, st, n, nx) out->inflight += st->nsnd_buf;
     out->retrans = w->retrans_total;
+    out->rto_spurious = w->rto_spurious;
     out->pace_rate = w->pace_rate ? w->pace_rate : compute_pace_rate(w);
     out->target_rate = w->rate.target;
     out->capacity_short = ST_ON(w->rate.f, CS_F_SHORT);
