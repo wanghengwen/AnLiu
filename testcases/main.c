@@ -70,6 +70,7 @@ int main(void)
     RUN(test_semi_close(10, 0));
     RUN(test_semi_close(10, 1));
     RUN(test_pacing());
+    RUN(test_pacing_unmeasured());
     RUN(test_stream_lifecycle(0));
     RUN(test_stream_lifecycle(10));
     RUN(test_sid_lifecycle());

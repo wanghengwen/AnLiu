@@ -545,6 +545,62 @@ static void test_pacing(void)
     net_stop(&n);
 }
 
+/* A remote-desktop session: seconds of login messages (one small frame every
+ * 500 ms) over a jittery mobile path that loses a few of them, then the first
+ * key frame. The only samples were app-limited, a few bytes a round: the model
+ * says ~20 kbit/s and the lost messages, on rounds whose single RTT sample sat
+ * above min_rtt, read as congestion. That must not end STARTUP, cut the
+ * model or pace the key frame at the minimum window: before any sample that
+ * measured the path it goes out as the first flight of a new connection does
+ * (DESIGN 6.8, the RustDesk 4G trace of 2026-11-06: 221 KB in 3..4 s). */
+static void test_pacing_unmeasured(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o;
+    static char buf[200000];
+    char msg[120];
+    anl_stats st;
+    int i, t, arrived = -1;
+    anl_stream_t *a, *b;
+    printf("[pacing: a key frame after app-limited sparse traffic]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = 15; n.max_delay = 50;              /* RTT 30..100 ms */
+    n.bandwidth_bps = 8000000; n.queue_limit = 400;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.max_age_ms = 0;
+    a = open_pair(&n, 0, &o, NULL, &b);
+    if (!b) { net_stop(&n); return; }
+    memset(msg, 7, sizeof(msg));
+    n.loss_pct = 25;
+    for (t = 0; t < 20000; t++) {
+        if (t % 500 == 0) anl_stream_send_frame(a, ANL_FRAME_KEY, msg, sizeof(msg), NULL);
+        net_tick(&n);
+        while (anl_stream_peeksize(b) > 0) { char r[200]; anl_frame_info fi; if (anl_stream_recv_frame(b, r, sizeof(r), &fi) < 0) break; }
+    }
+    n.loss_pct = 0;
+    n.min_delay = 20; n.max_delay = 30;              /* the key frame on a calmer path: what follows is STARTUP's */
+    for (t = 0; t < 600; t++) net_tick(&n);          /* the losses repaired */
+    while (anl_stream_peeksize(b) > 0) { char r[200]; anl_frame_info fi; if (anl_stream_recv_frame(b, r, sizeof(r), &fi) < 0) break; }
+    anl_get_stats(n.ep[0], &st);
+    CHECK(st.bw_estimate_age_ms == 0xffffffffu, "no sample measured the path yet (age %u)", st.bw_estimate_age_ms);
+    CHECK(st.cc_state == ANL_BBR_STARTUP, "sparse lossy app-limited rounds do not end STARTUP (state %d)", st.cc_state);
+    fill_pattern(buf, 200000, 1);
+    anl_stream_send_frame(a, ANL_FRAME_KEY, buf, 200000, NULL);
+    for (i = 0; i < 3000 && arrived < 0; i++) {
+        net_tick(&n);
+        if (anl_stream_peeksize(b) == 200000) arrived = i;
+    }
+    /* a few round trips from 16 segments in STARTUP; with STARTUP over and
+       the minimum window (4 segments per RTT) it took 0.9..1.4 s */
+    CHECK(arrived >= 0 && arrived < 600, "200 KB key frame arrived in %d ms", arrived);
+    anl_get_stats(n.ep[0], &st);
+    /* the first measured step starts the target from the model: from the
+       login's samples, 25%/s left it at 4 kB/s on a 200 kB/s estimate */
+    CHECK(st.target_rate >= st.bw_estimate / 4, "target %u after the key frame, estimate %u", st.target_rate, st.bw_estimate);
+    printf("  key frame arrived after %d ms, target %u of an estimate %u B/s\n", arrived, st.target_rate, st.bw_estimate);
+    net_stop(&n);
+}
+
 /* capture callback for the demux test */
 static char g_cap[2048];
 static int g_caplen;

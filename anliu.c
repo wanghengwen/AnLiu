@@ -903,6 +903,8 @@ typedef struct anl_stream {
 #define CS_F_PROBE        0x08  /* ... a state entered on expiry (or within 5 s of leaving it) with 3 calm steps:
                                    bw_lo released, PROBE_BW probes at once and UP goes on while the estimate grows */
 #define RATE_F_REPORT     0x10  /* the receiver-report snapshot is initialized (not that report_rate is fresh) */
+#define RATE_F_MEASURED   0x20  /* a step has seen the model measured (bbr_unmeasured false): the targets before were
+                                   of app-limited samples only, the first measured step starts afresh (rate_update) */
 
 /* lt.state: the policer detection (lt_policer) */
 enum {
@@ -1816,6 +1818,20 @@ static uint32_t lt_pace(const anl_t *w);
 static int bbr_queue_signal(const anl_t *w);
 static uint64_t bbr_inflight_bytes(const anl_t *w);
 
+/* No sample has measured the path yet: every one was app-limited (login
+ * messages, a still desktop), and the model is what the application sent -
+ * a few bytes a round, far below what the first flight of a new connection
+ * may send. Its pace and window are not below that first flight's
+ * (compute_pace_rate, bbr_set_cwnd), and a lost message on such a round is
+ * no congestion (bbr_round_end): a round of one or two sparse segments, its
+ * one RTT sample above min_rtt on a jittery path, read as congestive -
+ * STARTUP ended, the model was cut, and the first key frame (221 KB) went
+ * out at 4 segments per RTT, 3..4 s (RustDesk over 4G). */
+static int bbr_unmeasured(const anl_t *w)
+{
+    return w->net_sample_ts == 0;
+}
+
 /* Burst headroom for an app-limited sender whose bandwidth estimate only
  * shows what the application offered: a key frame goes out at the STARTUP
  * gain and its samples find the path. Not when the path was measured (or a
@@ -1853,7 +1869,7 @@ static uint32_t compute_pace_rate(const anl_t *w)
        4 segments per ms, 44 Mbps, over a 28 Mbps policer - 40% of what was
        sent was lost (real network) */
     uint32_t srtt = umax32(srtt_or_def(w), (uint32_t)w->interval);
-    uint64_t rate, floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000u / srtt;
+    uint64_t rate = 0, floor = (uint64_t)BBR_MIN_CWND * w->mss * 1000u / srtt;
     uint32_t gain = w->pacing_gain;
     /* app-limited (audio, video between key frames): btl_bw only shows
        what the application sent. Its bursts - a key frame - go out at the
@@ -1863,7 +1879,12 @@ static uint32_t compute_pace_rate(const anl_t *w)
        only loss - 6% of what was sent at 1 ms RTT (BBRv1 does the same) */
     if (w->lt.state != LT_WATCH && gain > BBR_UNIT) gain = BBR_UNIT;
     if (w->btl_bw != 0) rate = (uint64_t)bbr_bw(w) * gain / BBR_UNIT;
-    else rate = (uint64_t)w->init_cwnd * w->mss * 1000u / srtt * BBR_STARTUP_GAIN / BBR_UNIT;
+    /* not measured yet (only app-limited samples): at least as the first
+       flight goes, before any sample - not a policer's test rate */
+    if (w->btl_bw == 0 || (bbr_unmeasured(w) && w->lt.state == LT_WATCH)) {
+        uint64_t init = (uint64_t)w->init_cwnd * w->mss * 1000u / srtt * BBR_STARTUP_GAIN / BBR_UNIT;
+        if (rate < init) rate = init;
+    }
     /* A lower-rate trial must be executable: the floor stays outside policer
        control, explicit up-probes are allowed */
     {
@@ -3506,7 +3527,7 @@ static void bbr_set_cwnd(anl_t *w)
         if (w->bbr_state == ANL_BBR_PROBE_RTT)          /* BBRv2: half the BDP, not 4 packets */
             segs = umin32(segs, (uint32_t)(bdp / 2 / w->avg_seg));
     }
-    if (bbr_headroom(w)) segs = umax32(segs, w->init_cwnd);     /* room for an app-limited burst */
+    if (bbr_headroom(w) || bbr_unmeasured(w)) segs = umax32(segs, w->init_cwnd);  /* room for an app-limited burst */
     /* ... and a window for the rate bursts go out at: on a short path the
        model's BDP (the application's average rate) held a key frame to 13
        segments per RTT, 20 ms instead of 5 */
@@ -3712,7 +3733,12 @@ static void bbr_round_end(anl_t *w, int app_limited)
        throttle to nothing. Heavy loss without a queue (a policer) counts only
        in PROBE_BW: in STARTUP the first RTOs, before any RTT sample, are
        often spurious (initial RTO below the path RTT). */
-    if (bbr_congestive(w, rd, lost) || (w->bbr_state == ANL_BBR_PROBE_BW && loss_over(rd, lost, BBR_LOSS_BLIND))) {
+    /* ... nor on an app-limited round before any sample measured the path:
+       a segment or two a round, the loss of one is half the round, and the
+       round's one RTT sample is the queue signal (bbr_unmeasured) */
+    if (app_limited && bbr_unmeasured(w)) {
+        /* no congestion response */
+    } else if (bbr_congestive(w, rd, lost) || (w->bbr_state == ANL_BBR_PROBE_BW && loss_over(rd, lost, BBR_LOSS_BLIND))) {
         uint64_t cur = (uint64_t)w->cwnd * w->avg_seg;
         uint64_t hi = cur * BBR_BETA / BBR_UNIT;
         /* the round's delivery rate is what the path has now (not below 0.7x
@@ -6068,7 +6094,7 @@ static void rate_update(anl_t *w)
 {
     int32_t dt = tdiff(w->current, w->rate.ts);
     uint64_t dp, dwire, dd, dpar, base, pay_rate, floor;
-    uint32_t rmin, queue, qthresh, reported;
+    uint32_t rmin, queue, qthresh, reported, last;
     int delivery_limited;
     if (w->rate.ts != 0 && dt < RATE_STEP_MS) return;
     dp = w->tx_payload - w->rate.payload0;
@@ -6118,6 +6144,16 @@ static void rate_update(anl_t *w)
     qthresh = umax32(rmin / 4, 25);
     if (queue > qthresh) w->rate.par_queue_ts = ts_mark(w);
     reported = rate_report_pay(w);
+    /* The last target the increase is limited from. Not on the first step
+       with the model measured: the targets before it followed app-limited
+       samples only (bbr_unmeasured), a login's few bytes a round - from
+       them 25%/s took the encoder from 92 kbit/s to a 1.1 Mbit/s path in
+       9 s. That step starts from the model, as the first target does. */
+    last = w->rate.target;
+    if (!bbr_unmeasured(w) && !ST_ON(w->rate.f, RATE_F_MEASURED)) {
+        ST_SET(w->rate.f, RATE_F_MEASURED);
+        last = 0;
+    }
     /* This repairs ACK undercount during a queue drain, not the policer or
        app-limited ceiling. Require arrivals to sustain at least 80% of the
        model: a stale burst estimate or a propagation-delay jump must still
@@ -6156,8 +6192,8 @@ static void rate_update(anl_t *w)
            already bounds the target below actual delivery (below); let
            ACKs recover from a sparse step within that ceiling instead of
            making one low sample the starting point of a long ramp. */
-        if (w->rate.target != 0 && !delivery_limited) {
-            uint64_t grow = w->rate.target + (uint64_t)w->rate.target * RATE_GROWTH * (uint32_t)dt / 100000;
+        if (last != 0 && !delivery_limited) {
+            uint64_t grow = last + (uint64_t)last * RATE_GROWTH * (uint32_t)dt / 100000;
             if (base > grow) base = grow;
         }
     } else {
@@ -6166,7 +6202,7 @@ static void rate_update(anl_t *w)
            goes at the next probe) - climbing, the queue shows first. While
            app-limited without a queue, up by as much (at most 1.25 x what is
            sent): the estimate only shows what the application sent. */
-        uint64_t prev = w->rate.target ? w->rate.target : base, grow;
+        uint64_t prev = last ? last : base, grow;
         /* The bounded recovery test has to feed the path to test growth.
            The application may already send above a depressed target (its
            minimum media rate); start from that measured load, not below it. */
@@ -6541,8 +6577,11 @@ static void anl_flush_internal(anl_t *w)
        collapsing to one packet. Only while a queue shows (a bandwidth drop
        fills the bottleneck queue first) or with a policer's heavy loss:
        without a queue the RTOs are tail losses of a burst or reordering on
-       a jittery link, and each would stall a round. */
-    if (lost && !w->rec.cc_ignore_loss && (bbr_queue_signal(w) || w->loss_rate * 100 > BBR_LOSS_BLIND * 256u)) {
+       a jittery link, and each would stall a round. Nor before a sample
+       measured the path: there is no model to be stale, and the RTO of a
+       lone login message held the first key frame to 4 segments a round. */
+    if (lost && !w->rec.cc_ignore_loss && !bbr_unmeasured(w) &&
+        (bbr_queue_signal(w) || w->loss_rate * 100 > BBR_LOSS_BLIND * 256u)) {
         w->rto_round = w->round_count + 1;
         w->rto_inflight = inflight;
         bbr_set_cwnd(w);
@@ -6610,6 +6649,8 @@ static void path_model_reset(anl_t *w)
     w->min_rtt = w->min_rtt_ts = 0;
     memset(w->bw_round, 0, sizeof(w->bw_round));
     w->btl_bw = w->bw_lo = w->round_bw = 0;
+    w->net_round = w->net_sample_ts = 0;
+    ST_CLR(w->rate.f, RATE_F_MEASURED);
     w->inflight_hi = 0;
     w->loss_rate = 0;
     w->full_bw = w->full_bw_cnt = 0;

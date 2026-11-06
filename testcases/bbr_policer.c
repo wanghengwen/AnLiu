@@ -524,10 +524,13 @@ static void test_bbr_policer_queue_recheck(void)
  * and the path carried - while the smoothed loss stays under 1/8, and
  * inflight_hi is not bounded by such a round; a network-limited round cuts
  * both as before; an app-limited round with heavy loss (the application
- * offers more than a slower bottleneck) cuts bw_lo as before. */
-static void app_limited_round(anl_t *w, int app_limited, uint64_t delivered, uint64_t lost, uint32_t sent, uint32_t loss_rate)
+ * offers more than a slower bottleneck) cuts bw_lo as before. Before any
+ * sample measured the path (bbr_unmeasured) an app-limited round's loss
+ * is no congestion at all. */
+static void app_limited_round_m(anl_t *w, int app_limited, uint64_t delivered, uint64_t lost, uint32_t sent, uint32_t loss_rate, int measured)
 {
     memset(w, 0, sizeof(*w));
+    if (measured) { w->net_sample_ts = 1; w->net_round = 1; }
     w->interval = 10; w->mss = 1400; w->avg_seg = 1300; w->init_cwnd = 16;
     w->min_rtt = 70; w->min_rtt_ts = 1;
     w->round_min_rtt = 105;                     /* every RTT of the round well above min_rtt: a queue signal */
@@ -541,6 +544,11 @@ static void app_limited_round(anl_t *w, int app_limited, uint64_t delivered, uin
     w->round_bw = 150000;                       /* its best sample: the application's own rate */
     w->loss_rate = loss_rate;
     bbr_round_end(w, app_limited);
+}
+
+static void app_limited_round(anl_t *w, int app_limited, uint64_t delivered, uint64_t lost, uint32_t sent, uint32_t loss_rate)
+{
+    app_limited_round_m(w, app_limited, delivered, lost, sent, loss_rate, 1);
 }
 
 static void test_bbr_app_limited_loss(void)
@@ -567,6 +575,12 @@ static void test_bbr_app_limited_loss(void)
     /* the send-rate floor never exceeds what a clean cut would leave when the sender sent less */
     app_limited_round(&w, 1, 15000, 1300, 12000, 0);
     CHECK(w.bw_lo == beta, "app-limited, sent below 0.7x: 0.7x stands (%u)", w.bw_lo);
+    /* not measured yet, 60% lost: no cut;
+       a network-limited round is a measurement and is cut as before */
+    app_limited_round_m(&w, 1, 6000, 9000, 20000, 0, 0);
+    CHECK(w.bw_lo == 0 && w.inflight_hi == 0, "unmeasured app-limited round: no cut (%u)", w.bw_lo);
+    app_limited_round_m(&w, 0, 15000, 1300, 20000, 0, 0);
+    CHECK(w.bw_lo == beta, "unmeasured but network-limited: cut as before (%u)", w.bw_lo);
 }
 
 static void test_bbr_delivery_window(void)
