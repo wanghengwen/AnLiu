@@ -74,6 +74,8 @@ int main(void)
     RUN(test_cc_radio_jitter());
     RUN(test_rto_spurious());
     RUN(test_min_rtt_idle());
+    RUN(test_bbr_slowdown());
+    RUN(test_rto_link_hold());
     RUN(test_stream_lifecycle(0));
     RUN(test_stream_lifecycle(10));
     RUN(test_sid_lifecycle());

@@ -513,6 +513,7 @@ static int siv_open(const anl_keys *keys, int dir, const uint8_t *wire, size_t s
 #define STREAM_RTO_MIN  1000    /* RTO floor on a stream carrier: its own timers and queues are the delay */
 #define RTO_DEF         200
 #define RTO_MAX         60000
+#define HOLD_PROBE_MS   250     /* no ACK at all for this long (and half the RTO): the path holds, RTOs send one probe */
 #define PROBE_LIMIT     60000
 #define OPEN_RTO_MAX    5000
 #define KEEPALIVE_PAD   16
@@ -969,6 +970,8 @@ struct anl_s {
     uint32_t reo_inc_ts;                /* last reo_mult change: at most one per round trip */
     uint32_t reo_spur_ts;               /* last spurious RACK retransmission */
     uint32_t min_rtt, min_rtt_ts;       /* windowed minimum RTT (BBR_MIN_RTT_WIN) */
+    uint8_t  min_rtt_kept;              /* an expiry kept it against a sample over twice it */
+    uint8_t  q_rounds;                  /* rounds in a row whose every RTT sample stood behind a queue (bbr_standing_queue) */
     uint32_t wake_ts;                   /* the last data sent after IDLE_GAP_MS without: the busy period's start (| 1; 0: none) */
     uint32_t data_tx_ts;                /* the last datagram with data (| 1; 0: none) */
     uint32_t rack_ts, rack_rtt;         /* RACK: newest datagram the peer is known to have (any stream; IN_F_RACK) */
@@ -3669,9 +3672,32 @@ static void bbr_enter_probe_rtt(anl_t *w)
 }
 
 /* min_rtt over BBR_MIN_RTT_WIN; when it expires, PROBE_RTT drains the queue */
+/* rtt stood behind a standing queue, not a radio link's jitter: at least
+ * twice the path's RTT and four margins above (RTT 40..180 ms without a
+ * queue: a round of a few samples, a quarter of the ACKs lost, read all high
+ * now and then). Three rounds of it in a row: q_rounds */
+static int behind_queue(const anl_t *w, uint32_t rtt)
+{
+    return w->min_rtt > 0 && rtt > 2 * bbr_rtt(w) + 4 * bbr_queue_margin(w);
+}
+
 static void bbr_update_min_rtt(anl_t *w, int32_t rtt, int wake)
 {
     int expired = w->min_rtt != 0 && tdiff(w->current, w->min_rtt_ts) > BBR_MIN_RTT_WIN;
+    /* Behind a standing queue every sample is high: an expired minimum
+       took the next one (880 ms over 5 on a Wi-Fi that slowed down, 1535 ms
+       in PROBE_RTT), and the BDP - and the burst window over it - put cwnd
+       at 5000..8000 segments. Behind a standing queue (q_rounds; on a 2 ms
+       path any queue doubles the RTT) a sample over twice the minimum
+       re-times it once instead; PROBE_RTT, when not app-limited, drains and may find a
+       lower one meanwhile; the next expiry takes it (a longer path is real) */
+    if (expired && w->q_rounds >= 3 && (uint32_t)rtt > 2 * w->min_rtt + bbr_queue_margin(w) && !w->min_rtt_kept) {
+        w->min_rtt_ts = w->current;
+        w->min_rtt_kept = 1;
+        if (w->bbr_state != ANL_BBR_PROBE_RTT && w->app_limited == 0) bbr_enter_probe_rtt(w);
+        return;
+    }
+    if (w->min_rtt == 0 || (uint32_t)rtt <= w->min_rtt || expired) w->min_rtt_kept = 0;
     /* a sample of what was sent on waking from silence does not replace an
        expired minimum: a radio link's wake-up is in it (4G with a still
        screen: min_rtt 855..1106 ms over 41, above srtt, cwnd 1700 and the
@@ -3810,6 +3836,11 @@ static void bbr_round_end(anl_t *w, int app_limited)
     uint32_t rrate = rdur > 0 ? sat32(rd * 1000 / rdur) : 0;
     uint32_t rsent = w->sent_wire - w->round_sent0;             /* wire bytes sent in the round (wraps) */
     w->prev_round_min_rtt = w->round_min_rtt;
+    if (behind_queue(w, w->round_min_rtt)) {         /* every sample of the round */
+        if (w->q_rounds < 255) w->q_rounds++;
+    } else {
+        w->q_rounds = 0;
+    }
     w->round_min_rtt = 0;
     if (w->rec.cc_ignore_loss) lost = 0;                    /* the carrier loses nothing: what the timers call loss is queueing */
     else lt_policer(w, rd, lost, app_limited);
@@ -4095,7 +4126,12 @@ static void burst_begin(anl_t *w)
     }
     if (q < 8) return;
     if (++w->burst_id == 0) w->burst_id = 1;
-    if (w->burst_cur > w->burst_bw) w->burst_bw = w->burst_cur;
+    /* the fastest burst so far; behind a standing queue (q_rounds) the
+       last one, lower too: the max kept a LAN burst rate (808 KB/s) after
+       the path slowed to 31 KB/s and every key frame went out at 1 MB/s
+       into the queue. Not otherwise: a lossy burst reads low (15% loss,
+       180 ms: video -3..-6 points, and the capacity recovery stalled) */
+    if (w->burst_cur > w->burst_bw || (w->burst_cur != 0 && w->q_rounds >= 3)) w->burst_bw = w->burst_cur;
     w->burst_cur = 0;
     w->burst_left = q;                      /* >= 8: open */
     ST_CLR(w->bbr_f, BBR_F_BURST_DONE);
@@ -4174,6 +4210,7 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
     uint64_t delivered;
     int32_t send_el, ack_el;
     uint32_t interval;
+    int queued, measured;
     int round_start;
     if (w->app_limited != 0 && w->delivered > w->app_limited) w->app_limited = 0;
     round_start = rs->prior_delivered >= w->next_round_delivered;
@@ -4245,8 +4282,9 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
            bbr_queue_signal) filled the path: the estimate is the path, as
            after a network-limited sample - no STARTUP-gain headroom for
            BBR_BW_ROUNDS (bbr_headroom) */
-        if (rs->app_limited && w->min_rtt > 0 && w->last_rtt > 0 &&
-            (uint32_t)w->last_rtt > bbr_rtt(w) + bbr_queue_margin(w)) {
+        queued = rs->app_limited && w->min_rtt > 0 && w->last_rtt > 0 &&
+                 (uint32_t)w->last_rtt > bbr_rtt(w) + bbr_queue_margin(w);
+        if (queued) {
             w->net_round = w->round_count | 1;
             /* ... and ends STARTUP: an encoder following target_rate keeps
                the sender app-limited, and the bandwidth plateau counts only
@@ -4259,7 +4297,17 @@ static void bbr_on_ack(anl_t *w, const bbr_sample *rs)
                 ST_SET(w->bbr_f, BBR_F_FULL_BW);
         }
         if (!rs->app_limited) { ST_SET(w->bbr_f, BBR_F_ROUND_NET); w->net_round = w->round_count | 1; w->net_sample_ts = ts_mark(w); }
-        if (!rs->app_limited || bw >= w->btl_bw) {
+        /* An app-limited sample behind a standing queue (q_rounds; not an
+           encoder's frames queueing a little each: the samples then read
+           the encoder's rate and the model sank with it, test_target_rate;
+           nor radio jitter, test_cc_radio_jitter) measured the bottleneck,
+           busy all along: the filter advances over its round and it counts
+           as a network-limited sample. Otherwise an encoder following
+           target_rate keeps every sample app-limited and the peak from
+           before the path slowed down stays */
+        measured = queued && w->q_rounds >= 3 && behind_queue(w, w->round_min_rtt);
+        if (measured) ST_SET(w->bbr_f, BBR_F_ROUND_NET);
+        if (!rs->app_limited || measured || bw >= w->btl_bw) {
             if (bw > *slot) *slot = (uint32_t)bw;
             if (bw > w->btl_bw) w->btl_bw = (uint32_t)bw;
         }
@@ -6536,8 +6584,8 @@ static void flush_retransmit(anl_t *w, anl_stream *st, int64_t retrans_limit, in
 {
     uint32_t current = w->current;
     anl_node *pos;
-    uint32_t next_rto = current + RTO_MAX, want, found = 0;
-    int rto_due;
+    uint32_t next_rto = current + RTO_MAX, want, found = 0, probe_at = 0;
+    int rto_due, probed = 0;
     if (!flush_busy(st) || !stream_sendable(st)) return;
     /* The walk costs the window (DESIGN 6.3): only while something is
        lost or an RTO may be due (every segment in snd_buf has been sent
@@ -6585,6 +6633,18 @@ static void flush_retransmit(anl_t *w, anl_stream *st, int64_t retrans_limit, in
                 next_rto = tmin(next_rto, hold);
                 continue;
             }
+            /* no ACK at all for half the RTO and HOLD_PROBE_MS (a Wi-Fi
+               holding everything for seconds; not a slow, lossy link, where
+               a datagram takes 12 ms at 800 kbit/s and half a 30 ms RTO
+               passes without an ACK now and then): one probe per walk, the
+               oldest; the rest wait for its deadline. Every segment's own timer resent
+               the whole window at each backoff step, ~200 duplicates per 2 s
+               hold, into the queue that held them */
+            if (probed) {
+                seg->resendts = probe_at;
+                next_rto = tmin(next_rto, probe_at);
+                continue;
+            }
             *lost = 1;
             seg->rto = rto_backoff(seg->rto);
             seg->resendts = current + seg->rto;
@@ -6603,6 +6663,11 @@ static void flush_retransmit(anl_t *w, anl_stream *st, int64_t retrans_limit, in
         send_seg(w, st, seg);
         seg->resendts += vq_ms(w);
         next_rto = tmin(next_rto, seg->resendts);
+        if (why == RTX_RTO && w->ackprog_ts != 0 &&
+            tdiff(current, w->ackprog_ts) >= (int32_t)umax32(seg->rto / 2, HOLD_PROBE_MS)) {
+            probed = 1;                 /* (seg->rto is backed off already) */
+            probe_at = seg->resendts;
+        }
         *retrans_spent += data_seg_size(st, seg);
         if (st->mode == ANL_RELIABLE && seg->xmit >= w->dead_link)
             mark_dead(w, why == RTX_RACK ? "reliable_rack" : "reliable_rto",
@@ -6842,6 +6907,7 @@ static void path_model_reset(anl_t *w)
     w->reo_mult = 1;
     w->round_min_rtt = w->prev_round_min_rtt = 0;
     w->min_rtt = w->min_rtt_ts = 0;
+    w->min_rtt_kept = w->q_rounds = 0;
     memset(w->bw_round, 0, sizeof(w->bw_round));
     w->btl_bw = w->bw_lo = w->round_bw = 0;
     w->net_round = w->net_sample_ts = 0;

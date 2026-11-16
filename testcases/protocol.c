@@ -720,6 +720,131 @@ static void test_min_rtt_idle(void)
     net_stop(&n);
 }
 
+/* A short path (RTT ~5 ms) behind a deep buffer that slows from 5 to 0.25
+ * Mbit/s, the encoder following target_rate (a remote desktop on a Wi-Fi,
+ * 2026-11-16): every sample app-limited, the filter kept the peak from
+ * before for 10 rounds as long as the queue's RTT (15..18 s), key frames went
+ * out at the old burst rate, and an expired min_rtt took a queued sample:
+ * cwnd 5000..8800 (DESIGN 6.8) */
+static void test_bbr_slowdown(void)
+{
+    uint64_t saved_seed = g_seed;
+    net n; anl_config ca, cb; anl_stream_opt o, ro;
+    static char buf[160000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    anl_stats st;
+    int i, key = 1, last_key = -100000, kbps = 3000, r;
+    uint32_t max_cwnd = 0, low_at = 0, dropped = 0;
+    anl_stream_stats ss;
+    printf("[bbr: a deep-buffered short path slows down 20x under a closed-loop encoder]\n");
+    g_seed = g_seed0;
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 2;
+    n.bandwidth_bps = 5000000; n.queue_limit = 110;   /* ~4 s at the slow rate */
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.prio = 1; o.drop_until_key = 1;
+    anl_stream_opt_default(&ro, ANL_SEMI);
+    ro.rcv_drop_until_key = 1; ro.rcv_deadline_ms = 0;
+    a = open_pair(&n, 0, &o, &ro, &b);
+    if (!b) { net_stop(&n); g_seed = saved_seed; return; }
+    for (i = 0; i < 40000; i++) {
+        if (i == 15000) n.bandwidth_bps = 250000;
+        net_tick(&n);
+        if (i % 1000 == 0) {                            /* the encoder's figures, once a second */
+            anl_get_stats(n.ep[0], &st);
+            anl_stream_get_stats(a, &ss);
+            if (st.target_rate) {                       /* 0.9 x target - 64 kbit/s, at least 100 */
+                int k = (int)((uint64_t)st.target_rate * 8 * 9 / 10000) - 64;
+                kbps = k < 100 ? 100 : k > 20000 ? 20000 : k;
+            }
+            if (ss.frames_dropped > dropped && i - last_key >= 1000) key = 1;
+            dropped = ss.frames_dropped;
+        }
+        if (i % 33 == 0) {
+            int len = kbps * 125 / 30;                  /* bytes per frame at 30 fps */
+            if (key) len = len * 15 < 40000 ? 40000 : len * 15 > 150000 ? 150000 : len * 15;
+            fill_pattern(buf, len, (uint32_t)i);
+            r = anl_stream_send_frame(a, key ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            if (r == 0 && key) { key = 0; last_key = i; }
+            else if (r == ANL_EDROPPED && i - last_key >= 1000) key = 1;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) ;
+        if (i >= 15000) {
+            anl_get_stats(n.ep[0], &st);
+            if (st.cwnd > max_cwnd) max_cwnd = st.cwnd;
+            if (!low_at && st.bw_estimate < 2 * 31250) low_at = (uint32_t)(i - 15000);
+        }
+    }
+    printf("  after the slowdown: estimate under 2x the link at +%u ms, max cwnd %u\n", low_at, max_cwnd);
+    /* before: the estimate stayed at 460 KB/s for the 25 s, cwnd 1539. Now
+       9.3 s on most seeds; 17..19.4 s on some (cwnd ~360), where PROBE_RTT
+       took the standing queue's RTT for a longer path (bbr_path_rtt, the
+       flat-queue probe) and behind_queue no longer saw the queue */
+    CHECK(max_cwnd <= 500, "cwnd stays bounded behind the queue (%u)", max_cwnd);
+    CHECK(low_at != 0 && low_at <= 22000, "the estimate follows the slower path within 22 s (+%u ms)", low_at);
+    net_stop(&n);
+    g_seed = saved_seed;
+}
+
+/* the link holds what it has and what comes for dur ms, both ways */
+static void net_hold(net *n, uint32_t dur)
+{
+    pkt *p;
+    int k;
+    for (p = n->queue; p; p = p->next) p->deliver_at += dur;
+    for (k = 0; k < 2; k++) {
+        if ((int32_t)(n->link_free_at[k] - n->now) < 0) n->link_free_at[k] = n->now;
+        n->link_free_at[k] += dur;
+        if ((int32_t)(n->last_at[k] - n->now) < 0) n->last_at[k] = n->now;
+        n->last_at[k] += dur;
+    }
+}
+
+/* A Wi-Fi that holds everything for 2 s out of every 8 (a scan): each
+ * segment's own RTO resent the whole window at every backoff step, about 200
+ * duplicates per hold, into the queue that held them (DESIGN 6.3): 1020
+ * retransmissions in the 40 s before, 409 now */
+static void test_rto_link_hold(void)
+{
+    uint64_t saved_seed = g_seed;
+    net n; anl_config ca, cb; anl_stream_opt o, ro;
+    static char buf[20000];
+    anl_stream_t *a, *b;
+    anl_frame_info fi;
+    anl_stats st;
+    int i, got = 0, sent = 0;
+    printf("[rto: the link holds everything 2 s out of every 8]\n");
+    g_seed = g_seed0;
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 2;
+    n.bandwidth_bps = 5000000; n.queue_limit = 2000;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.prio = 1; o.drop_until_key = 1;
+    anl_stream_opt_default(&ro, ANL_SEMI);
+    ro.rcv_drop_until_key = 1; ro.rcv_deadline_ms = 0;
+    a = open_pair(&n, 0, &o, &ro, &b);
+    if (!b) { net_stop(&n); g_seed = saved_seed; return; }
+    for (i = 0; i < 40000; i++) {
+        if (i % 8000 == 4000) net_hold(&n, 2000);
+        net_tick(&n);
+        if (i % 33 == 0) {                              /* 2 Mbit/s, a key frame a second */
+            int key = i % 990 == 0, len = key ? 20000 : 7000;
+            fill_pattern(buf, len, (uint32_t)i);
+            if (anl_stream_send_frame(a, key ? ANL_FRAME_KEY : 0, buf, len, NULL) == 0) sent++;
+        }
+        while (anl_stream_recv_frame(b, buf, sizeof(buf), &fi) >= 0) got++;
+    }
+    anl_get_stats(n.ep[0], &st);
+    printf("  frames %d/%d, retransmissions %u\n", got, sent, st.retrans);
+    CHECK(st.retrans <= 500, "a hold resends a probe, not the window (%u retransmissions)", st.retrans);
+    CHECK(got * 2 >= sent, "video still flows between the holds (%d/%d)", got, sent);
+    net_stop(&n);
+    g_seed = saved_seed;
+}
+
 /* capture callback for the demux test */
 static char g_cap[2048];
 static int g_caplen;
