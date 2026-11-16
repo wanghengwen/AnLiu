@@ -211,7 +211,10 @@ typedef struct anl_stream_opt {
                                    beyond ~250 ms RTT (DESIGN 8.6) */
     int max_age_ms;             /* semi only: 500, 0 = unlimited */
     int max_bytes;              /* semi only: 0 = unlimited */
-    int drop_until_key;         /* semi only: 0 */
+    int drop_until_key;         /* semi only: 0; 1 = after a dropped frame drop the non-key frames
+                                   up to the next key frame. Key frames are not given up for
+                                   max_age_ms (nor a frame sent behind one still out), up to
+                                   10 s; the receiver should set rcv_deadline_ms 0 (DESIGN 7.3) */
     int rcv_deadline_ms;        /* semi only: -1 (default) = 3/5 of the local max_age_ms, 0 = off,
                                    >0 = max gap wait after later data reveals a missing segment.
                                    Skips to a later frame without waiting for sender FWD;

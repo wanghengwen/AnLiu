@@ -5708,9 +5708,92 @@ static void abandon_through(anl_t *w, anl_stream *st, uint32_t frame_no)
     drop_frame(w, st, frame_no);
 }
 
-static int semi_expired(const anl_t *w, const anl_stream *st, const anl_seg *seg)
+/* drop_until_key: a key frame is not given up for its age, started or still
+ * waiting (a newer key frame replaces a waiting one: semi_replace_queued), nor
+ * a frame sent behind a key frame still out (FWD skips a prefix: abandoning it
+ * would take the key frame too). Given up, a key frame took every frame up to
+ * the next one, and on a path slower than a key frame per max_age the next
+ * key frame went the same way: not one frame arrived (remote desktop over a
+ * slow Wi-Fi path, 2026-11-16). Its receiver should wait for the repair too
+ * (rcv_deadline_ms 0). Other frames expire as before, behind a kept one too
+ * (semi_drop_behind). Not every frame that has started: when the pace runs
+ * ahead of a path short of capacity, nearly all have, and keeping them all
+ * resent them in a stream that looked like a policer to lt_policer, whose
+ * ceiling then outlived the shortage (test_fec_capacity_recovery, 10% loss).
+ * KEEP_MAX_MS bounds what is kept on a path that stopped (DESIGN 7.3).
+ * started: seg's frame has segments out (seg in snd_buf, or not its first) */
+#define KEEP_MAX_MS 10000
+/* a key frame older than frame_no is out, not yet acknowledged */
+static int key_out_before(const anl_stream *st, uint32_t frame_no)
 {
-    return st->mode == ANL_SEMI && st->sm->max_age_ms && tdiff(w->current, seg->ts_enq) > st->sm->max_age_ms;
+    anl_node *pos;
+    for (pos = st->snd_buf.next; pos != &st->snd_buf; pos = pos->next) {
+        const anl_seg *s = QENTRY(pos, anl_seg, node);
+        if (tdiff(s->frame_no, frame_no) >= 0) return 0;
+        if (s->fkey) return 1;
+    }
+    return 0;
+}
+static int semi_expired(const anl_t *w, const anl_stream *st, const anl_seg *seg, int started)
+{
+    int32_t age;
+    if (st->mode != ANL_SEMI || !st->sm->max_age_ms) return 0;
+    age = tdiff(w->current, seg->ts_enq);
+    if (age <= st->sm->max_age_ms) return 0;
+    if (!ST_ON(st->cfg, STC_DROP_KEY) || age > KEEP_MAX_MS) return 1;
+    return !seg->fkey && (!started || !key_out_before(st, seg->frame_no));
+}
+
+/* a segment of a frame waiting to go, out of snd_queue: no sn yet
+ * (move_and_send), so the stream has no gap. Unsent for want of capacity,
+ * like max_age's drops (semi_drop_check) */
+static void cut_queued(anl_t *w, anl_stream *st, anl_seg *seg)
+{
+    w->rate.purged_unsent += seg->len;
+    qdel(&seg->node);
+    st->nsnd_que--;
+    backlog_sub(st, seg->len);
+    seg_free(w, seg);
+}
+
+/* drop_until_key, a key frame coming: what waits to go and has not started -
+ * older key frames too - is superseded by it (semi_expired): the tail of
+ * snd_queue behind the rest of the one that started */
+static void semi_replace_queued(anl_t *w, anl_stream *st)
+{
+    anl_node *pos, *next;
+    uint64_t unsent0 = w->rate.purged_unsent;
+    int cut = 0;
+    for (pos = st->snd_queue.next; pos != &st->snd_queue; pos = next) {
+        anl_seg *seg = QENTRY(pos, anl_seg, node);
+        next = pos->next;
+        if (seg->flags & F_HAS_FRAME) { cut = 1; st->frames_dropped++; }
+        if (cut) cut_queued(w, st, seg);    /* not the rest of the frame that started */
+    }
+    w->rate.tx_unsent += w->rate.purged_unsent - unsent0;
+}
+
+/* drop_until_key: the head of snd_queue is past max_age but kept
+ * (semi_expired). The frames waiting behind it still expire, each with the
+ * non-key frames after it up to the next key frame, as drop_frame does: left
+ * there, the queue behind a kept frame grew for KEEP_MAX_MS */
+static void semi_drop_behind(anl_t *w, anl_stream *st)
+{
+    anl_node *pos, *next;
+    int cut = 0;
+    for (pos = st->snd_queue.next; pos != &st->snd_queue; pos = next) {
+        anl_seg *seg = QENTRY(pos, anl_seg, node);
+        next = pos->next;
+        if (seg->flags & F_HAS_FRAME) {
+            if (cut && seg->fkey) { cut = 0; ST_CLR(st->trk, STT_DROPPING); }
+            if (!cut) {
+                if (semi_expired(w, st, seg, 0)) { cut = 1; ST_SET(st->trk, STT_DROPPING); }
+                else if (!seg->fkey) break;     /* kept key frames aside, younger from here on */
+            }
+            if (cut) st->frames_dropped++;
+        }
+        if (cut) cut_queued(w, st, seg);
+    }
 }
 
 /* DESIGN 7.3: max_bytes drops the oldest frame wherever it is; max_age only
@@ -5736,7 +5819,12 @@ static void semi_drop_check(anl_t *w, anl_stream *st)
             continue;
         }
         head = qfirst_seg(&st->snd_queue);
-        if (head == NULL || !semi_expired(w, st, head)) break;
+        if (head == NULL) break;
+        if (!semi_expired(w, st, head, !(head->flags & F_HAS_FRAME))) {
+            if (ST_ON(st->cfg, STC_DROP_KEY) && st->sm->max_age_ms && tdiff(w->current, head->ts_enq) > st->sm->max_age_ms)
+                semi_drop_behind(w, st);        /* kept past max_age: what waits behind it does not */
+            break;
+        }
         if (head->flags & F_HAS_FRAME) drop_frame(w, st, head->frame_no);    /* never sent: no FWD */
         else abandon_through(w, st, head->frame_no);                         /* head already sent */
     }
@@ -6471,7 +6559,7 @@ static void flush_retransmit(anl_t *w, anl_stream *st, int64_t retrans_limit, in
             next_rto = tmin(next_rto, seg->resendts);
             continue;
         }
-        if (semi_expired(w, st, seg)) {
+        if (semi_expired(w, st, seg, 1)) {
             /* past max_age: abandon instead of retransmitting (DESIGN
                7.3). Not an FEC failure: the peer may well have it
                (repaired, its ACK still on the way) - only the peer's
@@ -7643,6 +7731,7 @@ int anl_stream_send_frame(anl_stream_t *st, int flags, const char *buf, int len,
     if (count > st->rcv_wnd) return ANL_ETOOBIG;                    /* peer rcv_wnd == ours */
 
     fno = st->sm->frame_next;
+    if (key && ST_ON(st->cfg, STC_DROP_KEY)) semi_replace_queued(w, st);
     if (!key && ST_ON(st->trk, STT_DROPPING)) {
         st->sm->frame_next++;
         if (frame_no) *frame_no = fno;

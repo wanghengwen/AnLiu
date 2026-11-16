@@ -93,6 +93,8 @@ int main(void)
     RUN(test_sid_churn(10, 9000));
     RUN(test_priority());
     RUN(test_key_sender_purge());
+    RUN(test_key_kept());
+    RUN(test_key_slow_path());
     RUN(test_key_receiver_discard());
     RUN(test_window_reopen_loss());
     RUN(test_receiver_deadline_default());

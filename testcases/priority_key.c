@@ -42,7 +42,7 @@ static void test_key_sender_purge(void)
     uint32_t fno;
     int i, r;
     anl_stream_t *a, *b;
-    printf("[key frames A: sender drops in-flight P frames of an abandoned key frame]\n");
+    printf("[key frames A: a key frame kept past max_age, then abandoned with the P frames behind it]\n");
     net_init(&n, &ca, &cb);
     net_start(&n, &ca, &cb);
     anl_stream_opt_default(&o, ANL_SEMI);
@@ -59,9 +59,13 @@ static void test_key_sender_purge(void)
     }
     for (i = 0; i < 50 && a->nsnd_que > 0; i++) net_tick(&n);   /* the key frame's parities take pacing tokens */
     CHECK(a->nsnd_buf >= 3 && a->nsnd_que == 0, "all three frames in flight (%u / %u)", a->nsnd_buf, a->nsnd_que);
-    for (i = 0; i < 1000 && a->nsnd_buf > 0; i++) net_tick(&n);
+    for (i = 0; i < 1000; i++) net_tick(&n);
     anl_stream_get_stats(a, &ss);
-    CHECK(a->nsnd_buf == 0, "K0 abandoned on retransmission, P1 P2 dropped with it (%u left)", a->nsnd_buf);
+    CHECK(a->nsnd_buf >= 3 && ss.frames_dropped == 0, "K0, and P1 P2 behind it, resent past max_age (%u, %u dropped)",
+          a->nsnd_buf, ss.frames_dropped);
+    for (i = 0; i < KEEP_MAX_MS + 2000 && a->nsnd_buf > 0; i++) net_tick(&n);
+    anl_stream_get_stats(a, &ss);
+    CHECK(a->nsnd_buf == 0, "K0 abandoned after KEEP_MAX_MS, P1 P2 dropped with it (%u left)", a->nsnd_buf);
     CHECK(ss.frames_dropped == 3, "three frames dropped (%u)", ss.frames_dropped);
     CHECK(ST_ON(a->out, STO_FWD) && a->sm->fwd_una == a->snd_nxt, "one FWD to snd_nxt");
     CHECK(anl_stream_send_frame(a, 0, buf, 500, &fno) == ANL_EDROPPED && fno == 3, "P3 refused until a key frame");
@@ -75,6 +79,123 @@ static void test_key_sender_purge(void)
     for (i = 0; i < 300; i++) net_tick(&n);
     CHECK(anl_stream_recv_frame(b, buf, sizeof(buf), &fi) == ANL_EAGAIN, "no stale P frame afterwards");
     CHECK(!ST_ON(a->out, STO_FWD), "FWD acknowledged");
+    net_stop(&n);
+}
+
+/* drop_until_key (DESIGN 7.3): a key frame is kept past max_age, started or
+ * waiting (a newer one replaces it with what waits), and so is a frame sent
+ * behind a key frame still out; other frames expire as before, behind a kept
+ * one too; KEEP_MAX_MS bounds it all. Without drop_until_key, max_age */
+static int keep_discard(char *buf, int len, anl_t *w, void *user)
+{
+    (void)buf; (void)len; (void)w; (void)user;
+    return 0;
+}
+static void test_key_kept(void)
+{
+    anl_config cfg; anl_stream_opt opt; anl_stream_stats ss;
+    anl_t *w; anl_stream *s; anl_seg *h, *k, *p;
+    static char key[20000], buf[2000];
+    int err;
+    printf("[key frames: kept past max_age (drop_until_key)]\n");
+    anl_config_default(&cfg, ANL_ROLE_CLIENT);
+    w = anl_create(123, &cfg, NULL);
+    if (!w) { CHECK(0, "create"); return; }
+    anl_setoutput(w, keep_discard);
+    anl_stream_opt_default(&opt, ANL_SEMI);
+    opt.flush_on_send = 0; opt.fec = 0; opt.max_age_ms = 100; opt.drop_until_key = 1;
+    s = anl_stream_open(w, &opt, &err);
+    anl_update(w, 1000);
+    /* a key frame waiting is kept; the P frame waiting behind it expires */
+    CHECK(anl_stream_send_frame(s, ANL_FRAME_KEY, key, sizeof key, NULL) == 0, "K0");
+    CHECK(anl_stream_send_frame(s, 0, buf, 1000, NULL) == 0, "P1");
+    w->current = 1300;
+    semi_drop_check(w, s);
+    anl_stream_get_stats(s, &ss);
+    h = qfirst_seg(&s->snd_queue);
+    CHECK(ss.frames_dropped == 1 && h && h->fkey && s->nsnd_que == (sizeof key + s->mss - 1) / s->mss,
+          "K0 kept past max_age, P1 behind it expired (%u dropped)", ss.frames_dropped);
+    CHECK(anl_stream_send_frame(s, 0, buf, 1000, NULL) == ANL_EDROPPED, "P2 refused until a key frame");
+    /* a newer key frame replaces the waiting one */
+    CHECK(anl_stream_send_frame(s, ANL_FRAME_KEY, key, sizeof key, NULL) == 0, "K3");
+    anl_stream_get_stats(s, &ss);
+    h = qfirst_seg(&s->snd_queue);
+    CHECK(ss.frames_dropped == 3 && h && h->frame_no == 3, "K0 replaced by K3 (%u dropped)", ss.frames_dropped);
+    /* started: kept; the P frame waiting behind it expires */
+    anl_update(w, 1301);
+    h = qfirst_seg(&s->snd_queue);
+    CHECK(!QEMPTY(&s->snd_buf) && h && !(h->flags & F_HAS_FRAME) && h->fkey, "K3 started");
+    CHECK(anl_stream_send_frame(s, 0, buf, 1000, NULL) == 0, "P4");
+    w->current = 1700;
+    semi_drop_check(w, s);
+    anl_stream_get_stats(s, &ss);
+    CHECK(ss.frames_dropped == 4 && qfirst_seg(&s->snd_queue) == h && !next_frame_after(s, 3),
+          "K3 kept, P4 behind it expired (%u dropped)", ss.frames_dropped);
+    /* a path that stopped: KEEP_MAX_MS */
+    w->current = 1300 + KEEP_MAX_MS + 1;
+    semi_drop_check(w, s);
+    anl_stream_get_stats(s, &ss);
+    CHECK(ss.frames_dropped == 5 && QEMPTY(&s->snd_queue) && QEMPTY(&s->snd_buf), "K3 abandoned after KEEP_MAX_MS");
+    /* sent behind a key frame still out: kept; not behind one: expires */
+    s = anl_stream_open(w, &opt, &err);
+    CHECK(anl_stream_send_frame(s, ANL_FRAME_KEY, buf, 2000, NULL) == 0 && anl_stream_send_frame(s, 0, buf, 2000, NULL) == 0, "K0 P1");
+    anl_update(w, w->current + 1);
+    k = qfirst_seg(&s->snd_buf);
+    p = QENTRY(s->snd_buf.prev, anl_seg, node);
+    CHECK(s->nsnd_que == 0 && k && k->fkey && p && p->frame_no == 1, "both out");
+    w->current += 200;
+    CHECK(!semi_expired(w, s, k, 1) && !semi_expired(w, s, p, 1), "K0 and P1 behind it kept past max_age");
+    snd_unlink(s, k); seg_free(w, k);
+    k = qfirst_seg(&s->snd_buf);
+    if (k && k->frame_no == 0) { snd_unlink(s, k); seg_free(w, k); }   /* K0 acknowledged */
+    CHECK(semi_expired(w, s, p, 1), "P1 expires once K0 is through");
+    /* without drop_until_key: max_age, key frames too */
+    opt.drop_until_key = 0;
+    s = anl_stream_open(w, &opt, &err);
+    CHECK(anl_stream_send_frame(s, ANL_FRAME_KEY, key, sizeof key, NULL) == 0, "K0 without drop_until_key");
+    w->current += 101;
+    semi_drop_check(w, s);
+    anl_stream_get_stats(s, &ss);
+    CHECK(ss.frames_dropped == 1, "K0 expired (%u dropped)", ss.frames_dropped);
+    anl_release(w);
+}
+
+/* A path slower than a key frame per max_age (DESIGN 7.3): given up for its
+ * age, the key frame took the GOP and the next one went the same way - not
+ * one frame arrived (0 of 465 before). Kept, the key frames arrive; the P
+ * frames waiting behind one mostly expire there, as max_age wants */
+static void test_key_slow_path(void)
+{
+    net n; anl_config ca, cb; anl_stream_opt o, ro; anl_frame_info fi; anl_stream_stats ss;
+    static char buf[60000];
+    anl_stream_t *a, *b;
+    int i, r, need_key = 1, sent = 0, keys = 0;
+    unsigned got = 0, got_keys = 0;
+    printf("[key frames: a path slower than a key frame per max_age]\n");
+    net_init(&n, &ca, &cb);
+    n.min_delay = n.max_delay = 20;
+    n.bandwidth_bps = 400000; n.queue_limit = 20;
+    net_start(&n, &ca, &cb);
+    anl_stream_opt_default(&o, ANL_SEMI);
+    o.prio = 1; o.drop_until_key = 1;                   /* max_age 500 ms */
+    anl_stream_opt_default(&ro, ANL_SEMI);
+    ro.rcv_drop_until_key = 1; ro.rcv_deadline_ms = 0;
+    a = open_pair(&n, 0, &o, &ro, &b);
+    if (!b) { net_stop(&n); return; }
+    for (i = 0; i < 20000; i++) {
+        net_tick(&n);
+        if (i % 40 == 0) {                              /* 25 fps; a key frame of 40 KB is 0.8 s on the link */
+            int len = need_key ? 40000 : 1000;
+            fill_pattern(buf, len, (uint32_t)i);
+            r = anl_stream_send_frame(a, need_key ? ANL_FRAME_KEY : 0, buf, len, NULL);
+            if (r == 0) { keys += need_key; need_key = 0; sent++; }
+            else if (r == ANL_EDROPPED) need_key = 1;   /* the encoder makes a key frame */
+        }
+        while ((r = anl_stream_recv_frame(b, buf, sizeof(buf), &fi)) >= 0) { got++; got_keys += fi.flags == ANL_FRAME_KEY; }
+    }
+    anl_stream_get_stats(a, &ss);
+    printf("  %d frames (%d key) sent, %u (%u key) received, %u dropped\n", sent, keys, got, got_keys, ss.frames_dropped);
+    CHECK(got_keys >= 10 && got_keys * 2 >= (unsigned)keys, "most key frames arrive (%u of %d)", got_keys, keys);
     net_stop(&n);
 }
 
